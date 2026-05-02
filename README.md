@@ -15,7 +15,7 @@ without touching the others.
 |---|---|---|
 | [`data_scraper/`](data_scraper/) | Python 3.11+ | Pulls top-500 ladder users + all their saved replays from Pokémon Showdown. |
 | [`calc_microservice/`](calc_microservice/) | Node 20+ / TS | HTTP service wrapping `@smogon/calc` (`POST /calc`), `@pkmn/client` (`POST /parse_log`), and `@pkmn/dex` (`GET /dex/move/:name`). |
-| [`pipeline/`](pipeline/) | Python 3.11+ | Atomic modules that turn raw replays into SFT-ready conversational training data. `replay_parser`, `damage_inferencer`, and `threat_matrix` are implemented; `teacher_llm` and `master_pipeline` are still stubs. |
+| [`pipeline/`](pipeline/) | Python 3.11+ | Atomic modules that turn raw replays into SFT-ready conversational training data. `replay_parser`, `canonical_priors`, `damage_inferencer`, and `threat_matrix` are implemented; `teacher_llm` and `master_pipeline` are still stubs. |
 | [`notes/`](notes/) | — | Free-form planning notes (data sourcing options, scope decisions, etc). |
 
 ## Pipeline overview
@@ -36,12 +36,17 @@ Pokémon Showdown
 │         │                                                                │
 │         ▼  per-turn snapshots (JSONL)                                    │
 │                                                                          │
-│  damage_inferencer.py ── /calc, /dex/move ▶  calc_microservice           │
-│         ▲ │                                                              │
-│         │ ▼  tightens OpponentKnowledgeState (per-stat min_evs/max_evs)  │
+│  canonical_priors.py  (pure data lookup, no network)                     │
 │         │                                                                │
+│         ▼                                                                │
+│  damage_inferencer.py ── /calc, /dex/move ▶  calc_microservice           │
+│         ▲ │   (two-way binary search → tightens                          │
+│         │ │    KnowledgeState (p1) AND KnowledgeState (p2) atomically)   │
+│         │ ▼                                                              │
 │  threat_matrix.py     ── /calc, /dex/move ▶  calc_microservice           │
-│         │  (consumes the same OpponentKnowledgeState for low/high)       │
+│         │   (Absolute envelope from KnowledgeStates +                    │
+│         │    Probable envelope from canonical_priors,                    │
+│         │    flagged [PRIOR CONTRADICTED] when they disagree)            │
 │         ▼                                                                │
 │  teacher_llm.py       ── HTTP ────────────▶  frontier model              │
 │         │                                                                │
@@ -108,16 +113,24 @@ python3 -m venv .venv
 ### 4. Generate training data — *pending* (orchestrator only)
 
 For each turn in each match, the orchestrator (`master_pipeline.py`, still a
-stub) will chain three working library modules:
+stub) will chain four working library modules:
 
 1. **`damage_inferencer.update_knowledge(...)`** — feed the turn's damage
-   events into the EV-bound binary search; tighten the running
-   `OpponentKnowledgeState`.
-2. **`threat_matrix.generate_threat_matrix(...)`** — render the per-turn
-   low/high damage envelope as a compact text block (volatile state + EV
-   bounds threaded through every `/calc`).
-3. **`teacher_llm.generate(...)`** *(stub)* — drive a frontier model through
+   events into a two-way binary search; tighten **both** `KnowledgeState`s
+   atomically.
+2. **`canonical_priors.get_probable_spread(...)`** — pure-data lookup of the
+   meta spread per species.
+3. **`threat_matrix.generate_threat_matrix(...)`** — dual-track text block:
+   Absolute envelope (from KnowledgeStates) + Probable envelope (from
+   canonical priors), with `[PRIOR CONTRADICTED]` flags.
+4. **`teacher_llm.generate(...)`** *(stub)* — drive a frontier model through
    a tool-calling CoT loop toward the human's known play.
+
+> **Blocking sub-task:** the inferencer needs per-turn `DamageEvent` records
+> (attacker slot, defender slot, move, hp before/after, crit flag), which
+> `/parse_log` doesn't yet emit. The next piece of work is extending the
+> Node endpoint to surface protocol events and threading them through
+> `replay_parser.py` into `parsed_data/{bo1,bo3}.jsonl`.
 
 Output: one conversational JSONL row per turn.
 
@@ -135,8 +148,9 @@ Output: one conversational JSONL row per turn.
 | `data_scraper` | Working. 16,537 replays cached locally across both Reg I formats. |
 | `calc_microservice` | Working. Three endpoints: `POST /calc` (damage math), `POST /parse_log` (Showdown log → turn snapshots), `GET /dex/move/:name` (move metadata). |
 | `pipeline/replay_parser.py` | Working. ETL CLI: walks scraper output, stitches Bo3 series, POSTs each `log` to `/parse_log`, writes one match per line to `parsed_data/{bo1,bo3}.jsonl`. Resumable. |
-| `pipeline/damage_inferencer.py` | Working. Library: `update_knowledge(...)` binary-searches observed damage events to tighten per-opponent EV bounds. |
-| `pipeline/threat_matrix.py` | Working. Library: `generate_threat_matrix(...)` returns the per-turn low/high damage-envelope text block, threading status/boosts/Tera/weather through every calc payload. |
+| `pipeline/canonical_priors.py` | Working. Library: `get_probable_spread(species)` returns the meta spread (curated table for top ~40 species + base-stat heuristic for the rest). Mock — to be replaced by real Smogon usage data. |
+| `pipeline/damage_inferencer.py` | Working. Library: dual-state `KnowledgeState` (p1 + p2), two-way binary search per damage event with atomic application. End-to-end blocked on `action_log` production (per-turn protocol events from `/parse_log`). |
+| `pipeline/threat_matrix.py` | Working. Library: dual-track output (Absolute envelope from `KnowledgeState`s + Probable envelope from canonical priors), with `[PRIOR CONTRADICTED]` flag when they disagree. |
 | `pipeline/teacher_llm.py` | Stub. |
 | `pipeline/master_pipeline.py` | Stub. |
 

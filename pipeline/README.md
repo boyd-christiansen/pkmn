@@ -1,9 +1,9 @@
 # pipeline
 
 Atomic Python modules that turn raw Pokémon Showdown replays into SFT-ready
-conversational training data. `replay_parser.py`, `damage_inferencer.py`, and
-`threat_matrix.py` are implemented; `teacher_llm.py` and `master_pipeline.py`
-are still stubs.
+conversational training data. `replay_parser.py`, `canonical_priors.py`,
+`damage_inferencer.py`, and `threat_matrix.py` are implemented; `teacher_llm.py`
+and `master_pipeline.py` are still stubs.
 
 ## Setup
 
@@ -91,52 +91,98 @@ emits one JSONL row per *match*.
 [calc_microservice README](../calc_microservice/README.md#post-parse_log) for
 the per-turn shape.
 
-### `damage_inferencer.py` *(implemented)*
+### `canonical_priors.py` *(implemented)*
 
-Tightens an `OpponentKnowledgeState` (per-Pokémon `min_evs` / `max_evs` boxes
-in [0, 252]^6) by binary-searching observed damage events from the calc
-microservice. Damage % is monotonically decreasing in defender HP/Def/SpD
-EVs, so a textbook binary search works for each stat.
+Returns the *probable* spread (EVs / IVs / nature) for a species under
+standard meta play. Backs the **Probable Range** track in
+`threat_matrix.py`. Mock implementation today, will be wired to real
+Smogon usage stats later.
 
-- **In:** turn snapshots, a list of `DamageEvent` records (one per
-  damage-dealing hit on a tracked opponent), and the current
-  `OpponentKnowledgeState`.
-- **Out:** the same dict, mutated in place — `min_evs` ratcheted up,
-  `max_evs` ratcheted down where the new observation allows.
-- **Touches:** `POST /calc` (binary-search probes) and `GET /dex/move/:name`
-  (to identify the move's category and pick Def vs SpD). No LLM, no replay
-  parsing, no imports from sibling pipeline modules.
-- **Fuzzy HP**: spectator-visible HP percentages are widened by ±0.9% before
-  matching against calc rolls, to absorb the 1% rounding on opponent HP bars.
-- **Cross-stat coupling**: when bounding one stat, other unknowns are held
-  at the *least restrictive* edge of their current bounds, so we never
-  over-tighten because of joint uncertainty.
-- **KOs**: a KO observation only constrains `max_evs` (the defender can't be
-  bulky enough that even max roll wouldn't KO); `min_evs` is left alone.
-- **Caveat**: the algorithm assumes the attacker's offensive EVs are known
-  (or held constant). If the attacker is also an opponent with wide EV
-  bounds, the inference will be conservative or wrong-tight depending on the
-  median assumption. The orchestrator should plug in a sensible attacker
-  prior (e.g. lock common offensive Pokémon to "max Atk/SpA") before
-  invoking this module.
+- **API:** `get_probable_spread(species, format_id=None) -> ProbableSpread`.
+- **Lookup order:**
+  1. Hand-curated table of spreads for the top ~40 Reg I species
+     (Calyrex-Shadow → Timid SpA/Spe, Urshifu → Adamant Atk/Spe,
+     Amoonguss → Calm HP/SpD, etc.).
+  2. Base-stat heuristic for species not in the table:
+     - `max(atk, spa) ≥ 110` → max attacking stat + Spe, Jolly/Timid if
+       fast, Adamant/Modest otherwise.
+     - `hp ≥ 95 ∧ spe ≤ 70` → bulky support: max HP + heavier defensive
+       side (Calm or Bold).
+     - else → mixed offensive default.
+  3. Generic balanced base stats for completely unknown species.
+- **Touches:** nothing external. Pure data lookup.
 
-### `threat_matrix.py` *(implemented)*
+### `damage_inferencer.py` *(implemented — dual-state, two-way)*
 
-Renders the per-turn damage envelope as a compact human-readable text block,
-ready to inline into an SFT prompt or return as a tool-call response.
+Maintains a `KnowledgeState` per side (the orchestrator holds two:
+`p1_knowledge`, `p2_knowledge`) — per-species `min_evs` / `max_evs` boxes
+in `[0, 252]^6`. Each observed damage event tightens **both** sides at once
+via binary search against the calc microservice.
 
-- **In:** one snapshot, `p1_side` indicating which side is "us", and the
-  `OpponentKnowledgeState`.
-- **Out:** a single string, one section for outgoing (us → opp) and one for
-  incoming (opp → us). Each line: `move | low <calc range> (KO chance) | high <calc range> (KO chance)`.
-- **Touches:** `POST /calc` and `GET /dex/move/:name`. Status moves are
-  filtered out before any calc request fires.
-- **Volatile state**: every `/calc` payload carries the attacker's and
-  defender's `status` and `boosts` from the snapshot (so e.g. an Intimidated
-  attacker shows the `-1 Atk` damage hit).
-- **Bound semantics**:
-  - INCOMING: low uses opp `min_atk` / `min_spa`; high uses opp `max_atk` / `max_spa`.
-  - OUTGOING: low uses opp `max_hp` + `max_def` / `max_spd` (bulkiest); high uses opp `min_hp` + `min_def` / `min_spd` (frailest).
+- **In:** turn snapshots, a `list[DamageEvent]` for the turn (slot-based:
+  `attacker_slot="p1a"`, `defender_slot="p2b"`, `move_name`,
+  `hp_before_pct`, `hp_after_pct`, `is_crit`, `is_ko`), and both
+  `KnowledgeState`s.
+- **Out:** the same `(p1_knowledge, p2_knowledge)` tuple, mutated in
+  place — `min_evs` ratcheted up, `max_evs` ratcheted down per event.
+- **Touches:** `POST /calc` and `GET /dex/move/:name`. No replay parsing,
+  no LLM, no sibling imports.
+- **Two-way binary search.** For each non-status, non-crit event we run
+  six binary searches per damage event:
+  - DEFENDER `min_def`, `max_def`, `min_hp`, `max_hp`
+  - ATTACKER `min_off`, `max_off` (`atk` if physical, `spa` if special)
+
+  Cross-side coupling is handled with interval arithmetic — when
+  searching the defender, the attacker is held at its *least restrictive*
+  current bound, and vice versa. (E.g. to find the largest Def consistent
+  with the observation, hold attacker at its `max_off`; to find the
+  smallest Def, hold attacker at its `min_off`.) Symmetric for HP.
+- **Atomic application.** All six searches use **pre-update** bounds, then
+  results apply at the end. This makes the update order-independent —
+  no risk of over-tightening one side because the other has already
+  shifted.
+- **Fuzzy HP:** ±0.9% tolerance to absorb the 1% rounding on
+  spectator-visible HP bars.
+- **Skip rules:** `is_crit=True` (would need `/calc` `isCrit` support, see
+  follow-up), Status-category moves, missing slots, observations with no
+  consistent EV in `[0, 252]` (data inconsistency — bound left untouched).
+- **Action_log producer (status: not built yet).** `update_knowledge`
+  consumes a `list[DamageEvent]` per turn but `/parse_log` doesn't yet
+  emit them — extending the Node endpoint to return per-turn protocol
+  events (`|move|`, `|-damage|`, `|-crit|`) and threading them through
+  `replay_parser.py` is the next blocking task before the orchestrator
+  can run end-to-end.
+
+### `threat_matrix.py` *(implemented — dual-track)*
+
+Renders the per-turn damage envelope as a compact human-readable text
+block, with **two damage tracks per matchup**:
+
+- **Absolute** — strict mathematical envelope from the live
+  `KnowledgeState`s. Wide but provable.
+- **Probable (meta)** — single calc result using each Pokémon's
+  `canonical_priors` spread. Narrow, fast, and only as good as the prior.
+
+If the canonical prior falls outside the Absolute box for any relevant
+stat (HP, off-stat, def-stat), the line is flagged
+`[PRIOR CONTRADICTED]` so the LLM can spot off-meta opponents.
+
+- **In:** one snapshot, `p1_side` (which side is "us"), and **both**
+  `p1_knowledge` and `p2_knowledge`.
+- **Out:** a single string, one section for outgoing (us → opp) and one
+  for incoming (opp → us).
+- **Touches:** `POST /calc` (3 calls per matchup-move: abs-low, abs-high,
+  probable) and `GET /dex/move/:name` (cached). Status moves filtered out.
+- **Volatile state:** status, boosts, weather, terrain, side conditions,
+  Tera state — all threaded into every payload from the snapshot.
+
+#### Output line format
+
+```
+[opp Flutter Mane] vs [us Urshifu]:
+  moonblast              Absolute: 105.2%–160.8%  |  Probable (meta): 135.4%–150.1%  (guaranteed OHKO)
+  shadow ball            Absolute: 47.1%–82.0%   |  Probable (meta): 62.1%–73.5%   (guaranteed 2HKO)  [PRIOR CONTRADICTED]
+```
 
 ### `teacher_llm.py`
 
@@ -157,14 +203,17 @@ Orchestrator. Wires everything together:
 
 ```
 raw replay JSON
-    → replay_parser              # BoardState[] per turn
+    → replay_parser  →  per-turn snapshots
+    │
+    │  per match: init  K1, K2 = init_knowledge(p1_team), init_knowledge(p2_team)
     │
     │  for each turn (in order):
-    │    → damage_inferencer.update_knowledge(snap_pre, snap_post, events, K)
-    │      (tightens K = OpponentKnowledgeState in place)
-    │    → threat_matrix.generate(snap, p1_side, K)
-    │      (per-turn threat block, low/high envelopes)
-    │    → teacher_llm.generate(snap, label, threats, K)
+    │    → damage_inferencer.update_knowledge(snap_pre, snap_post, events, K1, K2)
+    │      (tightens BOTH K1 and K2 in place — two-way binary search)
+    │    → threat_matrix.generate(snap, p1_side, K1, K2)
+    │      (dual-track: Absolute envelope + Probable meta-spread range,
+    │       flagged [PRIOR CONTRADICTED] when canonical priors disagree)
+    │    → teacher_llm.generate(snap, label, threats, K1, K2)
     │      (CoT messages with tool calls)
     │
     → JSONL row written to disk
@@ -179,7 +228,18 @@ Anthropic conversational schema).
 | Module | State |
 |---|---|
 | `replay_parser.py` | Working. Run `python replay_parser.py --help`. |
-| `damage_inferencer.py` | Working. Library module: `update_knowledge(...)` + `init_knowledge(...)`. |
-| `threat_matrix.py` | Working. Library module: `await generate_threat_matrix(snapshot, p1_side, knowledge)`. |
+| `canonical_priors.py` | Working. Library: `get_probable_spread(species)` — mock heuristic until real Smogon data lands. |
+| `damage_inferencer.py` | Working. Library: dual-state, two-way binary search. End-to-end blocked on per-turn `action_log` production (see follow-up below). |
+| `threat_matrix.py` | Working. Library: dual-track Absolute + Probable output with `[PRIOR CONTRADICTED]` flag. |
 | `teacher_llm.py` | Stub. Prompt design + tool-calling loop; the alignment-quality crux of the project. |
-| `master_pipeline.py` | Stub. Wires the above four together; build last. |
+| `master_pipeline.py` | Stub. Wires the above five together; build last. |
+
+## Required follow-up: `action_log` from `/parse_log`
+
+`damage_inferencer.update_knowledge` consumes `list[DamageEvent]` per turn,
+but `/parse_log` doesn't emit them yet. Building a real orchestrator requires
+extending the Node endpoint to surface per-turn protocol events (`|move|`,
+`|-damage|`, `|-crit|`, `|-supereffective|`, weather/end-of-turn markers) and
+threading them through `replay_parser.py` into `parsed_data/{bo1,bo3}.jsonl`.
+That's a separate task — the modules in this PR ship as libraries verified
+against synthetic events.

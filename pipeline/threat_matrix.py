@@ -1,57 +1,58 @@
-"""Render the per-turn damage envelope as a compact human-readable text block.
+"""Dual-track damage envelope for one turn snapshot, ready for the SFT prompt.
 
 Pipeline role:
     For one BoardState (one /parse_log snapshot), enumerate every plausible
     (attacker, move, defender) triple between the two sides and ask the calc
-    microservice for damage bounds.
+    microservice for two damage answers per matchup:
 
-    Each calc payload includes the volatile state from the snapshot (status,
-    boosts, weather, terrain, side conditions, Tera) so the answer reflects
-    the actual board, not a sterile lab calc.
+      - **Absolute**: the strict mathematical envelope using BOTH sides'
+        current `KnowledgeState` bounds. Wide but provable.
+      - **Probable (meta)**: the single calc result assuming both Pokémon are
+        running their canonical meta spread (`canonical_priors`). Narrow,
+        quick, and only as good as the prior.
 
-    For damage that flows over the opponent boundary, two calcs are run per
-    move: the *low* and *high* envelopes derived from the OpponentKnowledge
-    EV bounds — see the rules below.
+    Whenever the canonical prior falls outside the absolute bounds for any
+    relevant stat, the line is flagged `[PRIOR CONTRADICTED]` so the LLM
+    can reason about off-meta opponents.
 
 Inputs:
     snapshot           — one TurnSnapshot dict from /parse_log.
-    p1_side            — "p1" or "p2", indicating which side is "us".
-    current_knowledge  — OpponentKnowledgeState (see damage_inferencer.py).
+    p1_side            — "p1" or "p2", whichever is "us" for the LLM.
+    p1_knowledge       — KnowledgeState for side p1.
+    p2_knowledge       — KnowledgeState for side p2.
 
 Outputs:
-    A single string formatted as a small text block, ready to be inlined
-    into the SFT prompt or returned as a tool-call response.
-
-Bounds rules (per the project spec):
-    INCOMING (opp → us):
-      • Low  uses opponent's min_atk / min_spa
-      • High uses opponent's max_atk / max_spa
-    OUTGOING (us → opp):
-      • Low  uses opponent's max_hp + max_def / max_spd  (opp is bulkiest)
-      • High uses opponent's min_hp + min_def / min_spd  (opp is frailest)
+    A single text block with one line per (attacker, move, defender),
+    grouped by direction (OUTGOING us → opp, INCOMING opp → us).
 
 Isolation contract:
-    HTTP-calls calc_microservice (`/calc`, `/dex/move`). No replay parsing,
-    no LLM, no imports from sibling pipeline modules.
+    HTTP-calls calc_microservice (`/calc`, `/dex/move`). Pure-data import of
+    `canonical_priors`. No replay parsing, no LLM, no imports from
+    `damage_inferencer` beyond the shared types/helpers.
 """
 from __future__ import annotations
 
-import asyncio
 from typing import Any, Mapping
 
 import aiohttp
 
+from canonical_priors import ProbableSpread, get_probable_spread
 from damage_inferencer import (
     DEFAULT_CALC_BASE_URL,
-    OpponentKnowledgeState,
+    KnowledgeState,
     STATS,
     get_move_category,
+    init_knowledge_entry,
     species_key,
 )
 
 
 def _build_pokemon_payload(
-    pkm: dict[str, Any], evs: Mapping[str, int] | None
+    pkm: dict[str, Any],
+    *,
+    evs: Mapping[str, int] | None = None,
+    nature: str | None = None,
+    ivs: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "species": pkm["species"],
@@ -65,22 +66,22 @@ def _build_pokemon_payload(
     }
     if evs is not None:
         payload["evs"] = dict(evs)
+    if nature is not None:
+        payload["nature"] = nature
+    if ivs is not None:
+        payload["ivs"] = dict(ivs)
     return payload
 
 
 def _field_payload(snapshot: dict[str, Any], attacker_side: str) -> dict[str, Any]:
     f = snapshot.get("field", {})
-    is_p1_atk = attacker_side == "p1"
+    is_p1 = attacker_side == "p1"
     return {
         "gameType": "Doubles",
         "weather": f.get("weather"),
         "terrain": f.get("terrain"),
-        "attackerSide": {
-            "isTailwind": bool(f.get("tailwindP1") if is_p1_atk else f.get("tailwindP2"))
-        },
-        "defenderSide": {
-            "isTailwind": bool(f.get("tailwindP2") if is_p1_atk else f.get("tailwindP1"))
-        },
+        "attackerSide": {"isTailwind": bool(f.get("tailwindP1") if is_p1 else f.get("tailwindP2"))},
+        "defenderSide": {"isTailwind": bool(f.get("tailwindP2") if is_p1 else f.get("tailwindP1"))},
     }
 
 
@@ -94,72 +95,48 @@ async def _call_calc(
         return await r.json()
 
 
-def _attacker_evs_for_bound(
-    knowledge: OpponentKnowledgeState | None,
-    attacker_species: str,
-    category: str,
-    bound: str,  # "low" | "high"
-) -> dict[str, int] | None:
-    """Pick attacker's offensive EVs for the bound. Defender side, opp attacker."""
-    if knowledge is None:
-        return None
-    entry = knowledge.get(species_key(attacker_species))
-    if entry is None:
-        return None
-    stat = "atk" if category == "Physical" else "spa"
-    edge = "min_evs" if bound == "low" else "max_evs"
-    evs = {s: 0 for s in STATS}
-    evs[stat] = entry[edge][stat]
-    return evs
+def _entry_or_default(state: KnowledgeState, species: str) -> dict[str, dict[str, int]]:
+    return state.get(species_key(species), init_knowledge_entry())
 
 
-def _defender_evs_for_bound(
-    knowledge: OpponentKnowledgeState | None,
-    defender_species: str,
-    category: str,
-    bound: str,  # "low" | "high"
-) -> dict[str, int] | None:
-    """Pick defender's HP+defensive EVs for the bound. Outgoing damage, opp defender."""
-    if knowledge is None:
-        return None
-    entry = knowledge.get(species_key(defender_species))
-    if entry is None:
-        return None
-    def_stat = "def" if category == "Physical" else "spd"
-    edge = "max_evs" if bound == "low" else "min_evs"
-    evs = {s: 0 for s in STATS}
-    evs["hp"] = entry[edge]["hp"]
-    evs[def_stat] = entry[edge][def_stat]
-    return evs
+def _is_prior_contradicted(
+    spread: ProbableSpread,
+    entry: dict[str, dict[str, int]],
+    relevant_stats: tuple[str, ...],
+) -> bool:
+    """True if the canonical EVs fall outside the proven bounds on any relevant stat."""
+    for s in relevant_stats:
+        ev = spread.evs.get(s, 0)
+        if ev < entry["min_evs"][s] or ev > entry["max_evs"][s]:
+            return True
+    return False
 
 
 def _fmt_pct(p: float) -> str:
     return f"{p:.1f}%"
 
 
-def _fmt_bound(prefix: str, result: dict[str, Any]) -> str:
-    return f"{prefix}: {_fmt_pct(result['minPercent'])}–{_fmt_pct(result['maxPercent'])}  ({result['koChance']})"
+def _fmt_range(lo: float, hi: float) -> str:
+    return f"{_fmt_pct(lo)}–{_fmt_pct(hi)}"
 
 
 async def generate_threat_matrix(
     snapshot: dict[str, Any],
     p1_side: str,
-    current_knowledge: OpponentKnowledgeState,
+    p1_knowledge: KnowledgeState,
+    p2_knowledge: KnowledgeState,
     *,
     session: aiohttp.ClientSession | None = None,
     base_url: str = DEFAULT_CALC_BASE_URL,
 ) -> str:
-    """Build the threat-matrix text block for one turn snapshot.
-
-    `p1_side` indicates which side is "us" — typically "p1" or "p2"; the other
-    side is treated as the opponent and the opponent's EV bounds are looked
-    up in `current_knowledge`.
-    """
+    """Render the dual-track threat matrix for one turn as a text block."""
     own_session = session is None
     if own_session:
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
     try:
-        return await _generate(snapshot, p1_side, current_knowledge, session, base_url)
+        return await _generate(
+            snapshot, p1_side, p1_knowledge, p2_knowledge, session, base_url
+        )
     finally:
         if own_session:
             await session.close()
@@ -168,7 +145,8 @@ async def generate_threat_matrix(
 async def _generate(
     snapshot: dict[str, Any],
     p1_side: str,
-    knowledge: OpponentKnowledgeState,
+    p1_knowledge: KnowledgeState,
+    p2_knowledge: KnowledgeState,
     session: aiohttp.ClientSession,
     base_url: str,
 ) -> str:
@@ -178,40 +156,40 @@ async def _generate(
     p1_active = [m for m in p1.get("active", []) if not m.get("fainted")]
     p2_active = [m for m in p2.get("active", []) if not m.get("fainted")]
 
-    out_lines: list[str] = [f"=== THREAT MATRIX  (turn {snapshot.get('turn', '?')}, us={p1_side}) ===", ""]
+    out: list[str] = [f"=== THREAT MATRIX  (turn {snapshot.get('turn', '?')}, us={p1_side}) ===", ""]
 
-    # OUTGOING — us → opp
-    out_lines.append("--- OUTGOING (us → opp) ---")
-    if not p1_active or not p2_active:
-        out_lines.append("(no active matchup)")
-    else:
-        for atk in p1_active:
-            for defn in p2_active:
-                lines = await _matchup(
+    out.append("--- OUTGOING (us → opp) ---")
+    for atk in p1_active:
+        for defn in p2_active:
+            out.extend(
+                await _matchup(
                     session, base_url, snapshot, atk, defn,
                     attacker_side=p1_side,
-                    knowledge=knowledge,
+                    attacker_knowledge=p1_knowledge,
+                    defender_knowledge=p2_knowledge,
                     direction="outgoing",
                 )
-                out_lines.extend(lines)
-    out_lines.append("")
+            )
+    if not (p1_active and p2_active):
+        out.append("(no active matchup)")
+    out.append("")
 
-    # INCOMING — opp → us
-    out_lines.append("--- INCOMING (opp → us) ---")
-    if not p1_active or not p2_active:
-        out_lines.append("(no active matchup)")
-    else:
-        for atk in p2_active:
-            for defn in p1_active:
-                lines = await _matchup(
+    out.append("--- INCOMING (opp → us) ---")
+    for atk in p2_active:
+        for defn in p1_active:
+            out.extend(
+                await _matchup(
                     session, base_url, snapshot, atk, defn,
                     attacker_side=p2_side,
-                    knowledge=knowledge,
+                    attacker_knowledge=p2_knowledge,
+                    defender_knowledge=p1_knowledge,
                     direction="incoming",
                 )
-                out_lines.extend(lines)
+            )
+    if not (p1_active and p2_active):
+        out.append("(no active matchup)")
 
-    return "\n".join(out_lines).rstrip() + "\n"
+    return "\n".join(out).rstrip() + "\n"
 
 
 async def _matchup(
@@ -222,76 +200,100 @@ async def _matchup(
     defender: dict[str, Any],
     *,
     attacker_side: str,
-    knowledge: OpponentKnowledgeState,
-    direction: str,  # "outgoing" | "incoming"
+    attacker_knowledge: KnowledgeState,
+    defender_knowledge: KnowledgeState,
+    direction: str,
 ) -> list[str]:
     moves = attacker.get("revealedMoves") or []
     if not moves:
         return []
 
     field_payload = _field_payload(snapshot, attacker_side)
-    lines: list[str] = []
+    a_entry = _entry_or_default(attacker_knowledge, attacker["species"])
+    d_entry = _entry_or_default(defender_knowledge, defender["species"])
+    a_prior = get_probable_spread(attacker["species"])
+    d_prior = get_probable_spread(defender["species"])
 
     label = (
         f"[us {attacker['species']}] vs [opp {defender['species']}]"
         if direction == "outgoing"
         else f"[opp {attacker['species']}] vs [us {defender['species']}]"
     )
-    lines.append(label + (f"  (status={attacker.get('status')}, boosts={attacker.get('boosts')})" if attacker.get('status') or attacker.get('boosts') else ""))
+    extras = []
+    if attacker.get("status"):
+        extras.append(f"atk_status={attacker['status']}")
+    if attacker.get("boosts"):
+        extras.append(f"atk_boosts={attacker['boosts']}")
+    if defender.get("boosts"):
+        extras.append(f"def_boosts={defender['boosts']}")
+    head = label + (f"  ({', '.join(extras)})" if extras else "")
+    lines: list[str] = [head]
 
     for move in moves:
         category = await get_move_category(session, base_url, move)
         if category == "Status":
             continue
+        off_stat = "atk" if category == "Physical" else "spa"
+        def_stat = "def" if category == "Physical" else "spd"
 
-        if direction == "outgoing":
-            # opponent is the defender; vary opp's HP+defense EVs
-            low_evs = _defender_evs_for_bound(knowledge, defender["species"], category, "low")
-            high_evs = _defender_evs_for_bound(knowledge, defender["species"], category, "high")
-            atk_payload = _build_pokemon_payload(attacker, evs=None)
-            low_payload = {
-                "attacker": atk_payload,
-                "defender": _build_pokemon_payload(defender, evs=low_evs),
-                "move": move,
-                "field": field_payload,
-            }
-            high_payload = {
-                "attacker": atk_payload,
-                "defender": _build_pokemon_payload(defender, evs=high_evs),
-                "move": move,
-                "field": field_payload,
-            }
-        else:
-            # opponent is the attacker; vary opp's offensive EVs
-            low_evs = _attacker_evs_for_bound(knowledge, attacker["species"], category, "low")
-            high_evs = _attacker_evs_for_bound(knowledge, attacker["species"], category, "high")
-            def_payload = _build_pokemon_payload(defender, evs=None)
-            low_payload = {
-                "attacker": _build_pokemon_payload(attacker, evs=low_evs),
-                "defender": def_payload,
-                "move": move,
-                "field": field_payload,
-            }
-            high_payload = {
-                "attacker": _build_pokemon_payload(attacker, evs=high_evs),
-                "defender": def_payload,
-                "move": move,
-                "field": field_payload,
-            }
+        # Absolute bounds: low end = bulkiest defender + weakest attacker;
+        # high end = frailest defender + strongest attacker.
+        att_low_evs = {s: 0 for s in STATS}
+        att_low_evs[off_stat] = a_entry["min_evs"][off_stat]
+        def_low_evs = {s: 0 for s in STATS}
+        def_low_evs["hp"] = d_entry["max_evs"]["hp"]
+        def_low_evs[def_stat] = d_entry["max_evs"][def_stat]
+
+        att_high_evs = {s: 0 for s in STATS}
+        att_high_evs[off_stat] = a_entry["max_evs"][off_stat]
+        def_high_evs = {s: 0 for s in STATS}
+        def_high_evs["hp"] = d_entry["min_evs"]["hp"]
+        def_high_evs[def_stat] = d_entry["min_evs"][def_stat]
 
         try:
-            low_result = await _call_calc(session, base_url, low_payload)
-            high_result = await _call_calc(session, base_url, high_payload)
+            abs_low = await _call_calc(
+                session, base_url,
+                {
+                    "attacker": _build_pokemon_payload(attacker, evs=att_low_evs),
+                    "defender": _build_pokemon_payload(defender, evs=def_low_evs),
+                    "move": move, "field": field_payload,
+                },
+            )
+            abs_high = await _call_calc(
+                session, base_url,
+                {
+                    "attacker": _build_pokemon_payload(attacker, evs=att_high_evs),
+                    "defender": _build_pokemon_payload(defender, evs=def_high_evs),
+                    "move": move, "field": field_payload,
+                },
+            )
+            prob = await _call_calc(
+                session, base_url,
+                {
+                    "attacker": _build_pokemon_payload(
+                        attacker, evs=a_prior.evs, nature=a_prior.nature, ivs=a_prior.ivs
+                    ),
+                    "defender": _build_pokemon_payload(
+                        defender, evs=d_prior.evs, nature=d_prior.nature, ivs=d_prior.ivs
+                    ),
+                    "move": move, "field": field_payload,
+                },
+            )
         except Exception as e:
             lines.append(f"  {move}  ERROR: {e}")
             continue
 
+        # Stats relevant to the contradiction check: the attacker's off-stat
+        # for the attacker prior, the defender's HP+def-stat for the
+        # defender prior. Either being outside its absolute box flags it.
+        atk_contradicted = _is_prior_contradicted(a_prior, a_entry, (off_stat,))
+        def_contradicted = _is_prior_contradicted(d_prior, d_entry, ("hp", def_stat))
+        flag = "  [PRIOR CONTRADICTED]" if (atk_contradicted or def_contradicted) else ""
+
+        absolute_str = _fmt_range(abs_low["minPercent"], abs_high["maxPercent"])
+        probable_str = _fmt_range(prob["minPercent"], prob["maxPercent"])
         lines.append(
-            f"  {move:<22} "
-            f"low {_fmt_pct(low_result['minPercent'])}–{_fmt_pct(low_result['maxPercent'])} "
-            f"({low_result['koChance']})  |  "
-            f"high {_fmt_pct(high_result['minPercent'])}–{_fmt_pct(high_result['maxPercent'])} "
-            f"({high_result['koChance']})"
+            f"  {move:<22} Absolute: {absolute_str}  |  Probable (meta): {probable_str}  ({prob['koChance']}){flag}"
         )
 
     return lines

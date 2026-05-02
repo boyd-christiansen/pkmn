@@ -1,44 +1,39 @@
-"""Tighten EV bounds on opponent Pokémon by binary-searching observed damage events.
+"""Two-way EV-bound inference from observed damage events.
 
 Pipeline role:
-    Maintains an `OpponentKnowledgeState` per match — for each opponent species,
-    a (min_evs, max_evs) box in [0, 252]^6 stat space. Each turn's observed
-    damage events are fed in via `update_knowledge`, which uses the calc
-    microservice to binary-search the consistent EV range and tighten the box.
+    Per match the orchestrator maintains TWO `KnowledgeState`s — one per side.
+    Each turn's damage events are fed to `update_knowledge`, which binary-
+    searches the consistent EV range for *both* the attacker and defender of
+    every event, using interval arithmetic over the other side's bounds so
+    neither side's hidden EVs are assumed.
 
-    The bounds are then consumed by `threat_matrix.py` to produce low/high
-    damage envelopes.
+    The bounds feed `threat_matrix.py`'s "Absolute" track.
 
-Inputs:
-    snapshot_pre   — the /parse_log snapshot taken at the START of the turn
-                     (provides volatile state: status, boosts, weather, ...).
-    snapshot_post  — same shape, START of the next turn.
-    action_log     — list[DamageEvent] of damage-dealing hits this turn.
-    current_knowledge — OpponentKnowledgeState dict, mutated in place.
-
-Outputs:
-    The same `current_knowledge` dict, with `min_evs` ratcheted up and
-    `max_evs` ratcheted down where new observations allow.
+Key design choices:
+    • Slot-based event addressing ("p1a", "p2b") — VGC has Species Clause but
+      we're ready for switch shenanigans regardless.
+    • Two-way updates: every observation tightens BOTH sides at once. To
+      avoid order-dependent over-tightening, all six binary searches per
+      event run against pre-update bounds, then results are applied
+      atomically.
+    • Cross-stat coupling on the *same* side (e.g. defender HP × Def) is
+      handled by holding the other unknown at its least-restrictive bound
+      during each search.
+    • Cross-side coupling (attacker × defender uncertainty) is handled the
+      same way — see the per-search "least restrictive" comments below.
 
 Isolation contract:
     HTTP-calls calc_microservice (`/calc`, `/dex/move`). No replay parsing,
     no LLM. No imports from sibling pipeline modules.
 
-Algorithm:
-    Damage % is monotonically decreasing in defender HP/Def/SpD EVs. For each
-    relevant stat, two binary searches over [0, 252] find:
-      - smallest EV where calc.minPercent ≤ observed.maxPercent  (new min_ev)
-      - largest  EV where calc.maxPercent ≥ observed.minPercent  (new max_ev)
-    Other unknowns are held at the *least restrictive* bound during each
-    search (e.g. when bounding Def's lower edge, hold HP at max_evs) so that
-    bounds are never over-tightened due to coupling between unknowns.
-
-    The "fuzzy HP" tolerance widens the observation by ±0.9% to account for
-    the 1% rounding the spectator sees on opponent HP bars.
+Known limitations:
+    • Critical hits (`event.is_crit`) are skipped; folding 1.5× damage and
+      stat-stage bypass into the search would need /calc to accept isCrit.
+    • action_log production is upstream of this module and not yet built —
+      see the project README for status.
 """
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
 
@@ -51,38 +46,37 @@ DEFAULT_MAX_EV = 252
 FUZZY_HP_TOLERANCE = 0.9  # percent
 
 
-OpponentKnowledgeState = dict[str, dict[str, dict[str, int]]]
-# Shape:
-#   {
-#     "calyrexshadow": {
-#       "min_evs": {"hp": 0, "atk": 0, ...},
-#       "max_evs": {"hp": 252, "atk": 252, ...},
-#     },
-#     ...
-#   }
+# A KnowledgeState tracks per-species bounds for *one side*.
+# {
+#   "calyrexshadow": {
+#     "min_evs": {"hp": 0, "atk": 0, ...},
+#     "max_evs": {"hp": 252, ...},
+#   },
+#   ...
+# }
+KnowledgeState = dict[str, dict[str, dict[str, int]]]
 
 
 @dataclass
 class DamageEvent:
-    """A single damage-dealing hit observed within one turn.
+    """One damage-dealing hit observed within a turn.
 
-    `hp_before`/`hp_after` are spectator-visible HP percentages (0-100).
-    `is_ko` widens the observation: damage was at least `hp_before`, with no
-    upper bound from this event alone.
+    `attacker_slot`, `defender_slot` are PS-style identifiers like "p1a",
+    "p2b". `hp_before_pct` and `hp_after_pct` are the *defender's* HP %
+    immediately around this hit (not the post-turn snapshot — multi-hit
+    turns interpose between snapshots).
     """
 
-    attacker_species: str
-    attacker_side: str  # "p1" | "p2"
-    defender_species: str
-    defender_side: str  # "p1" | "p2"
-    move: str
-    hp_before: float
-    hp_after: float
+    attacker_slot: str
+    defender_slot: str
+    move_name: str
+    hp_before_pct: float
+    hp_after_pct: float
+    is_crit: bool = False
     is_ko: bool = False
 
 
 def species_key(species: str) -> str:
-    """Normalise a species name to the @pkmn-style ID (lowercase, alnum only)."""
     return "".join(c for c in species.lower() if c.isalnum())
 
 
@@ -93,16 +87,16 @@ def init_knowledge_entry() -> dict[str, dict[str, int]]:
     }
 
 
-def init_knowledge(species_list: list[str]) -> OpponentKnowledgeState:
+def init_knowledge(species_list: list[str]) -> KnowledgeState:
     return {species_key(s): init_knowledge_entry() for s in species_list}
 
 
-def _find_active_pokemon(
-    snapshot: dict[str, Any], side: str, species: str
-) -> dict[str, Any] | None:
-    target = species_key(species)
+def _find_pokemon_by_slot(snapshot: dict[str, Any], slot: str) -> dict[str, Any] | None:
+    if len(slot) < 3:
+        return None
+    side, letter = slot[:2], slot[2]
     for p in snapshot.get(side, {}).get("active", []):
-        if species_key(p["species"]) == target:
+        if p.get("slot") == letter:
             return p
     return None
 
@@ -129,17 +123,13 @@ def _build_pokemon_payload(
 
 def _field_payload(snapshot: dict[str, Any], attacker_side: str) -> dict[str, Any]:
     f = snapshot.get("field", {})
-    is_p1_atk = attacker_side == "p1"
+    is_p1 = attacker_side == "p1"
     return {
         "gameType": "Doubles",
         "weather": f.get("weather"),
         "terrain": f.get("terrain"),
-        "attackerSide": {
-            "isTailwind": bool(f.get("tailwindP1") if is_p1_atk else f.get("tailwindP2"))
-        },
-        "defenderSide": {
-            "isTailwind": bool(f.get("tailwindP2") if is_p1_atk else f.get("tailwindP1"))
-        },
+        "attackerSide": {"isTailwind": bool(f.get("tailwindP1") if is_p1 else f.get("tailwindP2"))},
+        "defenderSide": {"isTailwind": bool(f.get("tailwindP2") if is_p1 else f.get("tailwindP1"))},
     }
 
 
@@ -153,23 +143,12 @@ def observed_damage_range(
     return (max(0.0, nominal - fuzzy), min(100.0, nominal + fuzzy))
 
 
-async def _call_calc(
-    session: aiohttp.ClientSession, base_url: str, payload: dict[str, Any]
-) -> dict[str, Any]:
-    async with session.post(f"{base_url}/calc", json=payload) as r:
-        if r.status >= 400:
-            text = await r.text()
-            raise RuntimeError(f"/calc {r.status}: {text[:200]}")
-        return await r.json()
-
-
 _MOVE_CATEGORY_CACHE: dict[str, str] = {}
 
 
 async def get_move_category(
     session: aiohttp.ClientSession, base_url: str, move: str
 ) -> str:
-    """Return 'Physical' | 'Special' | 'Status'. Cached process-wide."""
     key = species_key(move)
     if key in _MOVE_CATEGORY_CACHE:
         return _MOVE_CATEGORY_CACHE[key]
@@ -184,68 +163,116 @@ async def get_move_category(
         return cat
 
 
+async def _call_calc(
+    session: aiohttp.ClientSession, base_url: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    async with session.post(f"{base_url}/calc", json=payload) as r:
+        if r.status >= 400:
+            text = await r.text()
+            raise RuntimeError(f"/calc {r.status}: {text[:200]}")
+        return await r.json()
+
+
+# ---------------------------------------------------------------------------
+# Binary search primitives.
+#
+# Damage % is monotonically:
+#   - DECREASING in defender HP / Def / SpD EVs  (more bulk → less %)
+#   - INCREASING in attacker Atk / SpA EVs       (more offense → more %)
+#
+# Each helper finds the boundary EV in [0, 252] given the appropriate
+# monotonicity. Returns None if no EV in range satisfies the constraint
+# (the observation is inconsistent with the held priors — caller skips).
+# ---------------------------------------------------------------------------
+
 EvalFn = Callable[[int], Awaitable[tuple[float, float]]]
 
 
-async def _binary_search_min_ev(eval_fn: EvalFn, target_max: float) -> int | None:
-    """Smallest EV in [0, 252] where calc.minPercent ≤ target_max.
-
-    Damage % is monotonically decreasing in defensive EVs, so a textbook
-    binary search applies. Returns None if no EV in range satisfies the
-    constraint (typically means our other priors are wrong or the observation
-    is noisy — caller should skip the update).
-    """
+async def _bsearch_min_defender_ev(eval_fn: EvalFn, target_max: float) -> int | None:
+    """Smallest defender EV in [0, 252] where calc.minPercent ≤ target_max."""
     lo, hi = DEFAULT_MIN_EV, DEFAULT_MAX_EV
-    calc_min_lo, _ = await eval_fn(lo)
-    if calc_min_lo <= target_max:
+    if (await eval_fn(lo))[0] <= target_max:
         return lo
-    calc_min_hi, _ = await eval_fn(hi)
-    if calc_min_hi > target_max:
+    if (await eval_fn(hi))[0] > target_max:
         return None
     while hi - lo > 1:
         mid = (lo + hi) // 2
-        calc_min, _ = await eval_fn(mid)
-        if calc_min <= target_max:
+        if (await eval_fn(mid))[0] <= target_max:
             hi = mid
         else:
             lo = mid
     return hi
 
 
-async def _binary_search_max_ev(eval_fn: EvalFn, target_min: float) -> int | None:
-    """Largest EV in [0, 252] where calc.maxPercent ≥ target_min."""
+async def _bsearch_max_defender_ev(eval_fn: EvalFn, target_min: float) -> int | None:
+    """Largest defender EV in [0, 252] where calc.maxPercent ≥ target_min."""
     lo, hi = DEFAULT_MIN_EV, DEFAULT_MAX_EV
-    _, calc_max_hi = await eval_fn(hi)
-    if calc_max_hi >= target_min:
+    if (await eval_fn(hi))[1] >= target_min:
         return hi
-    _, calc_max_lo = await eval_fn(lo)
-    if calc_max_lo < target_min:
+    if (await eval_fn(lo))[1] < target_min:
         return None
     while hi - lo > 1:
         mid = (lo + hi) // 2
-        _, calc_max = await eval_fn(mid)
-        if calc_max >= target_min:
+        if (await eval_fn(mid))[1] >= target_min:
             lo = mid
         else:
             hi = mid
     return lo
 
 
+async def _bsearch_min_attacker_ev(eval_fn: EvalFn, target_min: float) -> int | None:
+    """Smallest attacker EV in [0, 252] where calc.maxPercent ≥ target_min."""
+    lo, hi = DEFAULT_MIN_EV, DEFAULT_MAX_EV
+    if (await eval_fn(lo))[1] >= target_min:
+        return lo
+    if (await eval_fn(hi))[1] < target_min:
+        return None
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if (await eval_fn(mid))[1] >= target_min:
+            hi = mid
+        else:
+            lo = mid
+    return hi
+
+
+async def _bsearch_max_attacker_ev(eval_fn: EvalFn, target_max: float) -> int | None:
+    """Largest attacker EV in [0, 252] where calc.minPercent ≤ target_max."""
+    lo, hi = DEFAULT_MIN_EV, DEFAULT_MAX_EV
+    if (await eval_fn(hi))[0] <= target_max:
+        return hi
+    if (await eval_fn(lo))[0] > target_max:
+        return None
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if (await eval_fn(mid))[0] <= target_max:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
 async def update_knowledge(
     snapshot_pre: dict[str, Any],
-    snapshot_post: dict[str, Any],  # noqa: ARG001 - reserved for future use (cross-event sanity checks)
+    snapshot_post: dict[str, Any],  # noqa: ARG001 — reserved for cross-event sanity checks
     action_log: list[DamageEvent],
-    current_knowledge: OpponentKnowledgeState,
+    p1_knowledge: KnowledgeState,
+    p2_knowledge: KnowledgeState,
     *,
     session: aiohttp.ClientSession | None = None,
     base_url: str = DEFAULT_CALC_BASE_URL,
     fuzzy_hp_pct: float = FUZZY_HP_TOLERANCE,
-) -> OpponentKnowledgeState:
-    """Tighten EV bounds in `current_knowledge` from this turn's damage events.
+) -> tuple[KnowledgeState, KnowledgeState]:
+    """Tighten both p1 and p2 knowledge from this turn's damage events.
 
-    `snapshot_pre` provides the volatile state used in calc payloads
-    (status, boosts, weather, terrain, side conditions). Mutates
-    `current_knowledge` in place and returns it for chaining.
+    Mutates both knowledge dicts in place; returns them as a tuple for
+    chaining. Volatile state (status, boosts, weather, terrain, Tera) is
+    pulled directly from `snapshot_pre` into every calc payload.
     """
     own_session = session is None
     if own_session:
@@ -253,110 +280,150 @@ async def update_knowledge(
     try:
         for event in action_log:
             await _process_event(
-                event, snapshot_pre, current_knowledge, session, base_url, fuzzy_hp_pct
+                event, snapshot_pre, p1_knowledge, p2_knowledge, session, base_url, fuzzy_hp_pct
             )
     finally:
         if own_session:
             await session.close()
-    return current_knowledge
+    return p1_knowledge, p2_knowledge
 
 
 async def _process_event(
     event: DamageEvent,
     snapshot_pre: dict[str, Any],
-    current_knowledge: OpponentKnowledgeState,
+    p1_knowledge: KnowledgeState,
+    p2_knowledge: KnowledgeState,
     session: aiohttp.ClientSession,
     base_url: str,
     fuzzy: float,
 ) -> None:
-    defender_key = species_key(event.defender_species)
-    if defender_key not in current_knowledge:
-        return  # we only learn about Pokémon we're tracking
+    if event.is_crit:
+        return  # see module docstring: crit handling deferred
 
-    attacker_pkm = _find_active_pokemon(snapshot_pre, event.attacker_side, event.attacker_species)
-    defender_pkm = _find_active_pokemon(snapshot_pre, event.defender_side, event.defender_species)
+    attacker_side = event.attacker_slot[:2]
+    defender_side = event.defender_slot[:2]
+    if attacker_side == defender_side:
+        return  # self-targeting moves have no inferential value
+    if attacker_side not in ("p1", "p2") or defender_side not in ("p1", "p2"):
+        return
+
+    attacker_pkm = _find_pokemon_by_slot(snapshot_pre, event.attacker_slot)
+    defender_pkm = _find_pokemon_by_slot(snapshot_pre, event.defender_slot)
     if attacker_pkm is None or defender_pkm is None:
         return
 
-    category = await get_move_category(session, base_url, event.move)
+    category = await get_move_category(session, base_url, event.move_name)
     if category == "Status":
         return
+    off_stat = "atk" if category == "Physical" else "spa"
     def_stat = "def" if category == "Physical" else "spd"
 
     target_min, target_max = observed_damage_range(
-        event.hp_before, event.hp_after, event.is_ko, fuzzy
+        event.hp_before_pct, event.hp_after_pct, event.is_ko, fuzzy
     )
-    field_payload = _field_payload(snapshot_pre, event.attacker_side)
+    field_payload = _field_payload(snapshot_pre, attacker_side)
 
-    attacker_key = species_key(event.attacker_species)
-    if attacker_key in current_knowledge:
-        atk_entry = current_knowledge[attacker_key]
-        atk_evs: Mapping[str, int] | None = {
-            s: (atk_entry["min_evs"][s] + atk_entry["max_evs"][s]) // 2 for s in STATS
-        }
-    else:
-        atk_evs = None
-    attacker_payload = _build_pokemon_payload(attacker_pkm, evs=atk_evs)
+    a_state = p1_knowledge if attacker_side == "p1" else p2_knowledge
+    d_state = p1_knowledge if defender_side == "p1" else p2_knowledge
+    a_key = species_key(attacker_pkm["species"])
+    d_key = species_key(defender_pkm["species"])
+    a_state.setdefault(a_key, init_knowledge_entry())
+    d_state.setdefault(d_key, init_knowledge_entry())
 
-    entry = current_knowledge[defender_key]
+    # Snapshot pre-update bounds; all six searches use these so the result is
+    # order-independent. Applied atomically below.
+    a_min = dict(a_state[a_key]["min_evs"])
+    a_max = dict(a_state[a_key]["max_evs"])
+    d_min = dict(d_state[d_key]["min_evs"])
+    d_max = dict(d_state[d_key]["max_evs"])
 
-    async def eval_with(defender_evs: Mapping[str, int]) -> tuple[float, float]:
-        defender_payload = _build_pokemon_payload(defender_pkm, evs=defender_evs)
+    def _evs_for_atk(off_ev: int) -> dict[str, int]:
+        evs = {s: 0 for s in STATS}
+        evs[off_stat] = off_ev
+        return evs
+
+    def _evs_for_def(hp_ev: int, def_ev: int) -> dict[str, int]:
+        evs = {s: 0 for s in STATS}
+        evs["hp"] = hp_ev
+        evs[def_stat] = def_ev
+        return evs
+
+    async def calc(att_evs: Mapping[str, int], def_evs: Mapping[str, int]) -> tuple[float, float]:
         result = await _call_calc(
             session,
             base_url,
             {
-                "attacker": attacker_payload,
-                "defender": defender_payload,
-                "move": event.move,
+                "attacker": _build_pokemon_payload(attacker_pkm, evs=att_evs),
+                "defender": _build_pokemon_payload(defender_pkm, evs=def_evs),
+                "move": event.move_name,
                 "field": field_payload,
             },
         )
         return float(result["minPercent"]), float(result["maxPercent"])
 
-    def eval_pair(hp_ev: int, def_ev: int) -> Awaitable[tuple[float, float]]:
-        evs = {s: 0 for s in STATS}
-        evs["hp"] = hp_ev
-        evs[def_stat] = def_ev
-        return eval_with(evs)
-
-    # Tighten the relevant defensive stat (Def for physical, SpD for special).
-    # Hold HP at the *least restrictive* bound so we never over-tighten via
-    # cross-stat coupling: high HP makes a small min_def consistent; low HP
-    # makes a large max_def consistent.
-    new_min_def = await _binary_search_min_ev(
-        lambda d: eval_pair(entry["max_evs"]["hp"], d), target_max
+    # ----- DEFENDER bounds ----- (other-side held at LEAST RESTRICTIVE end) ---
+    # min_def: small def_ev should be consistent → easiest with weak attacker (a_min)
+    #          and bulky-HP defender (d_max.hp)
+    new_min_def = await _bsearch_min_defender_ev(
+        lambda d: calc(_evs_for_atk(a_min[off_stat]), _evs_for_def(d_max["hp"], d)),
+        target_max,
     )
-    if new_min_def is not None and new_min_def > entry["min_evs"][def_stat]:
-        entry["min_evs"][def_stat] = new_min_def
-
-    if not event.is_ko:
-        new_max_def = await _binary_search_max_ev(
-            lambda d: eval_pair(entry["min_evs"]["hp"], d), target_min
+    # max_def: large def_ev should be consistent → easiest with strong attacker (a_max)
+    #          and frail-HP defender (d_min.hp)
+    new_max_def = (
+        None if event.is_ko
+        else await _bsearch_max_defender_ev(
+            lambda d: calc(_evs_for_atk(a_max[off_stat]), _evs_for_def(d_min["hp"], d)),
+            target_min,
         )
-        if new_max_def is not None and new_max_def < entry["max_evs"][def_stat]:
-            entry["max_evs"][def_stat] = new_max_def
-
-    # Same shape for HP — hold defensive stat at the least restrictive end.
-    new_min_hp = await _binary_search_min_ev(
-        lambda h: eval_pair(h, entry["max_evs"][def_stat]), target_max
     )
-    if new_min_hp is not None and new_min_hp > entry["min_evs"]["hp"]:
-        entry["min_evs"]["hp"] = new_min_hp
-
-    if not event.is_ko:
-        new_max_hp = await _binary_search_max_ev(
-            lambda h: eval_pair(h, entry["min_evs"][def_stat]), target_min
+    new_min_hp = await _bsearch_min_defender_ev(
+        lambda h: calc(_evs_for_atk(a_min[off_stat]), _evs_for_def(h, d_max[def_stat])),
+        target_max,
+    )
+    new_max_hp = (
+        None if event.is_ko
+        else await _bsearch_max_defender_ev(
+            lambda h: calc(_evs_for_atk(a_max[off_stat]), _evs_for_def(h, d_min[def_stat])),
+            target_min,
         )
-        if new_max_hp is not None and new_max_hp < entry["max_evs"]["hp"]:
-            entry["max_evs"]["hp"] = new_max_hp
+    )
+
+    # ----- ATTACKER bounds ----- (defender held at LEAST RESTRICTIVE end) ---
+    # min_off: small off_ev should be consistent → easiest with frail defender (d_min)
+    new_min_off = await _bsearch_min_attacker_ev(
+        lambda a: calc(_evs_for_atk(a), _evs_for_def(d_min["hp"], d_min[def_stat])),
+        target_min,
+    )
+    # max_off: large off_ev should be consistent → easiest with bulky defender (d_max)
+    new_max_off = (
+        None if event.is_ko
+        else await _bsearch_max_attacker_ev(
+            lambda a: calc(_evs_for_atk(a), _evs_for_def(d_max["hp"], d_max[def_stat])),
+            target_max,
+        )
+    )
+
+    # ----- ATOMIC APPLY (only after all six searches resolved) ----------------
+    if new_min_def is not None and new_min_def > d_min[def_stat]:
+        d_state[d_key]["min_evs"][def_stat] = new_min_def
+    if new_max_def is not None and new_max_def < d_max[def_stat]:
+        d_state[d_key]["max_evs"][def_stat] = new_max_def
+    if new_min_hp is not None and new_min_hp > d_min["hp"]:
+        d_state[d_key]["min_evs"]["hp"] = new_min_hp
+    if new_max_hp is not None and new_max_hp < d_max["hp"]:
+        d_state[d_key]["max_evs"]["hp"] = new_max_hp
+    if new_min_off is not None and new_min_off > a_min[off_stat]:
+        a_state[a_key]["min_evs"][off_stat] = new_min_off
+    if new_max_off is not None and new_max_off < a_max[off_stat]:
+        a_state[a_key]["max_evs"][off_stat] = new_max_off
 
 
 __all__ = [
     "DEFAULT_CALC_BASE_URL",
     "DamageEvent",
     "FUZZY_HP_TOLERANCE",
-    "OpponentKnowledgeState",
+    "KnowledgeState",
     "STATS",
     "get_move_category",
     "init_knowledge",
