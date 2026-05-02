@@ -28,11 +28,16 @@ o-series) or the calc engine without rewriting the whole pipeline.
 Stitches Bo3 series and extracts turn-by-turn `BoardState` snapshots from raw
 Showdown logs.
 
-- **In:** raw replay JSON dicts (as produced by `data_scraper`).
+- **In:** raw replay JSON dicts (as produced by `data_scraper`) + URL of the
+  [`calc_microservice`](../calc_microservice/).
 - **Out:** list of per-turn `BoardState` objects (active Pokémon for both
   players, HP, status, boosts, items, known moves, weather, terrain, side
   conditions, Tera state) plus the actual decision the player made that turn.
-- **Touches:** nothing external. Pure deterministic transformation.
+- **Touches:** HTTP-calls `calc_microservice`'s `POST /parse_log` endpoint —
+  which runs the official `@pkmn/client` Battle state machine in Node so we get
+  correct handling of Zoroark illusion, end-of-turn order, multi-hit moves,
+  forme changes, etc. Python side just shapes the response and stitches Bo3
+  series. No regex parsing.
 
 ### `threat_matrix.py`
 

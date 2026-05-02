@@ -11,6 +11,9 @@
     "start": "node dist/server.js"
   },
   "dependencies": {
+    "@pkmn/client": "^0.7.2",
+    "@pkmn/dex": "^0.10.7",
+    "@pkmn/protocol": "^0.7.2",
     "@smogon/calc": "^0.11.0",
     "express": "^4.21.2"
   },

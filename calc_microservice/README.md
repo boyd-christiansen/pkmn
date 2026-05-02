@@ -1,12 +1,17 @@
 # calc_microservice
 
-Express + TypeScript HTTP wrapper around [`@smogon/calc`](https://www.npmjs.com/package/@smogon/calc).
-Exposes a single `POST /calc` endpoint that turns an attacker / defender / move /
-field payload into a deterministic damage range.
+Express + TypeScript service that wraps the official Smogon TypeScript libraries
+and exposes them over HTTP. Two endpoints:
 
-This is the only piece of the pipeline that knows how to compute damage. Every
-other component (Python pipeline, teacher LLM tool calls) goes through this
-HTTP boundary, so the calc engine can be swapped or upgraded independently.
+| Endpoint | Backed by | Purpose |
+|---|---|---|
+| `POST /calc` | [`@smogon/calc`](https://www.npmjs.com/package/@smogon/calc) | Deterministic damage range for an attacker × move × defender × field. |
+| `POST /parse_log` | [`@pkmn/protocol`](https://www.npmjs.com/package/@pkmn/protocol) + [`@pkmn/client`](https://www.npmjs.com/package/@pkmn/client) | Replay log → array of turn-by-turn battle-state snapshots. |
+
+Both endpoints are the *only* place in the project that knows about Showdown's
+internal data formats. Everything downstream (Python pipeline, teacher LLM tool
+calls) goes through this HTTP boundary, so the underlying libraries can be
+upgraded independently.
 
 ## Setup
 
@@ -144,6 +149,124 @@ curl -s -X POST http://localhost:3000/calc \
 }
 ```
 
+## `POST /parse_log`
+
+Turns a raw Pokémon Showdown replay log (the pipe-delimited transcript stored
+in each replay JSON's `log` field) into a sequence of structured snapshots, one
+per turn. Replaces what would otherwise be a brittle Python regex parser; uses
+the official `@pkmn/client` `Battle` state machine, which correctly handles
+edge cases like Zoroark illusion, end-of-turn ordering, multi-hit moves,
+forme changes, and revealed-info tracking.
+
+### Request body
+
+```ts
+{ "log": "raw pipe-delimited Showdown log string" }
+```
+
+### Response
+
+```ts
+{
+  "snapshots": TurnSnapshot[]
+}
+```
+
+One snapshot is emitted at the **start of every turn** (i.e. immediately after
+the `|turn|N` protocol line is processed). The state reflects everything that
+happened up to and including the end of turn `N-1`.
+
+```ts
+interface TurnSnapshot {
+  turn: number;
+  field: {
+    weather: string | null;          // "Sun", "Rain", "Sand", "Snow", "Electric Terrain", etc.
+    terrain: string | null;
+    tailwindP1: boolean;
+    tailwindP2: boolean;
+  };
+  p1: SideSnapshot;
+  p2: SideSnapshot;
+}
+
+interface SideSnapshot {
+  player: string;                    // username
+  active: ActivePokemonSnapshot[];   // doubles slots a, b (length 2 in VGC)
+  bench: BenchPokemonSnapshot[];     // not-currently-active known team members
+}
+
+interface ActivePokemonSnapshot {
+  slot: 'a' | 'b' | 'c';
+  species: string;                   // e.g. "Calyrex-Shadow"
+  hpPercent: number;                 // 0 – 100, one decimal
+  fainted: boolean;
+  status: 'brn' | 'par' | 'psn' | 'tox' | 'slp' | 'frz' | null;
+  ability: string | null;            // revealed ability ID, null if not yet seen
+  item: string | null;               // revealed item ID, null if not yet seen
+  revealedMoves: string[];           // move IDs the Pokémon has used so far
+  teraType: string | null;           // intrinsic Tera type (revealed via team preview / Tera event)
+  isTerastallized: boolean;
+  terastallizedAs: string | null;    // type they Tera'd into, if applicable
+  boosts: Record<string, number>;    // active stat-stage boosts: { atk: 2, def: -1, ... }
+}
+
+interface BenchPokemonSnapshot {
+  species: string;
+  fainted: boolean;
+}
+```
+
+### Example
+
+```bash
+curl -s -X POST http://localhost:3000/parse_log \
+  -H "Content-Type: application/json" \
+  --data "$(jq -c '{log: .log}' < data_scraper/data/replays/gen9vgc2026regi/<some_id>.json)" \
+  | jq '.snapshots[0]'
+```
+
+Truncated example output (turn 2 of a real Reg I replay):
+
+```json
+{
+  "turn": 2,
+  "field": { "weather": null, "terrain": null, "tailwindP1": false, "tailwindP2": false },
+  "p2": {
+    "player": "VJ2511",
+    "active": [
+      {
+        "slot": "a", "species": "Calyrex-Shadow", "hpPercent": 91, "fainted": false,
+        "status": null, "ability": "unnerve", "item": "lifeorb",
+        "revealedMoves": ["psychic"],
+        "teraType": null, "isTerastallized": false, "terastallizedAs": null, "boosts": {}
+      },
+      {
+        "slot": "b", "species": "Zamazenta-Crowned", "hpPercent": 54, "fainted": false,
+        "status": null, "ability": "dauntlessshield", "item": null,
+        "revealedMoves": ["bodypress"],
+        "teraType": "Water", "isTerastallized": true, "terastallizedAs": "Water",
+        "boosts": { "def": 1 }
+      }
+    ],
+    "bench": [...]
+  },
+  "p1": { ... }
+}
+```
+
+### Notes
+
+- IDs (`ability`, `item`, `revealedMoves`) are normalised lowercase no-spaces
+  (`"lifeorb"`, `"hadronengine"`). Translate to display names downstream if you
+  need them.
+- "Revealed" means "the @pkmn/client Battle state machine inferred this from
+  the protocol stream." For VGC Open Team Sheet, you should layer the OTS data
+  on top — `parse_log` only knows what the spectator sees.
+- The Battle is constructed in omniscient (no specific player) mode; both sides
+  are tracked symmetrically.
+- Malformed individual lines are skipped silently rather than failing the whole
+  parse.
+
 ## Design notes
 
 - **`teraType` vs. `isTera`** — `teraType` is always required because under
@@ -169,7 +292,15 @@ calc_microservice/
 ├── package.json
 ├── tsconfig.json
 └── src/
-    ├── server.ts   # Express setup, /calc + /health, error wrapping
-    ├── calc.ts     # buildPokemon / buildField / runCalc
-    └── types.ts    # CalcRequest / CalcResponse / PokemonInput / FieldInput
+    ├── server.ts      # Express setup, /calc + /parse_log + /health, error wrapping
+    ├── calc.ts        # buildPokemon / buildField / runCalc
+    ├── parse_log.ts   # Battle state machine + per-turn snapshot extraction
+    └── types.ts       # CalcRequest / CalcResponse / PokemonInput / FieldInput
 ```
+
+Dependencies:
+
+- `@smogon/calc` — damage formulas (powers `/calc`).
+- `@pkmn/protocol`, `@pkmn/client`, `@pkmn/dex`, `@pkmn/data` — official
+  Showdown protocol parser + battle state machine + Pokédex (powers `/parse_log`).
+- `express` — HTTP server.
