@@ -1,0 +1,15 @@
+.DS_Store
+
+# Python
+.venv/
+__pycache__/
+*.egg-info/
+*.pyc
+
+# Node
+node_modules/
+dist/
+
+# Scraper output
+data_scraper/data/
+data_scraper/scrape_full.log

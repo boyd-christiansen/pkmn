@@ -1,0 +1,23 @@
+{
+  "name": "calc-microservice",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Deterministic VGC damage calculator HTTP wrapper around @smogon/calc.",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@smogon/calc": "^0.11.0",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
