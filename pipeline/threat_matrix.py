@@ -126,16 +126,24 @@ async def generate_threat_matrix(
     p1_knowledge: KnowledgeState,
     p2_knowledge: KnowledgeState,
     *,
+    format_id: str | None = None,
     session: aiohttp.ClientSession | None = None,
     base_url: str = DEFAULT_CALC_BASE_URL,
 ) -> str:
-    """Render the dual-track threat matrix for one turn as a text block."""
+    """Render the dual-track threat matrix for one turn as a text block.
+
+    `format_id` is forwarded to `canonical_priors.get_probable_spread` so the
+    Probable track uses real Smogon usage data when a chaos cache for that
+    format is present (run `python canonical_priors.py --format-id ...` to
+    populate the cache). Without a cache it falls back to the curated
+    table + heuristic.
+    """
     own_session = session is None
     if own_session:
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
     try:
         return await _generate(
-            snapshot, p1_side, p1_knowledge, p2_knowledge, session, base_url
+            snapshot, p1_side, p1_knowledge, p2_knowledge, session, base_url, format_id
         )
     finally:
         if own_session:
@@ -149,6 +157,7 @@ async def _generate(
     p2_knowledge: KnowledgeState,
     session: aiohttp.ClientSession,
     base_url: str,
+    format_id: str | None,
 ) -> str:
     p2_side = "p2" if p1_side == "p1" else "p1"
     p1 = snapshot.get(p1_side, {})
@@ -168,6 +177,7 @@ async def _generate(
                     attacker_knowledge=p1_knowledge,
                     defender_knowledge=p2_knowledge,
                     direction="outgoing",
+                    format_id=format_id,
                 )
             )
     if not (p1_active and p2_active):
@@ -184,6 +194,7 @@ async def _generate(
                     attacker_knowledge=p2_knowledge,
                     defender_knowledge=p1_knowledge,
                     direction="incoming",
+                    format_id=format_id,
                 )
             )
     if not (p1_active and p2_active):
@@ -203,6 +214,7 @@ async def _matchup(
     attacker_knowledge: KnowledgeState,
     defender_knowledge: KnowledgeState,
     direction: str,
+    format_id: str | None,
 ) -> list[str]:
     moves = attacker.get("revealedMoves") or []
     if not moves:
@@ -211,8 +223,8 @@ async def _matchup(
     field_payload = _field_payload(snapshot, attacker_side)
     a_entry = _entry_or_default(attacker_knowledge, attacker["species"])
     d_entry = _entry_or_default(defender_knowledge, defender["species"])
-    a_prior = get_probable_spread(attacker["species"])
-    d_prior = get_probable_spread(defender["species"])
+    a_prior = get_probable_spread(attacker["species"], format_id)
+    d_prior = get_probable_spread(defender["species"], format_id)
 
     label = (
         f"[us {attacker['species']}] vs [opp {defender['species']}]"

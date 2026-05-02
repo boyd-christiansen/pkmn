@@ -43,10 +43,16 @@ export interface FieldInput {
   defenderSide?: SideInput;
 }
 
+export interface MoveInput {
+  name: string;
+  isCrit?: boolean;
+  hits?: number;
+}
+
 export interface CalcRequest {
   attacker: PokemonInput;
   defender: PokemonInput;
-  move: string;
+  move: string | MoveInput;
   field?: FieldInput;
 }
 

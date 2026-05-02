@@ -46,10 +46,16 @@ curl http://localhost:3000/health
 {
   attacker: PokemonInput,
   defender: PokemonInput,
-  move: string,
+  move: string | { name: string, isCrit?: boolean, hits?: number },
   field?: FieldInput
 }
 ```
+
+`move` accepts either a bare string (legacy form, treats as a normal hit)
+or an object form. The object form forwards `isCrit` and `hits` directly to
+the `@smogon/calc` `Move` constructor — `isCrit: true` applies the 1.5×
+crit multiplier and bypasses the defender's positive boosts (used by
+`damage_inferencer.py` when an observed event was flagged as a crit).
 
 #### `PokemonInput`
 
@@ -188,6 +194,17 @@ interface TurnSnapshot {
   };
   p1: SideSnapshot;
   p2: SideSnapshot;
+  actionLog: DamageEvent[];          // damage events that occurred DURING this turn
+}
+
+interface DamageEvent {
+  attacker_slot: string;             // "p1a" | "p1b" | "p2a" | "p2b"
+  defender_slot: string;
+  move_name: string;                 // PS display name, e.g. "Wood Hammer"
+  hp_before_pct: number;             // 0–100, defender HP just BEFORE the hit
+  hp_after_pct: number;              // 0–100, after the hit (0 if KO'd)
+  is_crit: boolean;
+  is_ko: boolean;
 }
 
 interface SideSnapshot {
@@ -267,6 +284,16 @@ Truncated example output (turn 2 of a real Reg I replay):
   are tracked symmetrically.
 - Malformed individual lines are skipped silently rather than failing the whole
   parse.
+- **`actionLog` semantics** — events are forward-looking: `snapshot[N].actionLog`
+  contains damage events that happened during turn N (between this snapshot and
+  the next). For inference: pair `snapshot_pre = snapshots[N]`,
+  `snapshot_post = snapshots[N+1]`, `events = snapshots[N].actionLog`.
+- Only direct move damage is captured. `|-damage|` events with a `[from] …`
+  kwarg (burn / sand / Life Orb / Rocky Helmet / Future Sight / etc.) are
+  filtered out — incidental/end-of-turn damage isn't useful for EV inference.
+- Multi-hit moves (Triple Axel, Bullet Seed) emit one `DamageEvent` per hit;
+  downstream consumers (the Python inferencer) detect them by counting same
+  `(attacker_slot, move_name, defender_slot)` tuples per turn.
 
 ## `GET /dex/move/:name`
 

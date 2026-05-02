@@ -91,26 +91,36 @@ emits one JSONL row per *match*.
 [calc_microservice README](../calc_microservice/README.md#post-parse_log) for
 the per-turn shape.
 
-### `canonical_priors.py` *(implemented)*
+### `canonical_priors.py` *(implemented — Smogon-backed)*
 
 Returns the *probable* spread (EVs / IVs / nature) for a species under
 standard meta play. Backs the **Probable Range** track in
-`threat_matrix.py`. Mock implementation today, will be wired to real
-Smogon usage stats later.
+`threat_matrix.py`.
 
 - **API:** `get_probable_spread(species, format_id=None) -> ProbableSpread`.
-- **Lookup order:**
-  1. Hand-curated table of spreads for the top ~40 Reg I species
-     (Calyrex-Shadow → Timid SpA/Spe, Urshifu → Adamant Atk/Spe,
-     Amoonguss → Calm HP/SpD, etc.).
-  2. Base-stat heuristic for species not in the table:
-     - `max(atk, spa) ≥ 110` → max attacking stat + Spe, Jolly/Timid if
-       fast, Adamant/Modest otherwise.
-     - `hp ≥ 95 ∧ spe ≤ 70` → bulky support: max HP + heavier defensive
-       side (Calm or Bold).
-     - else → mixed offensive default.
-  3. Generic balanced base stats for completely unknown species.
-- **Touches:** nothing external. Pure data lookup.
+  The result has a `source` field: `"chaos"` | `"curated"` | `"heuristic"`.
+- **Lookup order** (each step falls through on miss):
+  1. **Smogon Chaos JSON** at `pipeline/data/smogon_chaos_{format_id}.json` —
+     loads the per-species `Spreads` dict and picks the most-used
+     `"Nature:hp/atk/def/spa/spd/spe"` entry. Real usage data.
+  2. **Curated table** of spreads for the top ~40 Reg I species (Calyrex-Shadow
+     → Timid SpA/Spe, Amoonguss → Calm HP/SpD, etc.). Used when chaos
+     hasn't been bootstrapped or the species genuinely has 0 usage rows.
+  3. **Base-stat heuristic** for anything else (offensive vs bulky vs default).
+- **Touches:** at runtime, only the local cache file. Network access is
+  isolated to `fetch_chaos(...)` (CLI-invoked).
+
+#### Bootstrap
+
+```bash
+cd pipeline
+.venv/bin/python canonical_priors.py --format-id gen9vgc2026regi
+.venv/bin/python canonical_priors.py --format-id gen9vgc2026regibo3
+```
+
+Walks back from the current month until a 200 OK chaos file is found
+(default: 12 months back), saves to `pipeline/data/smogon_chaos_<format_id>.json`.
+Add `--cutoff 1500` to use the high-ladder cut instead of all rated games.
 
 ### `damage_inferencer.py` *(implemented — dual-state, two-way)*
 
@@ -127,31 +137,40 @@ via binary search against the calc microservice.
   place — `min_evs` ratcheted up, `max_evs` ratcheted down per event.
 - **Touches:** `POST /calc` and `GET /dex/move/:name`. No replay parsing,
   no LLM, no sibling imports.
-- **Two-way binary search.** For each non-status, non-crit event we run
-  six binary searches per damage event:
+- **Two-way binary search.** For each non-status event we run six binary
+  searches per damage event:
   - DEFENDER `min_def`, `max_def`, `min_hp`, `max_hp`
   - ATTACKER `min_off`, `max_off` (`atk` if physical, `spa` if special)
 
   Cross-side coupling is handled with interval arithmetic — when
   searching the defender, the attacker is held at its *least restrictive*
-  current bound, and vice versa. (E.g. to find the largest Def consistent
-  with the observation, hold attacker at its `max_off`; to find the
-  smallest Def, hold attacker at its `min_off`.) Symmetric for HP.
+  current bound, and vice versa. Symmetric for HP.
 - **Atomic application.** All six searches use **pre-update** bounds, then
-  results apply at the end. This makes the update order-independent —
-  no risk of over-tightening one side because the other has already
-  shifted.
+  results apply at the end. Order-independent.
+- **Crits supported.** `event.is_crit=True` is forwarded to `/calc` via the
+  `move: { name, isCrit: true }` payload form. The calc applies the 1.5×
+  multiplier and bypasses the defender's positive boosts, so the inference
+  remains valid for crit observations.
+- **Multi-hit filter.** Triple Axel / Bullet Seed / Population Bomb / etc.
+  emit one `DamageEvent` per hit. The inferencer counts same
+  `(attacker_slot, move_name, defender_slot)` tuples per turn and **skips
+  all of them** if the count > 1 — supporting them properly would need
+  `/calc` to accept a `hits` field and the events to be aggregated upstream.
+- **508-EV total constraint.** After the six binary searches, a cheap pass
+  enforces the 508-EV usable budget per Pokémon: `max_evs[s] ≤ 508 −
+  (sum_of_other_min_evs)`. Once one or two stats are known to be heavily
+  invested (e.g. Atk≥252 + Spe≥252 = 504), the other four collapse to ≤4
+  in a single pass — solves the HP/Def coupling that binary search alone
+  converges on slowly.
 - **Fuzzy HP:** ±0.9% tolerance to absorb the 1% rounding on
   spectator-visible HP bars.
-- **Skip rules:** `is_crit=True` (would need `/calc` `isCrit` support, see
-  follow-up), Status-category moves, missing slots, observations with no
-  consistent EV in `[0, 252]` (data inconsistency — bound left untouched).
-- **Action_log producer (status: not built yet).** `update_knowledge`
-  consumes a `list[DamageEvent]` per turn but `/parse_log` doesn't yet
-  emit them — extending the Node endpoint to return per-turn protocol
-  events (`|move|`, `|-damage|`, `|-crit|`) and threading them through
-  `replay_parser.py` is the next blocking task before the orchestrator
-  can run end-to-end.
+- **Skip rules:** Status-category moves, missing slots, multi-hit
+  occurrences, and observations with no consistent EV in `[0, 252]` (data
+  inconsistency — bounds left untouched).
+- **Source of `action_log`:** `/parse_log` now emits per-turn `actionLog`
+  arrays inline with each snapshot. The orchestrator pairs
+  `snapshot[N].actionLog` with `snapshot_pre = snapshot[N]`,
+  `snapshot_post = snapshot[N+1]`.
 
 ### `threat_matrix.py` *(implemented — dual-track)*
 
@@ -167,8 +186,10 @@ If the canonical prior falls outside the Absolute box for any relevant
 stat (HP, off-stat, def-stat), the line is flagged
 `[PRIOR CONTRADICTED]` so the LLM can spot off-meta opponents.
 
-- **In:** one snapshot, `p1_side` (which side is "us"), and **both**
-  `p1_knowledge` and `p2_knowledge`.
+- **In:** one snapshot, `p1_side` (which side is "us"), **both**
+  `p1_knowledge` and `p2_knowledge`, and an optional `format_id` (forwarded
+  to `canonical_priors` so the Probable track uses real Smogon usage data
+  when a chaos cache is bootstrapped for that format).
 - **Out:** a single string, one section for outgoing (us → opp) and one
   for incoming (opp → us).
 - **Touches:** `POST /calc` (3 calls per matchup-move: abs-low, abs-high,
@@ -227,19 +248,9 @@ Anthropic conversational schema).
 
 | Module | State |
 |---|---|
-| `replay_parser.py` | Working. Run `python replay_parser.py --help`. |
-| `canonical_priors.py` | Working. Library: `get_probable_spread(species)` — mock heuristic until real Smogon data lands. |
-| `damage_inferencer.py` | Working. Library: dual-state, two-way binary search. End-to-end blocked on per-turn `action_log` production (see follow-up below). |
-| `threat_matrix.py` | Working. Library: dual-track Absolute + Probable output with `[PRIOR CONTRADICTED]` flag. |
+| `replay_parser.py` | Working. Run `python replay_parser.py --help`. Also captures the per-turn `actionLog` from `/parse_log` into the JSONL. |
+| `canonical_priors.py` | Working. Library + bootstrap CLI. Reads Smogon Chaos JSON when present; falls back to curated table → heuristic. |
+| `damage_inferencer.py` | Working. Dual-state, two-way binary search, atomic apply, 508-EV constraint pass, crit-aware via `/calc isCrit`, multi-hit filter. |
+| `threat_matrix.py` | Working. Library: dual-track Absolute + Probable output with `[PRIOR CONTRADICTED]` flag. Now takes optional `format_id` to drive Smogon-backed priors. |
 | `teacher_llm.py` | Stub. Prompt design + tool-calling loop; the alignment-quality crux of the project. |
 | `master_pipeline.py` | Stub. Wires the above five together; build last. |
-
-## Required follow-up: `action_log` from `/parse_log`
-
-`damage_inferencer.update_knowledge` consumes `list[DamageEvent]` per turn,
-but `/parse_log` doesn't emit them yet. Building a real orchestrator requires
-extending the Node endpoint to surface per-turn protocol events (`|move|`,
-`|-damage|`, `|-crit|`, `|-supereffective|`, weather/end-of-turn markers) and
-threading them through `replay_parser.py` into `parsed_data/{bo1,bo3}.jsonl`.
-That's a separate task — the modules in this PR ship as libraries verified
-against synthetic events.

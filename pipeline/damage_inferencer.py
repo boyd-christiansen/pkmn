@@ -27,10 +27,11 @@ Isolation contract:
     no LLM. No imports from sibling pipeline modules.
 
 Known limitations:
-    • Critical hits (`event.is_crit`) are skipped; folding 1.5× damage and
-      stat-stage bypass into the search would need /calc to accept isCrit.
-    • action_log production is upstream of this module and not yet built —
-      see the project README for status.
+    • Multi-hit moves (Triple Axel, Bullet Seed, Population Bomb, …) emit
+      one DamageEvent per hit. The inferencer detects them by counting
+      same-(attacker, move, defender) tuples per turn and skips all of
+      them — supporting them properly would need a `hits` field on the
+      event and on /calc.
 """
 from __future__ import annotations
 
@@ -44,6 +45,7 @@ STATS = ("hp", "atk", "def", "spa", "spd", "spe")
 DEFAULT_MIN_EV = 0
 DEFAULT_MAX_EV = 252
 FUZZY_HP_TOLERANCE = 0.9  # percent
+TOTAL_EV_BUDGET = 508    # PS allows 510 total, only 508 usable in 4-EV chunks
 
 
 # A KnowledgeState tracks per-species bounds for *one side*.
@@ -257,6 +259,42 @@ async def _bsearch_max_attacker_ev(eval_fn: EvalFn, target_max: float) -> int | 
 # ---------------------------------------------------------------------------
 
 
+def _filter_action_log(events: list[DamageEvent]) -> list[DamageEvent]:
+    """Drop multi-hit moves: any (attacker_slot, move_name, defender_slot)
+    appearing more than once in the same turn is treated as a multi-hit
+    sequence and skipped entirely (we'd need /calc `hits` support to
+    handle it correctly)."""
+    counts: dict[tuple[str, str, str], int] = {}
+    for ev in events:
+        key = (ev.attacker_slot, ev.move_name, ev.defender_slot)
+        counts[key] = counts.get(key, 0) + 1
+    return [
+        ev for ev in events
+        if counts[(ev.attacker_slot, ev.move_name, ev.defender_slot)] == 1
+    ]
+
+
+def _apply_total_ev_constraint(entry: dict[str, dict[str, int]]) -> None:
+    """Tighten max_evs using the 508-total constraint.
+
+    For every stat, the most EVs it can have is `508 - sum_of_other_mins`.
+    A stat we've proven needs ≥ X EVs frees up budget for the others —
+    converse, if other stats already eat most of the budget, this stat
+    can't be heavily invested either.
+    """
+    sum_min = sum(entry["min_evs"].values())
+    if sum_min > TOTAL_EV_BUDGET:
+        # Inconsistent priors — leave bounds untouched rather than corrupt them.
+        return
+    for stat in STATS:
+        ceiling = TOTAL_EV_BUDGET - (sum_min - entry["min_evs"][stat])
+        new_max = min(entry["max_evs"][stat], ceiling)
+        # Never push max below the stat's own min.
+        if new_max < entry["min_evs"][stat]:
+            new_max = entry["min_evs"][stat]
+        entry["max_evs"][stat] = new_max
+
+
 async def update_knowledge(
     snapshot_pre: dict[str, Any],
     snapshot_post: dict[str, Any],  # noqa: ARG001 — reserved for cross-event sanity checks
@@ -278,7 +316,8 @@ async def update_knowledge(
     if own_session:
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
     try:
-        for event in action_log:
+        events = _filter_action_log(action_log)
+        for event in events:
             await _process_event(
                 event, snapshot_pre, p1_knowledge, p2_knowledge, session, base_url, fuzzy_hp_pct
             )
@@ -297,9 +336,6 @@ async def _process_event(
     base_url: str,
     fuzzy: float,
 ) -> None:
-    if event.is_crit:
-        return  # see module docstring: crit handling deferred
-
     attacker_side = event.attacker_slot[:2]
     defender_side = event.defender_slot[:2]
     if attacker_side == defender_side:
@@ -348,6 +384,8 @@ async def _process_event(
         evs[def_stat] = def_ev
         return evs
 
+    move_payload: dict[str, Any] = {"name": event.move_name, "isCrit": event.is_crit}
+
     async def calc(att_evs: Mapping[str, int], def_evs: Mapping[str, int]) -> tuple[float, float]:
         result = await _call_calc(
             session,
@@ -355,7 +393,7 @@ async def _process_event(
             {
                 "attacker": _build_pokemon_payload(attacker_pkm, evs=att_evs),
                 "defender": _build_pokemon_payload(defender_pkm, evs=def_evs),
-                "move": event.move_name,
+                "move": move_payload,
                 "field": field_payload,
             },
         )
@@ -418,8 +456,17 @@ async def _process_event(
     if new_max_off is not None and new_max_off < a_max[off_stat]:
         a_state[a_key]["max_evs"][off_stat] = new_max_off
 
+    # ----- GLOBAL 508-EV CONSTRAINT --------------------------------------
+    # If we've proven minimums on enough stats, the remaining stats can't
+    # exceed (508 − sum_of_other_mins). Cheap pass that often crushes
+    # max_evs dramatically once one or two offensive/defensive stats are
+    # locked in (e.g. Speed=252 + Atk=252 forces HP/Def/SpD/SpA all ≤ 4).
+    _apply_total_ev_constraint(a_state[a_key])
+    _apply_total_ev_constraint(d_state[d_key])
+
 
 __all__ = [
+    "TOTAL_EV_BUDGET",
     "DEFAULT_CALC_BASE_URL",
     "DamageEvent",
     "FUZZY_HP_TOLERANCE",

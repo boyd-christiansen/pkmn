@@ -106,13 +106,23 @@ function flattenDamage(damage: number | number[] | number[][]): number[] {
 }
 
 export function runCalc(req: CalcRequest): CalcResponse {
-  if (!req.move || typeof req.move !== 'string') {
-    throw new Error('Request is missing required string field: move');
+  if (!req.move || (typeof req.move !== 'string' && typeof req.move !== 'object')) {
+    throw new Error('Request is missing required field: move (string or {name, isCrit?, hits?})');
+  }
+
+  const moveName = typeof req.move === 'string' ? req.move : req.move.name;
+  if (!moveName || typeof moveName !== 'string') {
+    throw new Error('move.name is required');
+  }
+  const moveOpts: { isCrit?: boolean; hits?: number } = {};
+  if (typeof req.move !== 'string') {
+    if (req.move.isCrit !== undefined) moveOpts.isCrit = !!req.move.isCrit;
+    if (req.move.hits !== undefined) moveOpts.hits = req.move.hits;
   }
 
   const attacker = buildPokemon(req.attacker);
   const defender = buildPokemon(req.defender);
-  const move = new Move(GEN, req.move);
+  const move = new Move(GEN, moveName, moveOpts);
   const field = buildField(req.field);
 
   const result = calculate(GEN, attacker, defender, move, field);

@@ -14,7 +14,7 @@ without touching the others.
 | Directory | Runtime | What it does |
 |---|---|---|
 | [`data_scraper/`](data_scraper/) | Python 3.11+ | Pulls top-500 ladder users + all their saved replays from Pokémon Showdown. |
-| [`calc_microservice/`](calc_microservice/) | Node 20+ / TS | HTTP service wrapping `@smogon/calc` (`POST /calc`), `@pkmn/client` (`POST /parse_log`), and `@pkmn/dex` (`GET /dex/move/:name`). |
+| [`calc_microservice/`](calc_microservice/) | Node 20+ / TS | HTTP service wrapping `@smogon/calc` (`POST /calc` with `isCrit` support), `@pkmn/client` (`POST /parse_log` returning per-turn snapshots + `actionLog`), and `@pkmn/dex` (`GET /dex/move/:name`). |
 | [`pipeline/`](pipeline/) | Python 3.11+ | Atomic modules that turn raw replays into SFT-ready conversational training data. `replay_parser`, `canonical_priors`, `damage_inferencer`, and `threat_matrix` are implemented; `teacher_llm` and `master_pipeline` are still stubs. |
 | [`notes/`](notes/) | — | Free-form planning notes (data sourcing options, scope decisions, etc). |
 
@@ -110,27 +110,42 @@ python3 -m venv .venv
 
 → writes to `pipeline/parsed_data/{bo1,bo3}.jsonl`
 
-### 4. Generate training data — *pending* (orchestrator only)
+### 4. Bootstrap canonical priors *(one-off, ~10 seconds per format)*
+
+Before generating training data, populate the local Smogon Chaos cache so
+the threat matrix's Probable track uses real ladder usage data:
+
+```bash
+cd pipeline
+.venv/bin/python canonical_priors.py --format-id gen9vgc2026regi
+.venv/bin/python canonical_priors.py --format-id gen9vgc2026regibo3
+```
+
+Walks back from the current month until a 200 OK chaos file is found; saves
+to `pipeline/data/smogon_chaos_<format_id>.json`. Run again whenever you want
+fresher data. Without this, `canonical_priors` falls back to a curated table
++ heuristic (still works, just less accurate for off-meta species).
+
+### 5. Generate training data — *pending* (orchestrator only)
 
 For each turn in each match, the orchestrator (`master_pipeline.py`, still a
 stub) will chain four working library modules:
 
-1. **`damage_inferencer.update_knowledge(...)`** — feed the turn's damage
-   events into a two-way binary search; tighten **both** `KnowledgeState`s
-   atomically.
-2. **`canonical_priors.get_probable_spread(...)`** — pure-data lookup of the
-   meta spread per species.
-3. **`threat_matrix.generate_threat_matrix(...)`** — dual-track text block:
-   Absolute envelope (from KnowledgeStates) + Probable envelope (from
-   canonical priors), with `[PRIOR CONTRADICTED]` flags.
+1. **`damage_inferencer.update_knowledge(snap_pre, snap_post, snap_pre.actionLog, p1_k, p2_k)`**
+   — two-way binary search tightens both `KnowledgeState`s atomically, with
+   the 508-EV total constraint applied per Pokémon after.
+2. **`canonical_priors.get_probable_spread(species, format_id)`** — pure-data
+   lookup, hits Smogon chaos data when bootstrapped.
+3. **`threat_matrix.generate_threat_matrix(snap, p1_side, p1_k, p2_k, format_id=…)`**
+   — dual-track text block: Absolute envelope (from `KnowledgeState`s) +
+   Probable envelope (from canonical priors), with `[PRIOR CONTRADICTED]`
+   flags.
 4. **`teacher_llm.generate(...)`** *(stub)* — drive a frontier model through
    a tool-calling CoT loop toward the human's known play.
 
-> **Blocking sub-task:** the inferencer needs per-turn `DamageEvent` records
-> (attacker slot, defender slot, move, hp before/after, crit flag), which
-> `/parse_log` doesn't yet emit. The next piece of work is extending the
-> Node endpoint to surface protocol events and threading them through
-> `replay_parser.py` into `parsed_data/{bo1,bo3}.jsonl`.
+All upstream blocking sub-tasks (per-turn `actionLog` production, `isCrit`
+threading, EV-budget constraint, real Smogon priors) are now implemented;
+only the orchestrator + teacher LLM remain.
 
 Output: one conversational JSONL row per turn.
 
@@ -147,10 +162,10 @@ Output: one conversational JSONL row per turn.
 |---|---|
 | `data_scraper` | Working. 16,537 replays cached locally across both Reg I formats. |
 | `calc_microservice` | Working. Three endpoints: `POST /calc` (damage math), `POST /parse_log` (Showdown log → turn snapshots), `GET /dex/move/:name` (move metadata). |
-| `pipeline/replay_parser.py` | Working. ETL CLI: walks scraper output, stitches Bo3 series, POSTs each `log` to `/parse_log`, writes one match per line to `parsed_data/{bo1,bo3}.jsonl`. Resumable. |
-| `pipeline/canonical_priors.py` | Working. Library: `get_probable_spread(species)` returns the meta spread (curated table for top ~40 species + base-stat heuristic for the rest). Mock — to be replaced by real Smogon usage data. |
-| `pipeline/damage_inferencer.py` | Working. Library: dual-state `KnowledgeState` (p1 + p2), two-way binary search per damage event with atomic application. End-to-end blocked on `action_log` production (per-turn protocol events from `/parse_log`). |
-| `pipeline/threat_matrix.py` | Working. Library: dual-track output (Absolute envelope from `KnowledgeState`s + Probable envelope from canonical priors), with `[PRIOR CONTRADICTED]` flag when they disagree. |
+| `pipeline/replay_parser.py` | Working. ETL CLI; captures per-turn `actionLog` from `/parse_log` straight into `parsed_data/{bo1,bo3}.jsonl`. |
+| `pipeline/canonical_priors.py` | Working. Library + bootstrap CLI. Real Smogon Chaos JSON when cached on disk; curated table + heuristic fallback. |
+| `pipeline/damage_inferencer.py` | Working. Dual-state, two-way binary search, atomic application, 508-EV constraint pass, crit-aware (via `/calc isCrit`), multi-hit filter. |
+| `pipeline/threat_matrix.py` | Working. Dual-track Absolute + Probable output with `[PRIOR CONTRADICTED]` flag. Takes optional `format_id` to drive chaos-backed priors. |
 | `pipeline/teacher_llm.py` | Stub. |
 | `pipeline/master_pipeline.py` | Stub. |
 
