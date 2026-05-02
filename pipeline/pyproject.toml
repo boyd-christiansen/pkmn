@@ -1,0 +1,17 @@
+[project]
+name = "pkmn-pipeline"
+version = "0.1.0"
+description = "Atomic modules that turn raw replays into SFT-ready conversational training data."
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.9",
+    "tqdm>=4.66",
+    "click>=8.1",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["replay_parser", "threat_matrix", "teacher_llm", "master_pipeline"]

@@ -13,3 +13,6 @@ dist/
 # Scraper output
 data_scraper/data/
 data_scraper/scrape_full.log
+
+# Pipeline output
+pipeline/parsed_data/

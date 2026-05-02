@@ -1,8 +1,18 @@
 # pipeline
 
 Atomic Python modules that turn raw Pokémon Showdown replays into SFT-ready
-conversational training data. Currently all stubs — see each module's
-docstring for the contract it will implement.
+conversational training data. `replay_parser.py` is implemented; the other
+three modules are still stubs (docstring + signature only).
+
+## Setup
+
+```bash
+cd pipeline
+python3 -m venv .venv
+.venv/bin/pip install -e .
+```
+
+Deps: `aiohttp`, `tqdm`, `click`. Python ≥3.11.
 
 ## Architecture principle
 
@@ -23,21 +33,62 @@ o-series) or the calc engine without rewriting the whole pipeline.
 
 ## Modules
 
-### `replay_parser.py`
+### `replay_parser.py` *(implemented)*
 
-Stitches Bo3 series and extracts turn-by-turn `BoardState` snapshots from raw
-Showdown logs.
+ETL: walks the scraper output, stitches Bo3 series, posts each `log` to
+[`calc_microservice`](../calc_microservice/)'s `POST /parse_log` endpoint, and
+emits one JSONL row per *match*.
 
-- **In:** raw replay JSON dicts (as produced by `data_scraper`) + URL of the
-  [`calc_microservice`](../calc_microservice/).
-- **Out:** list of per-turn `BoardState` objects (active Pokémon for both
-  players, HP, status, boosts, items, known moves, weather, terrain, side
-  conditions, Tera state) plus the actual decision the player made that turn.
-- **Touches:** HTTP-calls `calc_microservice`'s `POST /parse_log` endpoint —
-  which runs the official `@pkmn/client` Battle state machine in Node so we get
-  correct handling of Zoroark illusion, end-of-turn order, multi-hit moves,
-  forme changes, etc. Python side just shapes the response and stitches Bo3
-  series. No regex parsing.
+- **In:** raw replay JSONs at `../data_scraper/data/replays/{format_id}/*.json`,
+  plus a running calc microservice (defaults to `http://localhost:3000`).
+- **Out:** `parsed_data/bo1.jsonl`, `parsed_data/bo3.jsonl`,
+  `parsed_data/failures.jsonl` — one match per line.
+- **Touches:** the `/parse_log` endpoint only. No regex parsing of logs (the
+  `@pkmn/client` Battle state machine on the Node side handles edge cases like
+  Zoroark illusion, end-of-turn order, multi-hit moves, forme changes, etc).
+- **Stitching rules (Bo3):** group games by sorted player pair → sort by
+  `uploadtime` → split a new series whenever consecutive games are >30 min apart
+  *or* the current series already has 3 games (the Bo3 ceiling — back-to-back
+  matches between the same players otherwise get glued together).
+- **Resumable:** existing JSONL is scanned at startup; matches already present
+  are skipped. Failed matches go to `failures.jsonl` and are retried on rerun.
+
+#### CLI
+
+```bash
+.venv/bin/python replay_parser.py                              # full run, both formats
+.venv/bin/python replay_parser.py --limit 10 --format bo3      # 10-match smoke test
+.venv/bin/python replay_parser.py --concurrency 16             # more parallelism
+.venv/bin/python replay_parser.py --bo3-gap-minutes 45         # tune stitching gap
+```
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--scraper-dir` | `../data_scraper/data/replays` | Root of scraper output. |
+| `--output-dir` | `parsed_data/` | Where JSONL + failures go. |
+| `--parse-url` | `http://localhost:3000/parse_log` | Mechanics service endpoint. |
+| `--concurrency` | `8` | Max in-flight `/parse_log` requests. |
+| `--bo3-gap-minutes` | `30` | Series-split threshold. |
+| `--limit` | none | Process only the first N matches (test batch). |
+| `--format` | both | `bo1` or `bo3` to restrict. |
+
+#### Output row shape
+
+```json
+{
+  "match_id": "bo3-gen9vgc2026regibo3-2563049793",
+  "players":  ["carrotvg", "Yippeewoohoo"],
+  "format":   "bo3",
+  "games": [
+    { "replay_id": "...", "timestamp": 1773978060, "snapshots": [...] },
+    { "replay_id": "...", "timestamp": 1773978161, "snapshots": [...] }
+  ]
+}
+```
+
+`snapshots` is the array returned verbatim by `/parse_log` — see the
+[calc_microservice README](../calc_microservice/README.md#post-parse_log) for
+the per-turn shape.
 
 ### `threat_matrix.py`
 
@@ -83,11 +134,9 @@ Anthropic conversational schema).
 
 ## Status
 
-All four files are stubs with finalised docstrings. Implementation order:
-
-1. `replay_parser.py` — biggest unknown; everything downstream depends on its
-   `BoardState` shape.
-2. `threat_matrix.py` — straightforward once `BoardState` is concrete.
-3. `teacher_llm.py` — prompt design + tool-calling loop; the alignment-quality
-   crux of the project.
-4. `master_pipeline.py` — last; just wires the above three together.
+| Module | State |
+|---|---|
+| `replay_parser.py` | Working. Run `python replay_parser.py --help`. |
+| `threat_matrix.py` | Stub. Next up — straightforward now that the per-turn snapshot shape is concrete. |
+| `teacher_llm.py` | Stub. Prompt design + tool-calling loop; the alignment-quality crux of the project. |
+| `master_pipeline.py` | Stub. Wires the above three together; build last. |
