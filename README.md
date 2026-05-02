@@ -14,8 +14,8 @@ without touching the others.
 | Directory | Runtime | What it does |
 |---|---|---|
 | [`data_scraper/`](data_scraper/) | Python 3.11+ | Pulls top-500 ladder users + all their saved replays from Pokémon Showdown. |
-| [`calc_microservice/`](calc_microservice/) | Node 20+ / TS | HTTP service wrapping `@smogon/calc` (damage math, `POST /calc`) and `@pkmn/client` (Showdown log → turn snapshots, `POST /parse_log`). |
-| [`pipeline/`](pipeline/) | Python 3.11+ | Atomic modules that turn raw replays into SFT-ready conversational training data. `replay_parser.py` is implemented; downstream modules still stubbed. |
+| [`calc_microservice/`](calc_microservice/) | Node 20+ / TS | HTTP service wrapping `@smogon/calc` (`POST /calc`), `@pkmn/client` (`POST /parse_log`), and `@pkmn/dex` (`GET /dex/move/:name`). |
+| [`pipeline/`](pipeline/) | Python 3.11+ | Atomic modules that turn raw replays into SFT-ready conversational training data. `replay_parser`, `damage_inferencer`, and `threat_matrix` are implemented; `teacher_llm` and `master_pipeline` are still stubs. |
 | [`notes/`](notes/) | — | Free-form planning notes (data sourcing options, scope decisions, etc). |
 
 ## Pipeline overview
@@ -32,13 +32,18 @@ Pokémon Showdown
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                              pipeline/                                   │
 │                                                                          │
-│  replay_parser.py  ─── HTTP /parse_log ─▶  calc_microservice             │
+│  replay_parser.py     ── /parse_log ──────▶  calc_microservice           │
 │         │                                                                │
-│         ▼  per-turn BoardState[]                                         │
-│  threat_matrix.py  ─── HTTP /calc ──────▶  calc_microservice             │
+│         ▼  per-turn snapshots (JSONL)                                    │
+│                                                                          │
+│  damage_inferencer.py ── /calc, /dex/move ▶  calc_microservice           │
+│         ▲ │                                                              │
+│         │ ▼  tightens OpponentKnowledgeState (per-stat min_evs/max_evs)  │
 │         │                                                                │
+│  threat_matrix.py     ── /calc, /dex/move ▶  calc_microservice           │
+│         │  (consumes the same OpponentKnowledgeState for low/high)       │
 │         ▼                                                                │
-│  teacher_llm.py    ─── HTTP ────────────▶  frontier model (e.g. GPT-4o)  │
+│  teacher_llm.py       ── HTTP ────────────▶  frontier model              │
 │         │                                                                │
 │         ▼                                                                │
 │  master_pipeline.py  →  conversational SFT .jsonl                        │
@@ -100,12 +105,21 @@ python3 -m venv .venv
 
 → writes to `pipeline/parsed_data/{bo1,bo3}.jsonl`
 
-### 4. Generate training data — *pending*
+### 4. Generate training data — *pending* (orchestrator only)
 
-The next stage will turn each turn snapshot into one SFT example: assemble the
-threat matrix (queries `/calc` for every plausible attack), drive the teacher
-LLM through a tool-calling CoT loop toward the human's known play, and emit a
-conversational JSONL row.
+For each turn in each match, the orchestrator (`master_pipeline.py`, still a
+stub) will chain three working library modules:
+
+1. **`damage_inferencer.update_knowledge(...)`** — feed the turn's damage
+   events into the EV-bound binary search; tighten the running
+   `OpponentKnowledgeState`.
+2. **`threat_matrix.generate_threat_matrix(...)`** — render the per-turn
+   low/high damage envelope as a compact text block (volatile state + EV
+   bounds threaded through every `/calc`).
+3. **`teacher_llm.generate(...)`** *(stub)* — drive a frontier model through
+   a tool-calling CoT loop toward the human's known play.
+
+Output: one conversational JSONL row per turn.
 
 ```bash
 # (not implemented yet)
@@ -119,9 +133,10 @@ conversational JSONL row.
 | Component | State |
 |---|---|
 | `data_scraper` | Working. 16,537 replays cached locally across both Reg I formats. |
-| `calc_microservice` | Working. `POST /calc` for damage math; `POST /parse_log` returns turn-by-turn snapshots from raw Showdown logs. |
+| `calc_microservice` | Working. Three endpoints: `POST /calc` (damage math), `POST /parse_log` (Showdown log → turn snapshots), `GET /dex/move/:name` (move metadata). |
 | `pipeline/replay_parser.py` | Working. ETL CLI: walks scraper output, stitches Bo3 series, POSTs each `log` to `/parse_log`, writes one match per line to `parsed_data/{bo1,bo3}.jsonl`. Resumable. |
-| `pipeline/threat_matrix.py` | Stub. |
+| `pipeline/damage_inferencer.py` | Working. Library: `update_knowledge(...)` binary-searches observed damage events to tighten per-opponent EV bounds. |
+| `pipeline/threat_matrix.py` | Working. Library: `generate_threat_matrix(...)` returns the per-turn low/high damage-envelope text block, threading status/boosts/Tera/weather through every calc payload. |
 | `pipeline/teacher_llm.py` | Stub. |
 | `pipeline/master_pipeline.py` | Stub. |
 

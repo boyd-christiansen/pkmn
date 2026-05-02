@@ -7,6 +7,7 @@ and exposes them over HTTP. Two endpoints:
 |---|---|---|
 | `POST /calc` | [`@smogon/calc`](https://www.npmjs.com/package/@smogon/calc) | Deterministic damage range for an attacker × move × defender × field. |
 | `POST /parse_log` | [`@pkmn/protocol`](https://www.npmjs.com/package/@pkmn/protocol) + [`@pkmn/client`](https://www.npmjs.com/package/@pkmn/client) | Replay log → array of turn-by-turn battle-state snapshots. |
+| `GET /dex/move/:name` | [`@pkmn/dex`](https://www.npmjs.com/package/@pkmn/dex) | Move metadata lookup (category, type, base power, target, priority). Used by the threat matrix to skip Status moves. |
 
 Both endpoints are the *only* place in the project that knows about Showdown's
 internal data formats. Everything downstream (Python pipeline, teacher LLM tool
@@ -267,6 +268,39 @@ Truncated example output (turn 2 of a real Reg I replay):
 - Malformed individual lines are skipped silently rather than failing the whole
   parse.
 
+## `GET /dex/move/:name`
+
+Cheap metadata lookup for a move. The Python pipeline uses this to filter out
+Status-category moves (which the calc engine can't meaningfully damage-rate)
+before bothering with a full `/calc` request.
+
+`:name` accepts either the canonical name or its `@pkmn`-style ID
+(lowercase, alphanumeric only): `Electro Drift` and `electrodrift` both work.
+
+### Response
+
+```ts
+{
+  name: string,           // "Electro Drift"
+  id: string,             // "electrodrift"
+  type: string,           // "Electric"
+  category: "Physical" | "Special" | "Status",
+  basePower: number,
+  accuracy: number | true, // true = always hits
+  target: string,          // PS target id, e.g. "normal", "allAdjacentFoes"
+  priority: number
+}
+```
+
+Unknown move → `404 { "error": "..." }`.
+
+### Example
+
+```bash
+curl http://localhost:3000/dex/move/electrodrift
+# → {"name":"Electro Drift","id":"electrodrift","type":"Electric","category":"Special","basePower":100,"accuracy":100,"target":"normal","priority":0}
+```
+
 ## Design notes
 
 - **`teraType` vs. `isTera`** — `teraType` is always required because under
@@ -292,9 +326,10 @@ calc_microservice/
 ├── package.json
 ├── tsconfig.json
 └── src/
-    ├── server.ts      # Express setup, /calc + /parse_log + /health, error wrapping
+    ├── server.ts      # Express setup, /calc + /parse_log + /dex/move + /health
     ├── calc.ts        # buildPokemon / buildField / runCalc
     ├── parse_log.ts   # Battle state machine + per-turn snapshot extraction
+    ├── dex.ts         # @pkmn/dex Move lookup
     └── types.ts       # CalcRequest / CalcResponse / PokemonInput / FieldInput
 ```
 

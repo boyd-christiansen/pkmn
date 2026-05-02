@@ -1,8 +1,9 @@
 # pipeline
 
 Atomic Python modules that turn raw Pokémon Showdown replays into SFT-ready
-conversational training data. `replay_parser.py` is implemented; the other
-three modules are still stubs (docstring + signature only).
+conversational training data. `replay_parser.py`, `damage_inferencer.py`, and
+`threat_matrix.py` are implemented; `teacher_llm.py` and `master_pipeline.py`
+are still stubs.
 
 ## Setup
 
@@ -90,18 +91,52 @@ emits one JSONL row per *match*.
 [calc_microservice README](../calc_microservice/README.md#post-parse_log) for
 the per-turn shape.
 
-### `threat_matrix.py`
+### `damage_inferencer.py` *(implemented)*
 
-Evaluates a `BoardState` and queries the calc microservice to summarise the
-damage landscape.
+Tightens an `OpponentKnowledgeState` (per-Pokémon `min_evs` / `max_evs` boxes
+in [0, 252]^6) by binary-searching observed damage events from the calc
+microservice. Damage % is monotonically decreasing in defender HP/Def/SpD
+EVs, so a textbook binary search works for each stat.
 
-- **In:** `BoardState` + URL of [`calc_microservice`](../calc_microservice/).
-- **Out:** `ThreatMatrix` — for every (attacker, attacker_move, defender)
-  triple on the field, a min/max damage range + KO chance + relevant
-  conditional flags (Tera, weather, terrain, screens, items).
-- **Touches:** HTTP-calls calc microservice. No replay parsing, no LLM.
-- **Consumed two ways:** rendered as a compact text block to inline into the
-  SFT prompt, or returned as a tool-call response to the teacher LLM.
+- **In:** turn snapshots, a list of `DamageEvent` records (one per
+  damage-dealing hit on a tracked opponent), and the current
+  `OpponentKnowledgeState`.
+- **Out:** the same dict, mutated in place — `min_evs` ratcheted up,
+  `max_evs` ratcheted down where the new observation allows.
+- **Touches:** `POST /calc` (binary-search probes) and `GET /dex/move/:name`
+  (to identify the move's category and pick Def vs SpD). No LLM, no replay
+  parsing, no imports from sibling pipeline modules.
+- **Fuzzy HP**: spectator-visible HP percentages are widened by ±0.9% before
+  matching against calc rolls, to absorb the 1% rounding on opponent HP bars.
+- **Cross-stat coupling**: when bounding one stat, other unknowns are held
+  at the *least restrictive* edge of their current bounds, so we never
+  over-tighten because of joint uncertainty.
+- **KOs**: a KO observation only constrains `max_evs` (the defender can't be
+  bulky enough that even max roll wouldn't KO); `min_evs` is left alone.
+- **Caveat**: the algorithm assumes the attacker's offensive EVs are known
+  (or held constant). If the attacker is also an opponent with wide EV
+  bounds, the inference will be conservative or wrong-tight depending on the
+  median assumption. The orchestrator should plug in a sensible attacker
+  prior (e.g. lock common offensive Pokémon to "max Atk/SpA") before
+  invoking this module.
+
+### `threat_matrix.py` *(implemented)*
+
+Renders the per-turn damage envelope as a compact human-readable text block,
+ready to inline into an SFT prompt or return as a tool-call response.
+
+- **In:** one snapshot, `p1_side` indicating which side is "us", and the
+  `OpponentKnowledgeState`.
+- **Out:** a single string, one section for outgoing (us → opp) and one for
+  incoming (opp → us). Each line: `move | low <calc range> (KO chance) | high <calc range> (KO chance)`.
+- **Touches:** `POST /calc` and `GET /dex/move/:name`. Status moves are
+  filtered out before any calc request fires.
+- **Volatile state**: every `/calc` payload carries the attacker's and
+  defender's `status` and `boosts` from the snapshot (so e.g. an Intimidated
+  attacker shows the `-1 Atk` damage hit).
+- **Bound semantics**:
+  - INCOMING: low uses opp `min_atk` / `min_spa`; high uses opp `max_atk` / `max_spa`.
+  - OUTGOING: low uses opp `max_hp` + `max_def` / `max_spd` (bulkiest); high uses opp `min_hp` + `min_def` / `min_spd` (frailest).
 
 ### `teacher_llm.py`
 
@@ -122,9 +157,16 @@ Orchestrator. Wires everything together:
 
 ```
 raw replay JSON
-    → replay_parser.parse(...)              # BoardState[] per turn
-    → threat_matrix.evaluate(state, ...)    # per-state threat summary
-    → teacher_llm.generate(state, label, threats, ...)
+    → replay_parser              # BoardState[] per turn
+    │
+    │  for each turn (in order):
+    │    → damage_inferencer.update_knowledge(snap_pre, snap_post, events, K)
+    │      (tightens K = OpponentKnowledgeState in place)
+    │    → threat_matrix.generate(snap, p1_side, K)
+    │      (per-turn threat block, low/high envelopes)
+    │    → teacher_llm.generate(snap, label, threats, K)
+    │      (CoT messages with tool calls)
+    │
     → JSONL row written to disk
 ```
 
@@ -137,6 +179,7 @@ Anthropic conversational schema).
 | Module | State |
 |---|---|
 | `replay_parser.py` | Working. Run `python replay_parser.py --help`. |
-| `threat_matrix.py` | Stub. Next up — straightforward now that the per-turn snapshot shape is concrete. |
+| `damage_inferencer.py` | Working. Library module: `update_knowledge(...)` + `init_knowledge(...)`. |
+| `threat_matrix.py` | Working. Library module: `await generate_threat_matrix(snapshot, p1_side, knowledge)`. |
 | `teacher_llm.py` | Stub. Prompt design + tool-calling loop; the alignment-quality crux of the project. |
-| `master_pipeline.py` | Stub. Wires the above three together; build last. |
+| `master_pipeline.py` | Stub. Wires the above four together; build last. |

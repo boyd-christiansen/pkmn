@@ -1,5 +1,6 @@
 import express from 'express';
 import { runCalc } from './calc.js';
+import { lookupMove } from './dex.js';
 import { parseLog } from './parse_log.js';
 import type { CalcRequest } from './types.js';
 
@@ -22,6 +23,14 @@ app.post('/calc', (req, res) => {
     const message = err instanceof Error ? err.message : String(err);
     return res.status(400).json({ error: message });
   }
+});
+
+app.get('/dex/move/:name', (req, res) => {
+  const move = lookupMove(req.params.name);
+  if (!move) {
+    return res.status(404).json({ error: `move not found: ${req.params.name}` });
+  }
+  return res.json(move);
 });
 
 app.post('/parse_log', (req, res) => {
