@@ -216,7 +216,15 @@ async def _matchup(
     direction: str,
     format_id: str | None,
 ) -> list[str]:
-    moves = attacker.get("revealedMoves") or []
+    # Prefer the OTS-known full moveset (Bo3); fall back to chronologically
+    # revealed moves (Bo1 / OTS games where the field is missing). Filter out
+    # any empty-string padding the parser emits.
+    known = attacker.get("knownMoves")
+    moves: list[str] = (
+        [m for m in known if m]
+        if known
+        else (attacker.get("revealedMoves") or [])
+    )
     if not moves:
         return []
 

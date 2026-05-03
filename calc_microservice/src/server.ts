@@ -41,8 +41,8 @@ app.post('/parse_log', (req, res) => {
         .status(400)
         .json({ error: 'Body must be a JSON object with a string field "log"' });
     }
-    const snapshots = parseLog(body.log);
-    return res.json({ snapshots });
+    const result = parseLog(body.log);
+    return res.json(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return res.status(400).json({ error: message });

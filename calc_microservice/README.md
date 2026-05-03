@@ -175,7 +175,31 @@ forme changes, and revealed-info tracking.
 
 ```ts
 {
-  "snapshots": TurnSnapshot[]
+  "snapshots":  TurnSnapshot[],
+  "teamSheets": { p1: OtsPokemonSet[]; p2: OtsPokemonSet[] } | null
+}
+```
+
+`teamSheets` is populated only when the log contains `|showteam|` lines —
+i.e. on **OTS Bo3 replays**. CTS Bo1 returns `teamSheets: null`. Each side's
+`OtsPokemonSet[]` is the full 6-Pokémon roster decoded from the
+`|showteam|` packed payload via `@pkmn/sets`'s `Teams.unpackTeam`. VGC OTS
+exposes species / item / ability / 4 moves / Tera type — but **not** EVs /
+IVs / Nature, so those fields come back as `null`.
+
+```ts
+interface OtsPokemonSet {
+  species: string;
+  item: string;
+  ability: string;
+  moves: string[];          // exactly 4 (padded with "" if shorter)
+  teraType: string | null;
+  level: number;
+  gender: string | null;
+  // VGC OTS hides these — always null on real Bo3 replays:
+  nature: string | null;
+  evs: Record<string, number> | null;
+  ivs: Record<string, number> | null;
 }
 ```
 
@@ -219,13 +243,14 @@ interface ActivePokemonSnapshot {
   hpPercent: number;                 // 0 – 100, one decimal
   fainted: boolean;
   status: 'brn' | 'par' | 'psn' | 'tox' | 'slp' | 'frz' | null;
-  ability: string | null;            // revealed ability ID, null if not yet seen
-  item: string | null;               // revealed item ID, null if not yet seen
-  revealedMoves: string[];           // move IDs the Pokémon has used so far
-  teraType: string | null;           // intrinsic Tera type (revealed via team preview / Tera event)
+  ability: string | null;            // OTS-known if isOTS, else revealed via play
+  item: string | null;               // OTS-known if isOTS, else revealed via play
+  revealedMoves: string[];           // move IDs the Pokémon has actually used so far (chronological)
+  knownMoves: string[] | null;       // OTS full moveset (4 entries) when isOTS; null in CTS
+  teraType: string | null;           // OTS-known if isOTS, else revealed via team preview / Tera event
   isTerastallized: boolean;
-  terastallizedAs: string | null;    // type they Tera'd into, if applicable
-  boosts: Record<string, number>;    // active stat-stage boosts: { atk: 2, def: -1, ... }
+  terastallizedAs: string | null;
+  boosts: Record<string, number>;
 }
 
 interface BenchPokemonSnapshot {
@@ -294,6 +319,19 @@ Truncated example output (turn 2 of a real Reg I replay):
 - Multi-hit moves (Triple Axel, Bullet Seed) emit one `DamageEvent` per hit;
   downstream consumers (the Python inferencer) detect them by counting same
   `(attacker_slot, move_name, defender_slot)` tuples per turn.
+- **OTS / CTS bench gating** (Bo3 only — Bo1 behavior unchanged):
+  - `snapshot.p1.bench` is intersected with the **brought-set** for the
+    game (computed in a one-pass pre-scan over the log for every species
+    that ever appears via `|switch|` / `|drag|` / `|replace|`). At turn 1
+    P1 bench shows the 4 brought minus the 2 active, even before the
+    bench Pokémon switch in.
+  - `snapshot.p2.bench` is intersected with the **on-field-set** (running
+    — populated as P2 actually switches in). At turn 1, P2 bench is empty;
+    it grows over the game as the opponent's selection is revealed.
+  - Active Pokémon get their `item` / `ability` / `teraType` filled from
+    OTS at turn 1 (instead of waiting for in-game reveal). This is what
+    makes downstream `damage_inferencer` and `threat_matrix` calc payloads
+    immediately tighter on Bo3, with **zero changes** to those modules.
 
 ## `GET /dex/move/:name`
 
@@ -355,7 +393,8 @@ calc_microservice/
 └── src/
     ├── server.ts      # Express setup, /calc + /parse_log + /dex/move + /health
     ├── calc.ts        # buildPokemon / buildField / runCalc
-    ├── parse_log.ts   # Battle state machine + per-turn snapshot extraction
+    ├── parse_log.ts   # Battle state machine + per-turn snapshot extraction + OTS gating
+    ├── ots.ts         # @pkmn/sets Teams.unpackTeam wrapper for |showteam| decoding
     ├── dex.ts         # @pkmn/dex Move lookup
     └── types.ts       # CalcRequest / CalcResponse / PokemonInput / FieldInput
 ```
@@ -365,4 +404,6 @@ Dependencies:
 - `@smogon/calc` — damage formulas (powers `/calc`).
 - `@pkmn/protocol`, `@pkmn/client`, `@pkmn/dex`, `@pkmn/data` — official
   Showdown protocol parser + battle state machine + Pokédex (powers `/parse_log`).
+- `@pkmn/sets` — `Teams.unpackTeam` decoder for `|showteam|` packed payloads
+  (powers OTS team-sheet extraction in `/parse_log`).
 - `express` — HTTP server.

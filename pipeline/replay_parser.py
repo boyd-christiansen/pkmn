@@ -174,13 +174,13 @@ async def _post_log(
     session: aiohttp.ClientSession,
     parse_url: str,
     log: str,
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
+    """Return the full /parse_log response: { snapshots, teamSheets }."""
     async with session.post(parse_url, json={"log": log}) as r:
         if r.status >= 400:
             text = await r.text()
             raise RuntimeError(f"/parse_log {r.status}: {text[:200]}")
-        data = await r.json()
-        return data.get("snapshots", [])
+        return await r.json()
 
 
 async def process_match(
@@ -193,12 +193,13 @@ async def process_match(
     for g in match.games:
         log = json.loads(g.file_path.read_text())["log"]
         async with sem:
-            snapshots = await _post_log(session, parse_url, log)
+            result = await _post_log(session, parse_url, log)
         games_out.append(
             {
                 "replay_id": g.replay_id,
                 "timestamp": g.timestamp,
-                "snapshots": snapshots,
+                "snapshots": result.get("snapshots", []),
+                "teamSheets": result.get("teamSheets"),  # null in CTS
             }
         )
     return {

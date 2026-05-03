@@ -14,7 +14,7 @@ without touching the others.
 | Directory | Runtime | What it does |
 |---|---|---|
 | [`data_scraper/`](data_scraper/) | Python 3.11+ | Pulls top-500 ladder users + all their saved replays from Pokémon Showdown. |
-| [`calc_microservice/`](calc_microservice/) | Node 20+ / TS | HTTP service wrapping `@smogon/calc` (`POST /calc` with `isCrit` support), `@pkmn/client` (`POST /parse_log` returning per-turn snapshots + `actionLog`), and `@pkmn/dex` (`GET /dex/move/:name`). |
+| [`calc_microservice/`](calc_microservice/) | Node 20+ / TS | HTTP service wrapping `@smogon/calc` (`POST /calc`), `@pkmn/client` + `@pkmn/sets` (`POST /parse_log` — per-turn snapshots, `actionLog`, and Bo3 OTS `teamSheets`), and `@pkmn/dex` (`GET /dex/move/:name`). |
 | [`pipeline/`](pipeline/) | Python 3.11+ | Atomic modules that turn raw replays into SFT-ready conversational training data. **All six modules implemented** — `replay_parser`, `canonical_priors`, `damage_inferencer`, `threat_matrix`, `teacher_llm`, `master_pipeline`. |
 | [`notes/`](notes/) | — | Free-form planning notes (data sourcing options, scope decisions, etc). |
 
@@ -179,7 +179,7 @@ Output: one conversational JSONL row per turn.
 | `pipeline/canonical_priors.py` | Working. Library + bootstrap CLI. Real Smogon Chaos JSON when cached on disk; curated table + heuristic fallback. |
 | `pipeline/damage_inferencer.py` | Working. Dual-state, two-way binary search, atomic application, 508-EV constraint pass, crit-aware (via `/calc isCrit`), multi-hit filter. |
 | `pipeline/threat_matrix.py` | Working. Dual-track Absolute + Probable output with `[PRIOR CONTRADICTED]` flag. Takes optional `format_id` to drive chaos-backed priors. |
-| `pipeline/teacher_llm.py` | Working. OpenAI async tool-use loop with `calculate_damage` + structured `{pre_tool_thought, action}` output. Strips ground truth from saved messages. |
-| `pipeline/master_pipeline.py` | Working. CLI orchestrator. `--dry-run` mode exercises everything except the OpenAI call. Resumable. |
+| `pipeline/teacher_llm.py` | Working. OpenAI async tool-use loop with `calculate_damage` + structured `{pre_tool_thought, action}` output. Two system-prompt templates: Bo1 CTS (Masking Rule + reconstructed team) vs Bo3 OTS (full sheets + ★ brought-flag, no masking). Strips ground truth from saved messages. |
+| `pipeline/master_pipeline.py` | Working. CLI orchestrator. Branches on `match_record.format` (Bo1 CTS vs Bo3 OTS). `--dry-run` mode exercises everything except the OpenAI call. Resumable. |
 
 See each subdirectory's README for setup, contracts, and design notes.

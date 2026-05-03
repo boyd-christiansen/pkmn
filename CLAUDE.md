@@ -116,3 +116,19 @@ pipeline/parsed_data/sft_training_data.jsonl   # one fine-tuning example per tur
   pin a P1 slot's choice (e.g. multiple new revealed moves), the whole
   turn is skipped — no SFT row written, but `update_knowledge` still runs
   on the action_log so we don't lose inference signal.
+- **CTS vs OTS format split.** `gen9vgc2026regi` (Bo1) is **Closed Team
+  Sheet** — items / abilities / moves hidden until activated, P1 team
+  reconstructed by forward-scan with `[UNREVEALED_MOVE]` padding. The Bo1
+  system-prompt template carries the Masking Rule. `gen9vgc2026regibo3`
+  (Bo3) is **Open Team Sheet** — `|showteam|` decoded by `@pkmn/sets` on
+  the Node side; full 6-mon roster + items / abilities / moves / Tera
+  type are known from turn 1 for both players. The Bo3 system prompt
+  shows both teams in full with ★ markers on P1's brought 4, **no
+  Masking Rule**. EVs / IVs / Nature stay hidden in OTS too, so the
+  dual-track inferencer continues to do the heavy spread-bound lifting.
+- **The Node parser gates P2 bench chronologically in OTS games.** At
+  turn 1 of a Bo3 replay, `snapshot.p2.bench` is empty (only the 2
+  active have actually appeared); it grows as the opponent's selection
+  is revealed via `|switch|`. P1 bench shows the full 4 brought from
+  turn 1 (computed via a one-pass pre-scan). Bo1 bench behavior is
+  unchanged.

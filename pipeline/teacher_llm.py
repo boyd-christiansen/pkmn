@@ -184,16 +184,45 @@ FINAL_OUTPUT_SCHEMA: dict[str, Any] = {
 # Prompt templates
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT_BASE = """You are a world-class VGC (Pokémon Video Game Championships) competitor at the Day 2 World Championships level, commanding YOUR TEAM (Player 1) in a Generation 9 VGC Reg I doubles battle.
+def _species_key(s: str) -> str:
+    return "".join(c for c in s.lower() if c.isalnum())
+
+
+SYSTEM_PROMPT_BO1 = """You are a world-class VGC (Pokémon Video Game Championships) competitor at the Day 2 World Championships level, commanding YOUR TEAM (Player 1) in a Generation 9 VGC Reg I doubles battle (best-of-1, **Closed Team Sheet** — only species are visible at team preview; items, abilities, moves, and Tera types are hidden until they activate or are used).
 
 Your job each turn is to decide what each of your active Pokémon does — a move with a target (and whether to Terastallize), a switch, or pass.
 
-YOUR REVEALED TEAM (from this match):
+YOUR REVEALED TEAM (reconstructed from this match — moves the human never used are tagged as `[UNREVEALED_MOVE]`):
 {p1_team_block}
 
 CRITICAL RULES:
 
 1. The Masking Rule: If a Pokémon on Your Side has `[UNREVEALED_MOVE]` in its moveset, it means that move was never utilized by the human expert in this entire Bo3 series. You must assume that the unrevealed move was completely suboptimal, irrelevant, or unusable for this specific matchup. Do not attempt to guess what it is, and do not factor it into your strategic reasoning.
+
+2. The Tool Rule: You have access to a `calculate_damage` tool that exposes the official Smogon damage calculator. Use it to verify your most decisive damage assumptions before committing — typically 1-3 calcs per turn. Do not over-query.
+
+3. The Threat-Matrix Rule: The user message includes a pre-computed threat matrix with TWO tracks per matchup:
+   - Absolute: the strict mathematical envelope from observed-damage inference (provable bounds; wide).
+   - Probable (meta): the calc result assuming both Pokémon run their canonical Smogon meta spread (narrow; only as good as the prior).
+   When the two tracks disagree (`[PRIOR CONTRADICTED]`), the opponent is off-meta — favor the Absolute envelope.
+
+4. The Output Rule: After your reasoning (and any tool calls), return one final JSON object matching the response schema:
+   - pre_tool_thought: a brief strategic reasoning summary that leads to your chosen action
+   - action: {{ slot_1, slot_2 }} where each slot describes the action for that active Pokémon
+"""
+
+
+SYSTEM_PROMPT_BO3 = """You are a world-class VGC (Pokémon Video Game Championships) competitor at the Day 2 World Championships level, commanding YOUR TEAM (Player 1) in a Generation 9 VGC Reg I doubles battle (best-of-3, **Open Team Sheet** — both players see each other's full 6-Pokémon roster, items, abilities, all 4 moves, and Tera type before turn 1; only EVs / IVs / Nature stay hidden).
+
+YOUR TEAM (P1 — full Open Team Sheet, ★ = brought to this game):
+{p1_sheet_block}
+
+OPPONENT'S TEAM (P2 — full Open Team Sheet; you do NOT know which 4 of these 6 they brought):
+{p2_sheet_block}
+
+CRITICAL RULES:
+
+1. The OTS Rule: All 6 of your opponent's Pokémon, their items, abilities, moves, and Tera types are PUBLIC knowledge — reason about every one of them, including the backline. The only thing you don't know about your opponent is which 4 of the 6 they brought to this game (you'll learn that as they switch in) and their EV / IV / Nature spreads.
 
 2. The Tool Rule: You have access to a `calculate_damage` tool that exposes the official Smogon damage calculator. Use it to verify your most decisive damage assumptions before committing — typically 1-3 calcs per turn. Do not over-query.
 
@@ -220,9 +249,45 @@ SYNTHESIS_GROUND_TRUTH_SUFFIX = """
 # ---------------------------------------------------------------------------
 
 
+def _format_ots_block(
+    sheets: list[dict[str, Any]],
+    *,
+    brought_keys: set[str] | None = None,
+) -> str:
+    """Format an OTS team sheet as a system-prompt-friendly block.
+
+    `brought_keys` is the set of (normalized) species names actually brought
+    to the current game; entries in `sheets` whose species key matches get a
+    ★ marker. Pass `None` (default) for the opponent — we don't reveal which
+    4 they brought.
+    """
+    lines: list[str] = []
+    for s in sheets:
+        sp = s.get("species") or "?"
+        marker = "★ " if (brought_keys is not None and _species_key(sp) in brought_keys) else "  "
+        item = s.get("item") or "?"
+        ability = s.get("ability") or "?"
+        tera = s.get("teraType") or "?"
+        moves = " / ".join(m for m in (s.get("moves") or []) if m)
+        lines.append(f"{marker}{sp} @ {item}, ability={ability}, tera={tera}")
+        lines.append(f"      moves: {moves}")
+    return "\n".join(lines)
+
+
 def render_system_prompt(p1_team_block: str) -> str:
-    """Format the system prompt with the reconstructed P1 team block inserted."""
-    return SYSTEM_PROMPT_BASE.format(p1_team_block=p1_team_block)
+    """Bo1 (CTS) — format the system prompt with the reconstructed P1 team block."""
+    return SYSTEM_PROMPT_BO1.format(p1_team_block=p1_team_block)
+
+
+def render_system_prompt_bo3(
+    p1_sheet: list[dict[str, Any]],
+    p2_sheet: list[dict[str, Any]],
+    p1_brought: set[str],
+) -> str:
+    """Bo3 (OTS) — both teams' full sheets in the prompt; P1's brought 4 marked with ★."""
+    p1_block = _format_ots_block(p1_sheet, brought_keys=p1_brought)
+    p2_block = _format_ots_block(p2_sheet, brought_keys=None)
+    return SYSTEM_PROMPT_BO3.format(p1_sheet_block=p1_block, p2_sheet_block=p2_block)
 
 
 async def synthesize_turn(
@@ -343,7 +408,9 @@ __all__ = [
     "DEFAULT_MODEL",
     "FINAL_OUTPUT_SCHEMA",
     "MAX_TOOL_ITERATIONS",
-    "SYSTEM_PROMPT_BASE",
+    "SYSTEM_PROMPT_BO1",
+    "SYSTEM_PROMPT_BO3",
+    "render_system_prompt_bo3",
     "render_system_prompt",
     "synthesize_turn",
 ]

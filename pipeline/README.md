@@ -172,6 +172,28 @@ via binary search against the calc microservice.
   `snapshot[N].actionLog` with `snapshot_pre = snapshot[N]`,
   `snapshot_post = snapshot[N+1]`.
 
+### Format split: CTS (Bo1) vs OTS (Bo3)
+
+The pipeline branches on `match_record["format"]`:
+
+- **Bo1 / CTS** (`gen9vgc2026regi`): no `|showteam|` lines in the log.
+  `replay_parser.py`'s `games[].teamSheets` is `null`. `master_pipeline`
+  uses `reconstruct_p1_team` (forward-scan + `[UNREVEALED_MOVE]` padding)
+  and `teacher_llm.render_system_prompt` (Bo1 template + Masking Rule).
+  Behavior **unchanged** from before this feature.
+- **Bo3 / OTS** (`gen9vgc2026regibo3`): `|showteam|` decoded by
+  `@pkmn/sets`'s `Teams.unpackTeam` on the Node side. `games[].teamSheets`
+  is `{ p1: OtsPokemonSet[6], p2: OtsPokemonSet[6] }`. `master_pipeline`
+  uses `teacher_llm.render_system_prompt_bo3` (full sheets for both
+  sides, ★ markers on P1's brought 4, no Masking Rule). KnowledgeStates
+  are seeded with all 6 species per side. Active Pokémon snapshots get
+  OTS-known `item` / `ability` / `teraType` from turn 1, and a new
+  `knownMoves: string[4] | null` field carries the OTS-known full moveset
+  — `threat_matrix` prefers `knownMoves` when present (Bo3) and falls
+  back to `revealedMoves` (Bo1). VGC OTS does not reveal EVs / IVs /
+  Nature, so the dual-track inferencer continues to do the heavy lifting
+  on spread bounds.
+
 ### `threat_matrix.py` *(implemented — dual-track)*
 
 Renders the per-turn damage envelope as a compact human-readable text

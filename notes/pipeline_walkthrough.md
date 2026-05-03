@@ -76,7 +76,7 @@ The service exposes three endpoints:
 | Endpoint | Backed by | Purpose |
 |---|---|---|
 | `POST /calc` | `@smogon/calc` | Damage range for one (attacker, move, defender, field). Accepts `isCrit`. |
-| `POST /parse_log` | `@pkmn/protocol` + `@pkmn/client` | Raw log → per-turn snapshots + per-turn `actionLog` (damage events). |
+| `POST /parse_log` | `@pkmn/protocol` + `@pkmn/client` + `@pkmn/sets` | Raw log → per-turn snapshots + per-turn `actionLog` (damage events) + Bo3 `teamSheets` (Open Team Sheet decoded from `\|showteam\|`). |
 | `GET /dex/move/:name` | `@pkmn/dex` | Move metadata (category, type, base power). Used to skip Status moves. |
 
 ---
@@ -104,7 +104,11 @@ Each snapshot looks like:
   "p1": {
     "active": [
       { "slot": "a", "species": "Miraidon", "hpPercent": 100,
-        "ability": "hadronengine", "item": null, "revealedMoves": [], ... },
+        "ability": "Hadron Engine", "item": "Choice Specs",
+        "teraType": "Fairy",
+        "revealedMoves": [],
+        "knownMoves": ["Volt Switch", "Draco Meteor", "Dazzling Gleam", "Electro Drift"],
+        ... },
       { "slot": "b", "species": "Iron Valiant", ... }
     ],
     "bench": [ {"species": "Lunala", "fainted": false}, ... ]
@@ -114,9 +118,24 @@ Each snapshot looks like:
 }
 ```
 
+For OTS Bo3 replays, the response also carries a top-level `teamSheets`
+with both players' full 6-Pokémon team sheets (decoded from `|showteam|`).
+That's how `item` and `knownMoves` are filled in at turn 1 above — none of
+those moves had been used yet. In Bo1 CTS replays, `teamSheets` is `null`
+and `knownMoves` is `null` for every active mon (we only know what's been
+revealed chronologically).
+
 **Key design choice:** `actionLog` is *forward-looking*. Events for turn N
 attach to `snapshot[N].actionLog`, so we always pair `(snap[N], snap[N+1],
 snap[N].actionLog)` for inference and label extraction.
+
+**Format-aware bench gating** (Bo3 only): the parser pre-scans the log to
+find every Pokémon each side ever sends to the field. P1's bench at turn 1
+shows the 4 brought minus the 2 active (we know our own selection). P2's
+bench at turn 1 is **empty** — even though `|showteam|` revealed all 6 to
+the spectator, the human player didn't know which 4 the opponent would
+bring until they switched in. Strict chronological view for the
+opponent's backline.
 
 Real turn 1 actionLog from the running example:
 
@@ -138,37 +157,68 @@ damage event for `p1b`. That something is detectable from the next snapshot
 
 ## Part 3: The intelligence layer
 
-### Step 4 — Reconstruct P1's team (the "OTS we don't have")
+### Step 4 — Building the team picture: OTS (Bo3) vs CTS (Bo1)
 
-In live VGC, Open Team Sheet means we know the opponent's species, items,
-abilities, and Tera types from turn 1. But our offline replays **don't
-expose OTS data** — we only see what gets revealed during play (an item
-when it activates, a move when it's used, a Tera when it triggers).
+In real VGC, **Bo3 uses Open Team Sheet** — both players see each other's
+full 6-Pokémon roster, items, abilities, all 4 moves, and Tera types
+before turn 1; only EVs / IVs / Nature stay hidden. **Bo1 uses Closed
+Team Sheet** — only species are visible at team preview; everything else
+is hidden until it activates or is used during the match.
 
-We *do* however know the full Bo3 series in advance — we've seen all the
-turns. So we **forward-scan** every snapshot in the match and aggregate
-everything that was ever revealed about each P1 species:
+Our pipeline branches accordingly. Same dataset, two completely different
+team-knowledge regimes.
 
-- Item (from the first snapshot it surfaces)
-- Ability (from the first activation)
-- Tera type (from the team-preview line or the actual Terastallization)
-- All moves used across all games
+#### Bo3 (OTS): we see what the human saw
 
-For our running example, after scanning game 1, we'd have:
+The replay log includes two `|showteam|` lines (one per side) carrying a
+packed-team payload. We decode them with `Teams.unpackTeam` from
+`@pkmn/sets` and surface the result as `teamSheets` on the parse_log
+response.
+
+For our running example (game 1 against jonen), P1's team sheet:
+
 ```
-Miraidon: ability=hadronengine, item=?, tera=?, moves=[Volt Switch, Electro Drift, Discharge, ...]
-Iron Valiant: ability=quarkdrive, item=?, tera=?, moves=[Quick Guard, Encore, ...]
-Lunala: ability=shadowshield, ..., moves=[Moongeist Beam, ...]
-Incineroar: ability=intimidate, ..., moves=[...]
-Ursaluna: ..., moves=[...]
+★ Miraidon       @ Choice Specs, ability=Hadron Engine, tera=Fairy
+                  moves: Volt Switch / Draco Meteor / Dazzling Gleam / Electro Drift
+★ Iron Valiant   @ Booster Energy, ability=Quark Drive, tera=Fairy
+                  moves: Quick Guard / Encore / Moonblast / Close Combat
+★ Lunala         @ Power Herb, ability=Shadow Shield, tera=Water
+                  moves: Moongeist Beam / Meteor Beam / Wide Guard / Trick Room
+★ Incineroar     @ Sitrus Berry, ability=Intimidate, tera=Ghost
+                  moves: Knock Off / Fake Out / Parting Shot / Will-O-Wisp
+  Ursaluna       @ Flame Orb, ability=Guts, tera=Ghost
+                  moves: Headlong Rush / Facade / Earthquake / Protect
+  Brute Bonnet   @ Mental Herb, ability=Protosynthesis, tera=Water
+                  moves: Seed Bomb / Sucker Punch / Spore / Rage Powder
 ```
 
-**Why we pad to exactly 4 moves with `"[UNREVEALED_MOVE]"`:** a Pokémon's
-revealed moves are exactly the moves the human chose to USE. If a Pokémon
-has only 2 revealed moves across an entire 3-game Bo3, that means moves 3
-and 4 were judged worse than even Encore/Quick Guard for every situation
-this match presented. We tell the LLM (in the system prompt's *Masking
-Rule*):
+The ★ markers tag the 4 the human actually brought to *this* game — we
+can compute them per-game by intersecting the OTS sheet with the
+"ever-on-field" set from the log. (In a Bo3 series the same player can
+bring different 4s in game 1 vs game 2; the system prompt is rendered
+per-game so the brought-flag stays correct.)
+
+The opponent's team sheet is shown in full too, but **without** brought
+flags — at turn 1 we genuinely don't know which 4 of jonen's 6 will
+come out. We learn that one switch at a time as the game unfolds.
+
+#### Bo1 (CTS): we reconstruct from what got used
+
+Bo1 replays have no `|showteam|`. We don't know items, abilities, moves,
+or Tera types until they're revealed in play. So we **forward-scan**
+every snapshot in the match and aggregate everything that ever surfaced
+for each P1 species:
+
+- Item — from the first snapshot it appears in (e.g. Sitrus Berry when
+  it activates).
+- Ability — from the first activation (Intimidate on switch-in,
+  Protosynthesis from sun, etc.).
+- Tera type — from the actual Terastallize event.
+- Moves — every move the human used across the whole match.
+
+If a Pokémon ends the match with fewer than 4 known moves, we pad with
+the literal string `"[UNREVEALED_MOVE]"`. Then the system prompt's
+**Masking Rule** tells the LLM what to do with the placeholders:
 
 > *"If a Pokémon on Your Side has `[UNREVEALED_MOVE]` in its moveset, it
 > means that move was never utilized by the human expert in this entire
@@ -177,8 +227,10 @@ Rule*):
 > attempt to guess what it is, and do not factor it into your strategic
 > reasoning."*
 
-The Masking Rule is what lets us train without leaking team-builder
-guesses into the model's reasoning.
+The Masking Rule trains the model to reason from what's known and stay
+agnostic about what isn't, instead of hallucinating moves it might want.
+**Bo1 only** — the Bo3 prompt has no Masking Rule, because the OTS
+sheet really does show all 4 moves and we want the model to use them.
 
 ### Step 5 — KnowledgeState: solving the EV puzzle frame by frame
 
@@ -249,6 +301,15 @@ KnowledgeStates **persist across turns and across games** in a Bo3 series.
 By turn 5 of game 2, the bounds on commonly-used Pokémon are usually
 tight enough that the threat matrix becomes meaningfully decisive.
 
+**OTS doesn't replace this.** A common confusion: doesn't the OTS sheet
+make all this binary-search machinery redundant? No — VGC OTS exposes
+species / item / ability / moves / Tera type, but **not** EVs / IVs /
+Nature. Those are still hidden, and they're exactly what shapes damage
+ranges. OTS only collapses uncertainty on the *static* fields (which is
+why our calc payloads on Bo3 turn 1 are immediately tighter — the
+defender's item is locked in even before Sitrus activates). The spread
+math stays unchanged.
+
 ### Step 6 — Threat matrix: dual-track damage envelope
 
 For each turn, we render the damage landscape between the active
@@ -277,6 +338,16 @@ Real example output (turn 4 of a different match):
 Volatile state — Atk-1 from Intimidate, Grassy Terrain recovery, Tera —
 threaded through every payload. The LLM sees the actual board, not a
 sterile lab calc.
+
+**Move enumeration changes per format.** For each attacker, the threat
+matrix iterates `knownMoves` if present (Bo3 OTS — all 4 moves from the
+sheet) and falls back to `revealedMoves` otherwise (Bo1 CTS —
+chronologically-revealed only). Concrete consequence: at turn 1 of a
+Bo3 game, the threat matrix already shows all four moves on every
+attacker, including ones the human hasn't used yet. At turn 1 of a Bo1
+game, every attacker's `revealedMoves` is empty — the threat matrix
+section for that turn is therefore basically empty too, and gets
+gradually fleshed out as moves come into view.
 
 ### Step 7 — Canonical priors: what does "meta" mean?
 
@@ -357,7 +428,7 @@ that doesn't itself know VGC at pro level.
 **Synthesis call shape:**
 
 ```
-system: "You are a world-class VGC competitor… [Masking Rule]… [Output schema]…"
+system: "You are a world-class VGC competitor… [format-specific rules]… [Output schema]…"
 
 user:   [board state: turn N, field, P1/P2 active+bench]
         [threat matrix: dual-track Absolute + Probable per matchup-move]
@@ -374,6 +445,23 @@ assistant: { "pre_tool_thought": "Volt Switch lets us pivot Miraidon out of
               follow-up on slot a as it switches in.",
               "action": { "slot_1": {...}, "slot_2": {...} } }
 ```
+
+**Two system-prompt templates** — the format split from Step 4 carries
+all the way through. Same critical-rules backbone (Tool Rule,
+Threat-Matrix Rule, Output Rule), different team-knowledge framing:
+
+- **Bo1 / CTS template:** says "Closed Team Sheet — only species are
+  visible at team preview" and shows the *reconstructed* P1 team with
+  `[UNREVEALED_MOVE]` placeholders. Includes the **Masking Rule**.
+- **Bo3 / OTS template:** says "Open Team Sheet — both players see each
+  other's full 6-Pokémon roster" and shows the *full sheets for both
+  sides*, with ★ markers on P1's brought 4. Replaces the Masking Rule
+  with the **OTS Rule** ("All 6 of your opponent's Pokémon, their items,
+  abilities, moves, and Tera types are PUBLIC knowledge — reason about
+  every one of them, including the backline").
+
+Picking the right template per match is just `if match["format"] ==
+"bo3"` in the orchestrator.
 
 **Two things to notice:**
 

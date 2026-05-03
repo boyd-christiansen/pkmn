@@ -120,6 +120,39 @@ def reconstruct_p2_species(games: list[dict]) -> list[str]:
     return seen
 
 
+def _species_key(s: str) -> str:
+    return "".join(c for c in s.lower() if c.isalnum())
+
+
+def _team_sheets_for_match(games: list[dict]) -> dict[str, list[dict]] | None:
+    """Return the first non-null `teamSheets` from any game in the match.
+
+    All games in a Bo3 series carry the same sheet, so we just take the
+    earliest one available. None means CTS for the whole match.
+    """
+    for g in games:
+        sheets = g.get("teamSheets")
+        if sheets and sheets.get("p1") and sheets.get("p2"):
+            return sheets
+    return None
+
+
+def _brought_species_keys_for_game(game: dict) -> set[str]:
+    """Species (normalized keys) actually brought by P1 to this single game.
+
+    Derived from the union of P1 active + P1 bench across this game's
+    snapshots. In OTS Bo3 the parser already gates P1 bench to broughtSet,
+    so this naturally yields the 4 brought.
+    """
+    out: set[str] = set()
+    for snap in game.get("snapshots", []):
+        for p in snap.get("p1", {}).get("active", []):
+            out.add(_species_key(p["species"]))
+        for b in snap.get("p1", {}).get("bench", []):
+            out.add(_species_key(b["species"]))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Action extraction
 # ---------------------------------------------------------------------------
@@ -338,18 +371,47 @@ async def process_match(
     if not games:
         return {"skipped_no_games": 1}
 
-    p1_team = reconstruct_p1_team(games)
-    p2_species = reconstruct_p2_species(games)
-    p1_knowledge = damage_inferencer.init_knowledge(list(p1_team.keys()))
-    p2_knowledge = damage_inferencer.init_knowledge(p2_species)
+    match_format = match_record.get("format", "bo1")
+    team_sheets = _team_sheets_for_match(games) if match_format == "bo3" else None
 
-    system_prompt = teacher_llm.render_system_prompt(format_p1_team_block(p1_team))
+    # Knowledge state seeding — for OTS Bo3, use the full 6-mon team sheets
+    # so the threat matrix can reason about the unswitched-in backline too.
+    # For CTS Bo1, fall back to whatever the snapshots reveal.
+    p1_team_recon = reconstruct_p1_team(games)
+    if team_sheets:
+        p1_species_universe = [s["species"] for s in team_sheets["p1"]]
+        p2_species_universe = [s["species"] for s in team_sheets["p2"]]
+    else:
+        p1_species_universe = list(p1_team_recon.keys())
+        p2_species_universe = reconstruct_p2_species(games)
+
+    p1_knowledge = damage_inferencer.init_knowledge(p1_species_universe)
+    p2_knowledge = damage_inferencer.init_knowledge(p2_species_universe)
+
+    # Bo1 system prompt is stable across all turns of the match.
+    bo1_system_prompt = (
+        teacher_llm.render_system_prompt(format_p1_team_block(p1_team_recon))
+        if not team_sheets
+        else None
+    )
 
     stats: dict[str, int] = defaultdict(int)
     match_id = match_record.get("match_id", "unknown")
 
     for game_idx, game in enumerate(games):
         snapshots = game.get("snapshots") or []
+
+        # Bo3 system prompt depends on the brought-4 of THIS game (different
+        # selections per game in a series), so render per-game.
+        if team_sheets:
+            brought = _brought_species_keys_for_game(game)
+            system_prompt = teacher_llm.render_system_prompt_bo3(
+                p1_sheet=team_sheets["p1"],
+                p2_sheet=team_sheets["p2"],
+                p1_brought=brought,
+            )
+        else:
+            system_prompt = bo1_system_prompt
         for i in range(len(snapshots) - 1):
             snap_pre = snapshots[i]
             snap_post = snapshots[i + 1]
