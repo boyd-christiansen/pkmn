@@ -15,7 +15,7 @@ without touching the others.
 |---|---|---|
 | [`data_scraper/`](data_scraper/) | Python 3.11+ | Pulls top-500 ladder users + all their saved replays from Pokémon Showdown. |
 | [`calc_microservice/`](calc_microservice/) | Node 20+ / TS | HTTP service wrapping `@smogon/calc` (`POST /calc` with `isCrit` support), `@pkmn/client` (`POST /parse_log` returning per-turn snapshots + `actionLog`), and `@pkmn/dex` (`GET /dex/move/:name`). |
-| [`pipeline/`](pipeline/) | Python 3.11+ | Atomic modules that turn raw replays into SFT-ready conversational training data. `replay_parser`, `canonical_priors`, `damage_inferencer`, and `threat_matrix` are implemented; `teacher_llm` and `master_pipeline` are still stubs. |
+| [`pipeline/`](pipeline/) | Python 3.11+ | Atomic modules that turn raw replays into SFT-ready conversational training data. **All six modules implemented** — `replay_parser`, `canonical_priors`, `damage_inferencer`, `threat_matrix`, `teacher_llm`, `master_pipeline`. |
 | [`notes/`](notes/) | — | Free-form planning notes (data sourcing options, scope decisions, etc). |
 
 ## Pipeline overview
@@ -126,26 +126,39 @@ to `pipeline/data/smogon_chaos_<format_id>.json`. Run again whenever you want
 fresher data. Without this, `canonical_priors` falls back to a curated table
 + heuristic (still works, just less accurate for off-meta species).
 
-### 5. Generate training data — *pending* (orchestrator only)
+### 5. Generate the SFT training dataset
 
-For each turn in each match, the orchestrator (`master_pipeline.py`, still a
-stub) will chain four working library modules:
+For each turn in each match, the orchestrator chains the library modules:
 
-1. **`damage_inferencer.update_knowledge(snap_pre, snap_post, snap_pre.actionLog, p1_k, p2_k)`**
-   — two-way binary search tightens both `KnowledgeState`s atomically, with
-   the 508-EV total constraint applied per Pokémon after.
-2. **`canonical_priors.get_probable_spread(species, format_id)`** — pure-data
-   lookup, hits Smogon chaos data when bootstrapped.
-3. **`threat_matrix.generate_threat_matrix(snap, p1_side, p1_k, p2_k, format_id=…)`**
+1. **`master_pipeline.extract_p1_actions(snap_pre, snap_post, action_log)`** —
+   reverse-engineer P1's two-slot decision (move + target + Tera, switch,
+   or status move via revealedMoves diff). Skip the turn if ambiguous.
+2. **`threat_matrix.generate_threat_matrix(snap, "p1", K1, K2, format_id=…)`**
    — dual-track text block: Absolute envelope (from `KnowledgeState`s) +
-   Probable envelope (from canonical priors), with `[PRIOR CONTRADICTED]`
-   flags.
-4. **`teacher_llm.generate(...)`** *(stub)* — drive a frontier model through
-   a tool-calling CoT loop toward the human's known play.
+   Probable envelope (from canonical priors), `[PRIOR CONTRADICTED]` flags.
+3. **`teacher_llm.synthesize_turn(system, user, human_action)`** — OpenAI
+   tool-use loop with `calculate_damage`. The LLM sees the human's play as
+   ground truth and writes a Chain-of-Thought that justifies it. Returns
+   OpenAI-fine-tuning conversation messages (ground-truth stripped).
+4. **`damage_inferencer.update_knowledge(snap_pre, snap_post, events, K1, K2)`**
+   — two-way binary search tightens both `KnowledgeState`s; 508-EV
+   constraint pass applied per Pokémon.
 
-All upstream blocking sub-tasks (per-turn `actionLog` production, `isCrit`
-threading, EV-budget constraint, real Smogon priors) are now implemented;
-only the orchestrator + teacher LLM remain.
+```bash
+cd pipeline
+
+# Smoke test (no API key needed, exercises everything except the LLM call):
+.venv/bin/python master_pipeline.py --limit 1 --dry-run
+
+# Real run on a single Bo3 match:
+OPENAI_API_KEY=sk-... .venv/bin/python master_pipeline.py --limit 1
+
+# Full run on all parsed bo3 matches:
+OPENAI_API_KEY=sk-... .venv/bin/python master_pipeline.py
+```
+
+→ writes one fine-tuning row per identifiable turn to
+`pipeline/parsed_data/sft_training_data.jsonl`. Resumable on rerun.
 
 Output: one conversational JSONL row per turn.
 
@@ -166,7 +179,7 @@ Output: one conversational JSONL row per turn.
 | `pipeline/canonical_priors.py` | Working. Library + bootstrap CLI. Real Smogon Chaos JSON when cached on disk; curated table + heuristic fallback. |
 | `pipeline/damage_inferencer.py` | Working. Dual-state, two-way binary search, atomic application, 508-EV constraint pass, crit-aware (via `/calc isCrit`), multi-hit filter. |
 | `pipeline/threat_matrix.py` | Working. Dual-track Absolute + Probable output with `[PRIOR CONTRADICTED]` flag. Takes optional `format_id` to drive chaos-backed priors. |
-| `pipeline/teacher_llm.py` | Stub. |
-| `pipeline/master_pipeline.py` | Stub. |
+| `pipeline/teacher_llm.py` | Working. OpenAI async tool-use loop with `calculate_damage` + structured `{pre_tool_thought, action}` output. Strips ground truth from saved messages. |
+| `pipeline/master_pipeline.py` | Working. CLI orchestrator. `--dry-run` mode exercises everything except the OpenAI call. Resumable. |
 
 See each subdirectory's README for setup, contracts, and design notes.

@@ -1,9 +1,9 @@
 # pipeline
 
 Atomic Python modules that turn raw Pokémon Showdown replays into SFT-ready
-conversational training data. `replay_parser.py`, `canonical_priors.py`,
-`damage_inferencer.py`, and `threat_matrix.py` are implemented; `teacher_llm.py`
-and `master_pipeline.py` are still stubs.
+conversational training data. **All six modules are implemented**:
+`replay_parser.py`, `canonical_priors.py`, `damage_inferencer.py`,
+`threat_matrix.py`, `teacher_llm.py`, and `master_pipeline.py`.
 
 ## Setup
 
@@ -205,52 +205,128 @@ stat (HP, off-stat, def-stat), the line is flagged
   shadow ball            Absolute: 47.1%–82.0%   |  Probable (meta): 62.1%–73.5%   (guaranteed 2HKO)  [PRIOR CONTRADICTED]
 ```
 
-### `teacher_llm.py`
+### `teacher_llm.py` *(implemented)*
 
-Drives a frontier model through a tool-calling loop to synthesise CoT reasoning
-*toward* the known label (the play the human actually made).
+Drives a frontier OpenAI model through a tool-calling loop, eliciting a
+chain-of-thought that JUSTIFIES a known human play. Returns OpenAI-fine-
+tuning-ready conversation messages.
 
-- **In:** `BoardState`, the player's actual decision (the label), and the
-  pre-computed `ThreatMatrix`.
-- **Out:** a list of `(role, content)` messages forming a single SFT example
-  — system prompt, board-state user turn, assistant CoT (with interleaved calc
-  tool calls + results), final action.
-- **Touches:** the only file allowed to talk to the frontier LLM. Never parses
-  replays or calls the calc service directly.
+- **API:** `await synthesize_turn(system_prompt, user_prompt, human_action,
+  *, tools_allowed=True, ...)` → `list[dict] | None`.
+- **Tools exposed to the LLM:** `calculate_damage` — JSON schema mirrors
+  `/calc`'s payload (Pokémon × move × field, with `isCrit` / `evs` / `nature`
+  / etc. all optional).
+- **Final-output schema:** strict JSON schema enforced via OpenAI's
+  `response_format: json_schema`. Shape: `{ pre_tool_thought: string,
+  action: { slot_1, slot_2 } }`. Each slot has
+  `{action_type: "move"|"switch"|"pass", move?, target?, tera?, switch_to?}`.
+- **Ground-truth handling:** during the API call, the user message has the
+  human's play appended as an `=== EXPERT'S DECISION ===` suffix. The
+  returned messages have that suffix **stripped** — saved SFT examples
+  show only board state + threat matrix.
+- **Tool loop:** up to 6 iterations (`MAX_TOOL_ITERATIONS`). Each iteration:
+  call OpenAI, append assistant message, execute any `calculate_damage`
+  tool calls via `aiohttp` to `/calc`, append tool messages, loop. Returns
+  on a no-tool-call response (final answer) or `None` on iteration cap.
+- **Critical Rules in the system prompt** include the **Masking Rule**
+  verbatim from the project spec: `[UNREVEALED_MOVE]` slots are presumed
+  suboptimal and not to be reasoned about.
+- **Touches:** OpenAI Chat Completions API + `/calc` (tool execution).
+  No replay parsing, no inference, no canonical-priors imports.
 
-### `master_pipeline.py`
+### `master_pipeline.py` *(implemented)*
 
-Orchestrator. Wires everything together:
+Orchestrator. Walks `parsed_data/{bo1,bo3}.jsonl`, generates one SFT example
+per identifiable turn, writes to `parsed_data/sft_training_data.jsonl`.
+
+- **`reconstruct_p1_team(games)`** — forward-scan over every snapshot in
+  the match (across all Bo3 games), aggregating revealed `item`, `ability`,
+  `teraType`, `isTerastallized`, and `revealedMoves` per P1 species. Pads
+  each Pokémon's move list to exactly 4 with `"[UNREVEALED_MOVE]"`.
+- **`extract_p1_actions(snap_pre, snap_post, action_log)`** —
+  reverse-engineers each P1 active slot's action:
+  - Damage move → look in `action_log` (`attacker_slot == "p1a"|"p1b"`).
+    Multiple `defender_slot`s on one attacker = `"spread"` target.
+  - Tera detected by `isTerastallized` going false→true between snapshots.
+  - Switch detected by species change at the same slot.
+  - Status move detected by exactly-1 new entry in `revealedMoves` between
+    snapshots when neither damage event nor switch was observed.
+  - Returns `None` if any slot is ambiguous → caller skips the turn.
+- **Process loop** per match:
+  1. `reconstruct_p1_team` + gather P2 species from snapshots.
+  2. `init_knowledge` for both sides at fully-open `[0, 252]` bounds (per
+     project spec: canonical priors live in the threat-matrix Probable
+     track only; the inferencer's Absolute track stays strict-math).
+  3. Render system prompt (with team block + Masking Rule).
+  4. For each `(snap_pre, snap_post, snap_pre.actionLog)` triple in turn
+     order:
+     - Extract P1's action; skip turn if ambiguous.
+     - Generate threat matrix (uses `format_id` for chaos-backed Probable).
+     - Format user prompt (snapshot + threat matrix).
+     - `await teacher_llm.synthesize_turn(...)`.
+     - Append the resulting messages as one row to the SFT JSONL.
+     - `await damage_inferencer.update_knowledge(...)` to tighten both
+       KnowledgeStates for the next iteration.
+- **Resumable:** `(match_id, game_index, turn)` keys already present in the
+  output JSONL are skipped on rerun.
+- **`--dry-run`:** exercises the entire orchestration except the OpenAI
+  call; emits a placeholder assistant message containing the actual human
+  action. Useful for verifying the pipeline without spending API credits.
+
+#### CLI
+
+```bash
+cd pipeline
+
+# Smoke test (no API key needed):
+.venv/bin/python master_pipeline.py --limit 1 --dry-run
+
+# Real run on a single Bo3 match:
+OPENAI_API_KEY=sk-... .venv/bin/python master_pipeline.py --limit 1
+
+# Full run (default model gpt-4o, concurrency 1):
+OPENAI_API_KEY=sk-... .venv/bin/python master_pipeline.py
+```
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--input` | `parsed_data/bo3.jsonl` | Match-records JSONL from replay_parser. |
+| `--output` | `parsed_data/sft_training_data.jsonl` | Append-only JSONL. |
+| `--calc-base-url` | `http://localhost:3000` | |
+| `--format-id` | auto from filename | Drives chaos-priors lookup. |
+| `--limit` | none | Process first N matches (test batch). |
+| `--concurrency` | `1` | Keep low to respect OpenAI rate limits. |
+| `--dry-run` | off | Skip the OpenAI call. |
+| `--model` | `gpt-4o` | Or `TEACHER_MODEL` env var. |
+
+### Orchestrator data flow
 
 ```
 raw replay JSON
-    → replay_parser  →  per-turn snapshots
+    → replay_parser  →  per-turn snapshots (with actionLog)
     │
-    │  per match: init  K1, K2 = init_knowledge(p1_team), init_knowledge(p2_team)
+    │  per match: K1, K2 = init_knowledge(p1_team), init_knowledge(p2_team)
+    │             (full open bounds — canonical priors live in Probable track only)
     │
-    │  for each turn (in order):
+    │  for each turn in order:
+    │    → master_pipeline.extract_p1_actions(snap_pre, snap_post, action_log)
+    │      (the human's ground-truth play; skip turn if ambiguous)
+    │    → threat_matrix.generate(snap_pre, "p1", K1, K2, format_id=…)
+    │      (dual-track Absolute + Probable, [PRIOR CONTRADICTED] flagged)
+    │    → teacher_llm.synthesize_turn(system, user, human_action)
+    │      (tool-call loop, returns OpenAI fine-tuning messages)
+    │    → write JSONL row
     │    → damage_inferencer.update_knowledge(snap_pre, snap_post, events, K1, K2)
-    │      (tightens BOTH K1 and K2 in place — two-way binary search)
-    │    → threat_matrix.generate(snap, p1_side, K1, K2)
-    │      (dual-track: Absolute envelope + Probable meta-spread range,
-    │       flagged [PRIOR CONTRADICTED] when canonical priors disagree)
-    │    → teacher_llm.generate(snap, label, threats, K1, K2)
-    │      (CoT messages with tool calls)
-    │
-    → JSONL row written to disk
+    │      (tightens both KnowledgeStates atomically + 508-EV constraint)
 ```
-
-Owns: file I/O, batching/concurrency, retries on teacher failures, dedup of
-seen `(replay_id, turn_idx)` keys, and final dataset formatting (OpenAI /
-Anthropic conversational schema).
 
 ## Status
 
 | Module | State |
 |---|---|
-| `replay_parser.py` | Working. Run `python replay_parser.py --help`. Also captures the per-turn `actionLog` from `/parse_log` into the JSONL. |
+| `replay_parser.py` | Working. Run `python replay_parser.py --help`. Captures per-turn `actionLog` from `/parse_log` into the JSONL. |
 | `canonical_priors.py` | Working. Library + bootstrap CLI. Reads Smogon Chaos JSON when present; falls back to curated table → heuristic. |
 | `damage_inferencer.py` | Working. Dual-state, two-way binary search, atomic apply, 508-EV constraint pass, crit-aware via `/calc isCrit`, multi-hit filter. |
-| `threat_matrix.py` | Working. Library: dual-track Absolute + Probable output with `[PRIOR CONTRADICTED]` flag. Now takes optional `format_id` to drive Smogon-backed priors. |
-| `teacher_llm.py` | Stub. Prompt design + tool-calling loop; the alignment-quality crux of the project. |
-| `master_pipeline.py` | Stub. Wires the above five together; build last. |
+| `threat_matrix.py` | Working. Dual-track Absolute + Probable output with `[PRIOR CONTRADICTED]` flag. Optional `format_id` drives Smogon-backed priors. |
+| `teacher_llm.py` | Working. OpenAI tool-use loop with `calculate_damage` + structured `{pre_tool_thought, action}` output. Strips ground truth from saved messages. |
+| `master_pipeline.py` | Working. Run `python master_pipeline.py --help`. `--dry-run` exercises orchestration without OpenAI cost. |
