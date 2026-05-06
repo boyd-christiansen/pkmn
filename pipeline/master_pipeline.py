@@ -38,6 +38,8 @@ from typing import Any
 import aiohttp
 import click
 from openai import AsyncOpenAI
+
+from teacher_llm import TeacherProvider
 from tqdm.asyncio import tqdm
 
 import canonical_priors
@@ -460,6 +462,30 @@ def load_seen_keys(output_path: Path) -> set[tuple[str, int, int]]:
 # ---------------------------------------------------------------------------
 
 
+def _build_teacher(provider: str, model: str | None) -> TeacherProvider:
+    """Instantiate the requested provider, validating that its API key is present."""
+    if provider == "openai":
+        if not os.environ.get("OPENAI_API_KEY"):
+            raise click.ClickException(
+                "OPENAI_API_KEY env var is required (or pass --dry-run / --provider <other>)"
+            )
+        from teacher_openai import OpenAIProvider
+        return OpenAIProvider(model=model) if model else OpenAIProvider()
+    if provider == "anthropic":
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise click.ClickException("ANTHROPIC_API_KEY env var is required for --provider anthropic")
+        from teacher_anthropic import AnthropicProvider
+        return AnthropicProvider(model=model) if model else AnthropicProvider()
+    if provider == "google":
+        if not (os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")):
+            raise click.ClickException(
+                "GOOGLE_API_KEY (or GEMINI_API_KEY) env var is required for --provider google"
+            )
+        from teacher_google import GoogleProvider
+        return GoogleProvider(model=model) if model else GoogleProvider()
+    raise click.ClickException(f"unknown provider: {provider}")
+
+
 async def _check_calc_health(session: aiohttp.ClientSession, base_url: str) -> None:
     try:
         async with session.get(f"{base_url}/health") as r:
@@ -477,7 +503,7 @@ async def process_match(
     *,
     output_path: Path,
     calc_base_url: str,
-    openai_client: AsyncOpenAI | None,
+    teacher: TeacherProvider | None,
     aiohttp_session: aiohttp.ClientSession,
     file_lock: asyncio.Lock,
     format_id: str,
@@ -580,18 +606,20 @@ async def process_match(
             if dry_run:
                 messages = _dry_run_messages(system_prompt, user_prompt, human_action)
             else:
-                if openai_client is None:
-                    raise RuntimeError("OpenAI client missing in non-dry-run mode")
+                if teacher is None:
+                    raise RuntimeError("Teacher provider missing in non-dry-run mode")
                 try:
-                    messages = await teacher_llm.synthesize_turn(
+                    res = await teacher.synthesize_turn(
                         system_prompt=system_prompt,
                         user_prompt=user_prompt,
                         human_action=human_action,
                         calc_url=f"{calc_base_url}/calc",
-                        model=model,
-                        openai_client=openai_client,
                         aiohttp_session=aiohttp_session,
                     )
+                    messages = res.messages
+                    if res.error and not messages:
+                        _log_error(f"[{match_id} g{game_idx} t{turn}] teacher LLM: {res.error}")
+                        stats["skipped_llm_error"] += 1
                 except Exception as e:
                     stats["skipped_llm_error"] += 1
                     _log_error(f"[{match_id} g{game_idx} t{turn}] teacher LLM failed: {e}")
@@ -695,15 +723,15 @@ async def run(
     limit: int | None,
     concurrency: int,
     dry_run: bool,
-    model: str,
+    model: str | None,
+    provider: str,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     timeout = aiohttp.ClientTimeout(total=180, connect=10)
 
-    if not dry_run and not os.environ.get("OPENAI_API_KEY"):
-        raise click.ClickException(
-            "OPENAI_API_KEY env var is required (or pass --dry-run for the orchestration smoke test)"
-        )
+    teacher: TeacherProvider | None = None
+    if not dry_run:
+        teacher = _build_teacher(provider, model)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         await _check_calc_health(session, calc_base_url)
@@ -719,7 +747,6 @@ async def run(
             records = records[:limit]
             click.echo(f"  --limit {limit}: processing first {len(records)} matches")
 
-        openai_client = None if dry_run else AsyncOpenAI()
         file_lock = asyncio.Lock()
         sem = asyncio.Semaphore(concurrency)
 
@@ -729,7 +756,7 @@ async def run(
                     rec,
                     output_path=output_path,
                     calc_base_url=calc_base_url,
-                    openai_client=openai_client,
+                    teacher=teacher,
                     aiohttp_session=session,
                     file_lock=file_lock,
                     format_id=format_id,
@@ -774,12 +801,26 @@ async def run(
 @click.option("--limit", type=int, default=None, help="Process only the first N matches (test batch).")
 @click.option("--concurrency", default=1, show_default=True,
               help="Max matches processed in parallel. Keep low (1-3) to respect OpenAI rate limits.")
-@click.option("--dry-run", is_flag=True, help="Skip the OpenAI call; emit a placeholder assistant message.")
-@click.option("--model", default=teacher_llm.DEFAULT_MODEL, show_default=True)
-def cli(input_path, output_path, calc_base_url, format_id, limit, concurrency, dry_run, model):
+@click.option("--dry-run", is_flag=True, help="Skip the LLM call; emit a placeholder assistant message.")
+@click.option(
+    "--provider",
+    type=click.Choice(["openai", "anthropic", "google"]),
+    default="openai",
+    show_default=True,
+    help="Which teacher LLM backend to use.",
+)
+@click.option(
+    "--model",
+    default=None,
+    help="Override the default model id for the chosen provider.",
+)
+def cli(input_path, output_path, calc_base_url, format_id, limit, concurrency, dry_run, provider, model):
     """Generate the SFT training JSONL from parsed replay data."""
     resolved_format = _resolve_format_id(input_path, format_id)
-    click.echo(f"using format_id={resolved_format}  dry_run={dry_run}  model={model}")
+    click.echo(
+        f"using format_id={resolved_format}  dry_run={dry_run}  "
+        f"provider={provider}  model={model or '(default)'}"
+    )
     asyncio.run(
         run(
             input_path=input_path,
@@ -790,6 +831,7 @@ def cli(input_path, output_path, calc_base_url, format_id, limit, concurrency, d
             concurrency=concurrency,
             dry_run=dry_run,
             model=model,
+            provider=provider,
         )
     )
 

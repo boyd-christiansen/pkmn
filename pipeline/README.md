@@ -387,8 +387,12 @@ raw replay JSON
 | `canonical_priors.py` | Working. Library + bootstrap CLI. Reads Smogon Chaos JSON when present; falls back to curated table → heuristic. |
 | `damage_inferencer.py` | Working. Dual-state, two-way binary search, atomic apply, 508-EV constraint pass, crit-aware via `/calc isCrit`, multi-hit filter. |
 | `threat_matrix.py` | Working. Dual-track Absolute + Probable output with `[PRIOR CONTRADICTED]` flag. Optional `format_id` drives Smogon-backed priors. |
-| `teacher_llm.py` | Working. OpenAI tool-use loop; concise rules (Masking/OTS, Tool, Threat-Matrix, Spread, Alternatives, Output); ground-truth stripping; `# TODO(rlhf-followup)` for proper minimax distillation of alternatives. |
-| `master_pipeline.py` | Working. `flip_match_to_winner` makes every SFT example come from the series winner's perspective; inferred-spread block in user prompt; per-format system prompt branch. `--dry-run` exercises orchestration without OpenAI cost. |
+| `teacher_llm.py` | Provider-agnostic core: `TeacherProvider` ABC, schemas (incl. `submit_decision` tool), prompt templates (6 rules: Masking/OTS, Tool, Threat-Matrix, Spread, Alternatives, Output), ground-truth stripping. `# TODO(rlhf-followup)` flags the prompt-driven alternative evaluation as temporary. |
+| `teacher_openai.py` | OpenAI adapter (gpt-4o / gpt-4.1 / gpt-5). Forces `calculate_damage` on iter 0, `tool_choice=required` thereafter. Default. |
+| `teacher_anthropic.py` | Anthropic adapter (claude-sonnet-4.x). Same tool-loop semantics. |
+| `teacher_google.py` | Google adapter (gemini-2.5-pro / gemini-3-x). Same tool-loop semantics. |
+| `bakeoff.py` | Head-to-head bake-off runner. Reports per-provider cost, tool-call rate, CoT length, action-match rate. |
+| `master_pipeline.py` | Working. `flip_match_to_winner` makes every SFT example come from the series winner's perspective; inferred-spread block in user prompt; per-format system prompt branch; `--provider {openai,anthropic,google}` flag. `--dry-run` exercises orchestration without LLM cost. |
 
 ## Planned follow-up workstreams (TODO)
 

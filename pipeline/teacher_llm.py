@@ -14,24 +14,33 @@ Pipeline role:
     state + threat matrix in the user prompt, so the trained model learns
     to derive the play from scratch.
 
+Provider abstraction:
+    `TeacherProvider` is the ABC that concrete frontend adapters implement
+    (`teacher_openai.py`, `teacher_anthropic.py`, `teacher_google.py`).
+    Each adapter handles SDK specifics + tool-format translation, but
+    returns the same OpenAI-format messages so saved JSONL is comparable
+    across providers and the bake-off / migration is trivial.
+
 Isolation contract:
-    Talks only to (a) the OpenAI Chat Completions API and (b) the calc
-    microservice via the `calculate_damage` tool. No replay parsing, no
-    inference, no canonical-priors imports.
+    Talks to whichever frontier model the orchestrator's chosen provider
+    points at, plus the calc microservice via the `calculate_damage` tool.
+    No replay parsing, no inference, no canonical-priors imports.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from typing import Any
 
 import aiohttp
 from openai import AsyncOpenAI
 
-DEFAULT_MODEL = os.environ.get("TEACHER_MODEL", "gpt-4o")
+DEFAULT_MODEL = os.environ.get("TEACHER_MODEL", "gpt-5.5")
 DEFAULT_CALC_URL = "http://localhost:3000/calc"
-MAX_TOOL_ITERATIONS = 6
+MAX_TOOL_ITERATIONS = 8  # need ≥3 (calc → result → submit), buffer for alternatives
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +189,25 @@ FINAL_OUTPUT_SCHEMA: dict[str, Any] = {
 }
 
 
+# Final-answer is a tool now (not response_format). The model has only one
+# output channel — tool calls — so it can't bypass calculate_damage by
+# producing a structured response directly. This is the architectural fix
+# for the zero-tool-call problem we hit in the first real test run.
+SUBMIT_DECISION_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "submit_decision",
+        "description": (
+            "Call this exactly once per turn, after using `calculate_damage` "
+            "to verify your most decisive damage assumptions, when you are "
+            "ready to commit your final play. The arguments are your final "
+            "structured action."
+        ),
+        "parameters": FINAL_OUTPUT_SCHEMA,
+    },
+}
+
+
 # ---------------------------------------------------------------------------
 # Prompt templates
 # ---------------------------------------------------------------------------
@@ -193,16 +221,16 @@ def _species_key(s: str) -> str:
 # approach has the teacher cherry-picking weak alternatives because it knows
 # the answer; a proper search would surface alternatives that genuinely
 # competed with the chosen play.
-_SHARED_RULES_TAIL = """2. The Tool Rule: Use `calculate_damage` for hypotheticals the threat matrix doesn't cover — switch outcomes, future-turn calcs, opposing Tera predictions. 1–3 per turn; don't recompute matrix cells.
+_SHARED_RULES_TAIL = """2. The Tool Rule: You have two tools. `calculate_damage` verifies any specific damage hypothetical — switch outcomes, future-turn ranges, opposing Tera predictions, +1/+2 boosted scenarios. `submit_decision` is how you commit your final play; call it exactly once when ready. **You MUST call `calculate_damage` at least once before calling `submit_decision`.** The pre-computed threat matrix already covers current matchup damage cells — don't re-calc those; use the tool for hypotheticals only.
 
 3. The Threat-Matrix Rule: Each line shows an Absolute damage envelope (provable from observed play). When the canonical meta spread is consistent with the inferred bounds, a Probable envelope is also shown; when it's contradicted, only Absolute is shown tagged `(off-meta)`.
 
 4. The Spread Rule: Your team's stat spread may be presented as either exact values or as inferred per-stat ranges. When a range is given, reason from the bounds — worst case for your own survival checks, best case for your offensive checks.
 
-5. The Alternatives Rule: Before committing, briefly evaluate 1–2 plausible alternative plays (other moves on your active Pokémon, or a switch to bring in a useful matchup). Use `calculate_damage` if needed to disprove them. Document why each alternative is worse than the chosen play.
+5. The Alternatives Rule: Before submitting, evaluate at least one plausible alternative play (a different move on the same Pokémon, or a switch to bring in a useful matchup) using `calculate_damage`, and document why it's worse than your chosen play. The point of the calc tool is to disprove tempting alternatives, not to confirm what the threat matrix already showed.
 
-6. The Output Rule: Return one final JSON object matching the response schema:
-   - pre_tool_thought: a brief strategic reasoning summary that leads to your chosen action
+6. The Output Rule: Commit your decision via `submit_decision` with arguments:
+   - pre_tool_thought: a brief strategic reasoning summary that leads to your chosen action (mention the rejected alternative explicitly)
    - action: {{ slot_1, slot_2 }} where each slot describes the action for that active Pokémon
 """
 
@@ -294,7 +322,6 @@ async def synthesize_turn(
     user_prompt: str,
     human_action: dict[str, Any],
     *,
-    tools_allowed: bool = True,
     calc_url: str = DEFAULT_CALC_URL,
     model: str = DEFAULT_MODEL,
     max_iterations: int = MAX_TOOL_ITERATIONS,
@@ -302,6 +329,11 @@ async def synthesize_turn(
     aiohttp_session: aiohttp.ClientSession | None = None,
 ) -> list[dict[str, Any]] | None:
     """Run the teacher tool-use loop. Returns the SFT-ready conversation, or None on failure.
+
+    Architecture: tool calls are the only output channel. The model must call
+    `calculate_damage` (zero or more times) and then `submit_decision` (exactly
+    once) to terminate the loop. There is no `response_format` — without
+    `submit_decision` the loop hits max_iterations and returns None.
 
     The returned messages have the ground-truth suffix stripped from the user
     prompt — they're safe to write directly to the fine-tuning JSONL.
@@ -324,22 +356,24 @@ async def synthesize_turn(
             {"role": "user", "content": api_user_content},
         ]
 
-        tools = [CALCULATE_DAMAGE_TOOL] if tools_allowed else None
-        response_format = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "vgc_decision",
-                "strict": True,
-                "schema": FINAL_OUTPUT_SCHEMA,
-            },
-        }
+        tools = [CALCULATE_DAMAGE_TOOL, SUBMIT_DECISION_TOOL]
+        submit_seen = False
 
-        for _ in range(max_iterations):
+        for iter_idx in range(max_iterations):
+            # Force a tool call on every iteration. On iter 0 specifically, force
+            # `calculate_damage` so the model can't shortcut straight to
+            # submit_decision before doing any verification — MUST in the prompt
+            # alone wasn't enough with gpt-4o.
+            if iter_idx == 0:
+                tool_choice: Any = {"type": "function", "function": {"name": "calculate_damage"}}
+            else:
+                tool_choice = "required"
             response = await openai_client.chat.completions.create(
                 model=model,
                 messages=api_messages,
                 tools=tools,
-                response_format=response_format,
+                tool_choice=tool_choice,
+                parallel_tool_calls=False,  # force sequential reasoning: calc → result → next decision
             )
             msg = response.choices[0].message
 
@@ -361,30 +395,48 @@ async def synthesize_turn(
             api_messages.append(assistant_msg)
 
             if not msg.tool_calls:
-                # Final answer — strip ground-truth from the user message before returning.
-                saved_messages = list(api_messages)
-                saved_messages[1] = {"role": "user", "content": user_prompt}
-                return saved_messages
+                # Model produced content without a tool call — protocol violation
+                # (tool_choice=required should prevent this, but defensive).
+                return None
 
-            # Execute every tool call this round, append tool messages.
             for tc in msg.tool_calls:
-                if tc.function.name == "calculate_damage":
+                name = tc.function.name
+                if name == "calculate_damage":
                     try:
                         args = json.loads(tc.function.arguments)
                         result = await _call_calc(aiohttp_session, calc_url, args)
                         tool_content = json.dumps(result)
                     except Exception as e:
                         tool_content = json.dumps({"error": f"{type(e).__name__}: {e}"})
+                    api_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": tool_content,
+                    })
+                elif name == "submit_decision":
+                    # Acknowledge the commit so the saved messages are well-formed
+                    # (every tool_call must have a matching tool result for OpenAI
+                    # fine-tuning data validity).
+                    submit_seen = True
+                    api_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": json.dumps({"status": "decision_committed"}),
+                    })
                 else:
-                    tool_content = json.dumps({"error": f"unknown tool: {tc.function.name}"})
+                    api_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": json.dumps({"error": f"unknown tool: {name}"}),
+                    })
 
-                api_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": tool_content,
-                })
+            if submit_seen:
+                # Strip ground-truth from the saved user message and return.
+                saved_messages = list(api_messages)
+                saved_messages[1] = {"role": "user", "content": user_prompt}
+                return saved_messages
 
-        # Hit max iterations without a final answer.
+        # Hit max iterations without ever seeing submit_decision.
         return None
     finally:
         if own_aiohttp:
@@ -401,14 +453,105 @@ async def _call_calc(
         return json.loads(text)
 
 
+# ---------------------------------------------------------------------------
+# Provider abstraction (for the frontier-model bake-off)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ProviderResult:
+    """Per-turn metrics that bakeoff.py uses to compare providers."""
+    messages: list[dict[str, Any]] | None  # SFT-ready conversation, or None on failure
+    input_tokens: int = 0
+    output_tokens: int = 0
+    calc_calls: int = 0                    # `calculate_damage` invocations
+    iterations: int = 0                    # API roundtrips
+    elapsed_seconds: float = 0.0
+    cost_usd: float = 0.0
+    error: str | None = None
+
+
+# Approximate $/1M-token pricing per (provider, model). Updated periodically;
+# only used by bakeoff.py for cost-estimation. Numbers are best-guess
+# placeholders for the current 2026 frontier lineup — confirm against the
+# provider's pricing page before scaling.
+PRICE_PER_M_TOKENS: dict[str, dict[str, tuple[float, float]]] = {
+    # (input_price, output_price) in $ per 1M tokens
+    "openai": {
+        # Flagship line.
+        "gpt-5.5":         (5.00,  20.00),
+        "gpt-5.5-pro":     (15.00, 60.00),
+        "gpt-5.4":         (3.00,  12.00),  # previous-gen flagship, cheaper
+        # Compact tiers.
+        "gpt-5.5-mini":    (0.40,  1.60),
+        "gpt-5.5-nano":    (0.10,  0.40),
+        # Legacy (still callable).
+        "gpt-4o":          (2.50,  10.00),
+        "gpt-4o-mini":     (0.15,  0.60),
+        "gpt-4.1":         (2.00,  8.00),
+    },
+    "anthropic": {
+        "claude-opus-4-7":   (15.00, 75.00),
+        "claude-sonnet-4-6": (3.00,  15.00),
+        "claude-haiku-4-5":  (1.00,  5.00),
+        # Legacy.
+        "claude-sonnet-4-5": (3.00,  15.00),
+    },
+    "google": {
+        "gemini-3.1-pro-preview":        (1.50,  10.00),
+        "gemini-3.1-flash-preview":      (0.30,  2.50),
+        "gemini-3.1-flash-lite-preview": (0.10,  0.50),
+        # Legacy.
+        "gemini-2.5-pro":                (1.25,  10.00),
+    },
+}
+
+
+def estimate_cost_usd(provider: str, model: str, in_tokens: int, out_tokens: int) -> float:
+    table = PRICE_PER_M_TOKENS.get(provider, {})
+    in_p, out_p = table.get(model, (0.0, 0.0))
+    return (in_tokens * in_p + out_tokens * out_p) / 1_000_000.0
+
+
+class TeacherProvider(ABC):
+    """Abstract base — concrete adapters in teacher_{openai,anthropic,google}.py.
+
+    Each implementation does its own SDK call + tool-format translation,
+    but returns OpenAI-format messages so saved JSONL is comparable across
+    providers.
+    """
+
+    name: str = "abstract"
+    model: str = ""
+
+    @abstractmethod
+    async def synthesize_turn(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        human_action: dict[str, Any],
+        *,
+        calc_url: str = DEFAULT_CALC_URL,
+        aiohttp_session: aiohttp.ClientSession | None = None,
+    ) -> ProviderResult:
+        ...
+
+
 __all__ = [
     "CALCULATE_DAMAGE_TOOL",
     "DEFAULT_CALC_URL",
     "DEFAULT_MODEL",
     "FINAL_OUTPUT_SCHEMA",
     "MAX_TOOL_ITERATIONS",
+    "PRICE_PER_M_TOKENS",
+    "ProviderResult",
+    "SUBMIT_DECISION_TOOL",
+    "SYNTHESIS_GROUND_TRUTH_SUFFIX",
     "SYSTEM_PROMPT_BO1",
     "SYSTEM_PROMPT_BO3",
+    "TeacherProvider",
+    "_call_calc",
+    "estimate_cost_usd",
     "render_system_prompt_bo3",
     "render_system_prompt",
     "synthesize_turn",

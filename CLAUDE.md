@@ -139,6 +139,63 @@ pipeline/parsed_data/sft_training_data.jsonl   # one fine-tuning example per tur
   P2 won. Don't assume "p1" in a saved row corresponds to the protocol's
   p1 — it's whoever won the series.
 
+## Provider-agnostic teacher LLM
+
+The teacher LLM tool-loop now goes through a `TeacherProvider` ABC
+(`teacher_llm.py`) with three concrete adapters:
+
+- `teacher_openai.py` — `gpt-4o` / `gpt-5` etc. via the OpenAI SDK.
+- `teacher_anthropic.py` — `claude-sonnet-4-x` etc. via the Anthropic SDK.
+- `teacher_google.py` — `gemini-2.5-pro` etc. via the `google-genai` SDK.
+
+Each adapter implements the same `submit_decision`-tool architecture:
+the model **must** call `calculate_damage` at least once before calling
+`submit_decision` to commit. There is no `response_format` — tool calls
+are the only output channel, which is what fixed the zero-tool-call
+regression we saw on the first real run.
+
+Pick a provider via `master_pipeline.py --provider {openai,anthropic,google}`
+(default: `openai`). Override the model id with `--model gpt-5` etc.
+
+For a head-to-head comparison: `python bakeoff.py --providers openai,anthropic,google`
+runs the same match through each provider and reports per-row cost,
+tool-call rate, CoT length, action-match rate, and wall-clock.
+
+### Environment variables
+
+Stored in `.env` at the repo root (gitignored):
+
+```
+OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=sk-ant-...
+GOOGLE_API_KEY=...
+```
+
+Each pipeline invocation sources `.env` via `set -a && source ../.env && set +a`
+(see test commands earlier in the session). Only the providers whose key
+is present will actually run; missing-key providers are skipped with a
+warning.
+
+Default models (frontier mid-tier in each family — best cost/quality balance
+for our tool-loop use case):
+
+| Provider | Default | Top-tier alternative | Cheap alternative |
+|---|---|---|---|
+| OpenAI | `gpt-5.5` | `gpt-5.5-pro` | `gpt-5.5-mini` / `gpt-5.5-nano` |
+| Anthropic | `claude-sonnet-4-6` | `claude-opus-4-7` | `claude-haiku-4-5` |
+| Google | `gemini-3.1-pro-preview` | (same — pro is the top) | `gemini-3.1-flash-preview` / `flash-lite-preview` |
+
+Optional env-var overrides:
+
+```
+TEACHER_MODEL_OPENAI=gpt-5.5-pro
+TEACHER_MODEL_ANTHROPIC=claude-opus-4-7
+TEACHER_MODEL_GOOGLE=gemini-3.1-flash-preview
+```
+
+Cost-table placeholders are in `teacher_llm.PRICE_PER_M_TOKENS` — confirm
+against the provider's pricing page before scaling to the full corpus.
+
 ## Planned follow-up workstreams (not built yet)
 
 - **Selection-model SFT corpus** — separate dataset for the
@@ -149,3 +206,7 @@ pipeline/parsed_data/sft_training_data.jsonl   # one fine-tuning example per tur
   current prompt-driven Alternatives Rule (teacher cherry-picks
   alternatives because it already knows the answer) with a proper
   search step. See `# TODO(rlhf-followup)` in `teacher_llm.py`.
+- **Migrate `master_pipeline` default provider to the bake-off winner**
+  once empirical results are in. Today's default is `openai/gpt-4o`
+  (verified working post-Phase-1 fix); whichever provider wins the
+  bake-off becomes the next default.
