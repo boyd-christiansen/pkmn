@@ -1,5 +1,9 @@
 .DS_Store
 
+# Secrets — never commit
+.env
+.env.local
+
 # Python
 .venv/
 __pycache__/
