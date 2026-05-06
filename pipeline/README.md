@@ -204,27 +204,40 @@ block, with **two damage tracks per matchup**:
 - **Probable (meta)** — single calc result using each Pokémon's
   `canonical_priors` spread. Narrow, fast, and only as good as the prior.
 
-If the canonical prior falls outside the Absolute box for any relevant
-stat (HP, off-stat, def-stat), the line is flagged
-`[PRIOR CONTRADICTED]` so the LLM can spot off-meta opponents.
+When the canonical prior is clipped from the inferred KnowledgeState
+bounds by **≥ 40 EVs** on any relevant stat, the Probable calc is
+**skipped entirely** for that line and only the Absolute envelope is
+shown, tagged `(off-meta)`. Avoids surfacing a "meta" range we've
+already disproven.
 
 - **In:** one snapshot, `p1_side` (which side is "us"), **both**
   `p1_knowledge` and `p2_knowledge`, and an optional `format_id` (forwarded
   to `canonical_priors` so the Probable track uses real Smogon usage data
   when a chaos cache is bootstrapped for that format).
-- **Out:** a single string, one section for outgoing (us → opp) and one
-  for incoming (opp → us).
-- **Touches:** `POST /calc` (3 calls per matchup-move: abs-low, abs-high,
-  probable) and `GET /dex/move/:name` (cached). Status moves filtered out.
+- **Out:** a single string, grouped per attacker. Each attacker block
+  shows one line per (move, defender) pair (or a single grouped line
+  per spread move). Off-meta lines drop the Probable column. Chip moves
+  (max % < 15% across every defender) are collapsed into a single
+  footer line per attacker.
+- **Touches:** `POST /calc` (2 calls per (move, defender) cell when
+  off-meta — abs-low, abs-high; +1 Probable call when in-meta) and
+  `GET /dex/move/:name` (cached, fetched for category + target).
+  Status moves filtered out.
 - **Volatile state:** status, boosts, weather, terrain, side conditions,
   Tera state — all threaded into every payload from the snapshot.
+- **Spread modifier auto-applies.** Doubles spread moves
+  (`allAdjacentFoes`, `foeSide`, `allAdjacent`) get the 0.75× modifier
+  for free from `@smogon/calc` when `field.gameType: "Doubles"`. Output
+  presentation groups them into one `[spread]` line listing every
+  defender.
 
 #### Output line format
 
 ```
-[opp Flutter Mane] vs [us Urshifu]:
-  moonblast              Absolute: 105.2%–160.8%  |  Probable (meta): 135.4%–150.1%  (guaranteed OHKO)
-  shadow ball            Absolute: 47.1%–82.0%   |  Probable (meta): 62.1%–73.5%   (guaranteed 2HKO)  [PRIOR CONTRADICTED]
+[us Chi-Yu]  (boosts={spe: -1, spa: -2})
+  Heat Wave [spread]: Miraidon 11.7%–13.7%, Iron Bundle 47.8%–62.6%  [Iron Bundle: guaranteed 2HKO]  (off-meta)
+  Overheat → Iron Bundle    85.5%–116.8%  | meta 103.0%–122.7%  [guaranteed OHKO]
+  …plus 1 chip move(s): Snarl
 ```
 
 ### `teacher_llm.py` *(implemented)*
@@ -260,6 +273,30 @@ tuning-ready conversation messages.
 
 Orchestrator. Walks `parsed_data/{bo1,bo3}.jsonl`, generates one SFT example
 per identifiable turn, writes to `parsed_data/sft_training_data.jsonl`.
+
+**Series-winner-as-P1.** Every saved SFT example is generated from the
+perspective of the player who won the series (Bo3: 2 of 3 games; Bo1:
+the per-game winner). `flip_match_to_winner` rewrites the entire match
+record — `players[0] ↔ players[1]`, every snapshot's `p1 ↔ p2` and
+`tailwindP1 ↔ tailwindP2`, every `actionLog` event's slot identifiers
+(`p1a ↔ p2a`, `p1b ↔ p2b`), and per-game `teamSheets.p1 ↔ teamSheets.p2`
+— so all downstream code (action extraction, threat matrix, system
+prompt rendering) reads "p1" as the winner from this point on.
+
+Why winner-only: the model is trained to play *correctly*, not to mimic
+losing patterns at the same Elo. Including some intra-series losses
+(games the series-winner lost) preserves variance — in a Bo3 the
+series-winner sometimes drops a game to RNG / matchup, and that
+reasoning is still high-quality.
+
+**Inferred P1 spreads in the user prompt.** Each turn's user prompt
+includes a `=== YOUR SPREADS (inferred) ===` block listing per-stat EV
+ranges for each active P1 mon, derived from the running
+`p1_knowledge`. Stats whose bound width exceeds 60 EVs collapse to
+`?` so wide-open turn-1 bounds don't flood the prompt. The Spread Rule
+in the system prompt tells the model how to reason from ranges (worst
+case for survival checks, best case for offensive checks) and
+acknowledges that exact values may also be presented at deploy time.
 
 - **`reconstruct_p1_team(games)`** — forward-scan over every snapshot in
   the match (across all Bo3 games), aggregating revealed `item`, `ability`,
@@ -350,5 +387,22 @@ raw replay JSON
 | `canonical_priors.py` | Working. Library + bootstrap CLI. Reads Smogon Chaos JSON when present; falls back to curated table → heuristic. |
 | `damage_inferencer.py` | Working. Dual-state, two-way binary search, atomic apply, 508-EV constraint pass, crit-aware via `/calc isCrit`, multi-hit filter. |
 | `threat_matrix.py` | Working. Dual-track Absolute + Probable output with `[PRIOR CONTRADICTED]` flag. Optional `format_id` drives Smogon-backed priors. |
-| `teacher_llm.py` | Working. OpenAI tool-use loop with `calculate_damage` + structured `{pre_tool_thought, action}` output. Strips ground truth from saved messages. |
-| `master_pipeline.py` | Working. Run `python master_pipeline.py --help`. `--dry-run` exercises orchestration without OpenAI cost. |
+| `teacher_llm.py` | Working. OpenAI tool-use loop; concise rules (Masking/OTS, Tool, Threat-Matrix, Spread, Alternatives, Output); ground-truth stripping; `# TODO(rlhf-followup)` for proper minimax distillation of alternatives. |
+| `master_pipeline.py` | Working. `flip_match_to_winner` makes every SFT example come from the series winner's perspective; inferred-spread block in user prompt; per-format system prompt branch. `--dry-run` exercises orchestration without OpenAI cost. |
+
+## Planned follow-up workstreams (TODO)
+
+- **Selection-model SFT corpus** — separate dataset for the team-preview
+  4-of-6 pick decision. Walks the same parsed replays, extracts P1's
+  brought set per game, generates one selection example per game with
+  `{p1_full_6, p2_full_6, format_meta} → {brought: [4 species]}`. Trains
+  as its own model (no tactical play, no tool calls); deployed before
+  the turn-play model takes over. Lives in a sibling module, not in
+  `master_pipeline.py`.
+- **Minimax / MCTS distillation for the tool-use loop** — replaces the
+  current prompt-driven alternative evaluation (Alternatives Rule in
+  the system prompt) with a proper search step that surfaces
+  genuinely-competitive alternative plays for the teacher to articulate
+  rejection of. The current approach has the teacher cherry-picking
+  weak alternatives because it knows the answer. See the
+  `# TODO(rlhf-followup)` in `teacher_llm.py`.

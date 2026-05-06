@@ -199,7 +199,8 @@ async def process_match(
                 "replay_id": g.replay_id,
                 "timestamp": g.timestamp,
                 "snapshots": result.get("snapshots", []),
-                "teamSheets": result.get("teamSheets"),  # null in CTS
+                "teamSheets": result.get("teamSheets"),   # null in CTS
+                "winner": result.get("winner"),           # 'p1' | 'p2' | None
             }
         )
     return {

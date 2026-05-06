@@ -132,3 +132,20 @@ pipeline/parsed_data/sft_training_data.jsonl   # one fine-tuning example per tur
   is revealed via `|switch|`. P1 bench shows the full 4 brought from
   turn 1 (computed via a one-pass pre-scan). Bo1 bench behavior is
   unchanged.
+- **Series-winner-as-P1.** Every SFT example is generated from the
+  perspective of the player who won the series. `flip_match_to_winner`
+  in `master_pipeline.py` rewrites the entire match record (players,
+  snapshots, actionLog slot identifiers, teamSheets) when the protocol
+  P2 won. Don't assume "p1" in a saved row corresponds to the protocol's
+  p1 — it's whoever won the series.
+
+## Planned follow-up workstreams (not built yet)
+
+- **Selection-model SFT corpus** — separate dataset for the
+  team-preview 4-of-6 pick decision. Sibling module to
+  `master_pipeline.py`. Generates `{full p1, full p2, format_meta} →
+  {brought 4}` examples per game.
+- **Minimax / MCTS distillation for the tool-use loop** — replaces the
+  current prompt-driven Alternatives Rule (teacher cherry-picks
+  alternatives because it already knows the answer) with a proper
+  search step. See `# TODO(rlhf-followup)` in `teacher_llm.py`.

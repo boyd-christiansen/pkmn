@@ -65,6 +65,7 @@ export interface TeamSheets {
 export interface ParseLogResult {
   snapshots: TurnSnapshot[];
   teamSheets: TeamSheets | null;   // null in CTS games
+  winner: 'p1' | 'p2' | null;      // null on tie / abort / unparseable end
 }
 
 const SLOT_LETTERS: Array<'a' | 'b' | 'c'> = ['a', 'b', 'c'];
@@ -312,6 +313,10 @@ export function parseLog(log: string): ParseLogResult {
   const onFieldP1 = new Set<string>();
   const onFieldP2 = new Set<string>();
 
+  // Per-game winner: captured from the trailing `|win|<username>` line and
+  // mapped to 'p1' | 'p2' by comparing against battle.p{1,2}.name.
+  let winnerName: string | null = null;
+
   // Action-log tracking (unchanged from previous version).
   let currentMove: { attacker_slot: string; move_name: string } | null = null;
   const pendingCrits = new Set<string>();
@@ -405,7 +410,10 @@ export function parseLog(log: string): ParseLogResult {
           actionLog: [],
         });
       }
-    } else if (argName === 'win' || argName === 'tie') {
+    } else if (argName === 'win') {
+      winnerName = String(parsed.args[1] ?? '') || null;
+      flushTurnEvents();
+    } else if (argName === 'tie') {
       flushTurnEvents();
     }
   }
@@ -417,5 +425,11 @@ export function parseLog(log: string): ParseLogResult {
       ? { p1: pre.p1Sheets, p2: pre.p2Sheets }
       : null;
 
-  return { snapshots, teamSheets };
+  let winner: 'p1' | 'p2' | null = null;
+  if (winnerName) {
+    if (battle.p1.name && winnerName === battle.p1.name) winner = 'p1';
+    else if (battle.p2.name && winnerName === battle.p2.name) winner = 'p2';
+  }
+
+  return { snapshots, teamSheets, winner };
 }

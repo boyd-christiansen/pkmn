@@ -137,6 +137,76 @@ def _team_sheets_for_match(games: list[dict]) -> dict[str, list[dict]] | None:
     return None
 
 
+def _series_winner(games: list[dict]) -> str | None:
+    """Return 'p1' | 'p2' | None — the player who won the majority of games.
+
+    Each game has a `winner` field set by /parse_log. Bo1: per-game winner
+    IS the series winner. Bo3: majority of game winners. None if no
+    determination is possible (all ties / aborts).
+    """
+    p1_wins = sum(1 for g in games if g.get("winner") == "p1")
+    p2_wins = sum(1 for g in games if g.get("winner") == "p2")
+    if p1_wins == p2_wins:
+        return None
+    return "p1" if p1_wins > p2_wins else "p2"
+
+
+_SLOT_FLIP = {"p1a": "p2a", "p1b": "p2b", "p1c": "p2c",
+              "p2a": "p1a", "p2b": "p1b", "p2c": "p1c"}
+
+
+def _flip_slot(slot: str | None) -> str | None:
+    if not slot:
+        return slot
+    return _SLOT_FLIP.get(slot, slot)
+
+
+def flip_match_to_winner(match: dict) -> dict:
+    """Return a copy of `match` with sides relabeled so the **series winner
+    is P1**. If P1 already won (or the winner is undetermined), returns the
+    match unchanged.
+
+    Swaps:
+      - top-level `players[0] ↔ players[1]`
+      - per game: `teamSheets.p1 ↔ teamSheets.p2`, `winner` flipped
+      - per snapshot: `p1 ↔ p2`, `field.tailwindP1 ↔ tailwindP2`,
+        every `actionLog` event's `attacker_slot` / `defender_slot` slot-flipped
+    """
+    games = match.get("games") or []
+    winner = _series_winner(games)
+    if winner != "p2":
+        return match  # already P1's side, or undetermined — nothing to flip
+
+    import copy
+    flipped = copy.deepcopy(match)
+
+    flipped["players"] = [match["players"][1], match["players"][0]]
+
+    for g in flipped["games"]:
+        if g.get("teamSheets"):
+            ts = g["teamSheets"]
+            ts["p1"], ts["p2"] = ts["p2"], ts["p1"]
+        if g.get("winner") == "p1":
+            g["winner"] = "p2"
+        elif g.get("winner") == "p2":
+            g["winner"] = "p1"
+
+        for snap in g.get("snapshots", []):
+            snap["p1"], snap["p2"] = snap["p2"], snap["p1"]
+            field = snap.get("field") or {}
+            field["tailwindP1"], field["tailwindP2"] = (
+                field.get("tailwindP2", False),
+                field.get("tailwindP1", False),
+            )
+            snap["field"] = field
+
+            for ev in snap.get("actionLog") or []:
+                ev["attacker_slot"] = _flip_slot(ev.get("attacker_slot"))
+                ev["defender_slot"] = _flip_slot(ev.get("defender_slot"))
+
+    return flipped
+
+
 def _brought_species_keys_for_game(game: dict) -> set[str]:
     """Species (normalized keys) actually brought by P1 to this single game.
 
@@ -284,7 +354,52 @@ def _summarize_bench(b: dict[str, Any]) -> str:
     return f"{b['species']}{' (fainted)' if b.get('fainted') else ''}"
 
 
-def format_user_prompt(snapshot: dict[str, Any], threat_matrix_text: str) -> str:
+SPREAD_BOUND_WIDTH_THRESHOLD = 60  # stats whose (max - min) ≤ this get an explicit range shown
+_STAT_DISPLAY = ("hp", "atk", "def", "spa", "spd", "spe")
+
+
+def format_p1_inferred_spreads_block(
+    snapshot: dict[str, Any],
+    p1_knowledge: dict[str, dict[str, dict[str, int]]],
+) -> str:
+    """Render an `=== YOUR SPREADS ===` block listing per-stat EV ranges for
+    each active P1 mon. Stats whose bound width exceeds the threshold are
+    shown as `?` to keep the prompt tight.
+    """
+    actives = (snapshot.get("p1") or {}).get("active") or []
+    if not actives:
+        return ""
+    lines: list[str] = ["=== YOUR SPREADS (inferred) ==="]
+    for p in actives:
+        species = p.get("species") or "?"
+        key = _species_key(species)
+        entry = p1_knowledge.get(key)
+        if not entry:
+            lines.append(f"  {species}: (no inference yet)")
+            continue
+        mins = entry.get("min_evs", {})
+        maxs = entry.get("max_evs", {})
+        parts: list[str] = []
+        for s in _STAT_DISPLAY:
+            lo = mins.get(s, 0)
+            hi = maxs.get(s, 252)
+            if hi - lo <= SPREAD_BOUND_WIDTH_THRESHOLD:
+                if lo == hi:
+                    parts.append(f"{s.capitalize()} {lo}")
+                else:
+                    parts.append(f"{s.capitalize()} {lo}–{hi}")
+            else:
+                parts.append(f"{s.capitalize()} ?")
+        lines.append(f"  {species}: " + ", ".join(parts))
+    return "\n".join(lines)
+
+
+def format_user_prompt(
+    snapshot: dict[str, Any],
+    threat_matrix_text: str,
+    *,
+    p1_inferred_block: str = "",
+) -> str:
     f = snapshot.get("field", {})
     field_parts = []
     if f.get("weather"):
@@ -303,6 +418,8 @@ def format_user_prompt(snapshot: dict[str, Any], threat_matrix_text: str) -> str
     p1_bench = ", ".join(_summarize_bench(b) for b in p1.get("bench", [])) or "(none)"
     p2_bench = ", ".join(_summarize_bench(b) for b in p2.get("bench", [])) or "(none)"
 
+    spreads_block = (p1_inferred_block + "\n\n") if p1_inferred_block else ""
+
     return (
         f"=== TURN {snapshot.get('turn', '?')} ===\n"
         f"Field: {field_str}\n\n"
@@ -310,6 +427,7 @@ def format_user_prompt(snapshot: dict[str, Any], threat_matrix_text: str) -> str
         f"YOUR (P1) BENCH: {p1_bench}\n\n"
         f"OPP (P2) ACTIVE:\n{p2_active_lines}\n"
         f"OPP (P2) BENCH: {p2_bench}\n\n"
+        f"{spreads_block}"
         f"{threat_matrix_text}"
     )
 
@@ -367,6 +485,10 @@ async def process_match(
     dry_run: bool,
     model: str,
 ) -> dict[str, int]:
+    # Series-winner-as-P1: every SFT example is generated from the perspective
+    # of the player who won the series. P2-won matches are relabeled in full.
+    match_record = flip_match_to_winner(match_record)
+
     games = match_record.get("games") or []
     if not games:
         return {"skipped_no_games": 1}
@@ -447,7 +569,8 @@ async def process_match(
                 )
                 continue
 
-            user_prompt = format_user_prompt(snap_pre, tm_text)
+            p1_inferred = format_p1_inferred_spreads_block(snap_pre, p1_knowledge)
+            user_prompt = format_user_prompt(snap_pre, tm_text, p1_inferred_block=p1_inferred)
             human_action = {
                 "slot_1": human_action_dict.get("a", _slot_action("pass")),
                 "slot_2": human_action_dict.get("b", _slot_action("pass")),

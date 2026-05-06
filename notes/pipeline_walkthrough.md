@@ -298,8 +298,10 @@ already pre-clamped to 252. But the example that pays off most:
 > converges on slowly is solved in a single arithmetic pass.
 
 KnowledgeStates **persist across turns and across games** in a Bo3 series.
-By turn 5 of game 2, the bounds on commonly-used Pokémon are usually
-tight enough that the threat matrix becomes meaningfully decisive.
+By turn 3 of a real game, the inferencer can have already proven things
+like "Miraidon's HP EVs are at most 35" and "SpD EVs are at most 11" —
+which is why the threat matrix's Absolute envelope tightens visibly as
+the game progresses.
 
 **OTS doesn't replace this.** A common confusion: doesn't the OTS sheet
 make all this binary-search machinery redundant? No — VGC OTS exposes
@@ -310,34 +312,84 @@ why our calc payloads on Bo3 turn 1 are immediately tighter — the
 defender's item is locked in even before Sitrus activates). The spread
 math stays unchanged.
 
+**P1's bounds get surfaced to the LLM.** The same KnowledgeState that
+drives the Absolute track also feeds a `=== YOUR SPREADS (inferred) ===`
+block in the user prompt — per-stat ranges for each active P1 Pokémon.
+Stats whose bound width is still > 60 EVs collapse to `?` (so wide-open
+turn-1 bounds don't flood the prompt). The system prompt's *Spread Rule*
+tells the model how to use them: worst-case for survival checks,
+best-case for offensive checks. At deploy time the operator can present
+exact spreads from a team-builder JSON instead of inferred ranges; the
+trained model is robust to either form.
+
 ### Step 6 — Threat matrix: dual-track damage envelope
 
 For each turn, we render the damage landscape between the active
 Pokémon. Two damage tracks per matchup-move:
 
 - **Absolute** — strict math from KnowledgeState bounds. Wide, but
-  provable. (At turn 1, it's basically `[0, 252]` everywhere → ranges
-  like 18%–89% — useless for decisions.)
+  provable.
 - **Probable (meta)** — single calc result assuming both Pokémon run
   their canonical Smogon meta spread (from `canonical_priors`). Narrow,
   fast — but only as good as the prior.
 
-When the canonical prior falls *outside* the proven KnowledgeState bounds
-on any relevant stat, we append `[PRIOR CONTRADICTED]`. That's the
-LLM's signal: *"this opponent is off-meta, lean on the Absolute envelope."*
+**When the prior is wrong, we drop it.** When the canonical spread is
+clipped from the inferred bounds by **≥ 40 EVs** on any relevant stat
+(off-stat for the attacker prior, HP / def-stat for the defender), we
+skip the Probable calc entirely and tag the line `(off-meta)`. Showing
+a "Probable" range we've already disproven would actively mislead the
+LLM. The 40-EV threshold avoids firing on edge-case clips of 1–10 EVs.
 
-Real example output (turn 4 of a different match):
+**Chip filter and spread grouping.** Two presentation tweaks make the
+matrix decision-relevant rather than exhaustive:
+
+- Moves whose Absolute max-percent is `< 15%` across every active
+  defender get rolled into a one-line footer per attacker
+  (`…plus N chip move(s): Snarl, Icy Wind`). The matrix stops being
+  9HKO clutter.
+- Spread moves (`allAdjacentFoes` / `allAdjacent` / `foeSide`) render
+  as a single `[spread]` line listing every defender. The 0.75× spread
+  modifier auto-applies via `@smogon/calc` when
+  `field.gameType: "Doubles"`.
+
+**Real example** (turn 3 of a Bo3 game where Chi-Yu has been Snarl'd
+to -2 SpA and the inferencer has therefore proven the prior wrong on
+all of Chi-Yu's offensive plays):
 
 ```
-[opp Rillaboom] vs [us Calyrex-Ice]
-  woodhammer  Absolute: 45.7%–62.3%  |  Probable (meta): 48.3%–57.0%  (42.6% chance to 2HKO)  [PRIOR CONTRADICTED]
-[us Farigiraf] vs [opp Rillaboom]  (atk_boosts={'atk': -1})
-  foulplay   Absolute: 17.9%–32.6%  |  Probable (meta): 33.1%–39.4%  (22.3% chance to 3HKO after Grassy Terrain recovery)
+=== THREAT MATRIX  (turn 3, us=p1) ===
+
+--- OUTGOING (us → opp) ---
+[us Miraidon]  (boosts={spa: -2})
+  Electro Drift → Chi-Yu      29.5%–44.6%  | meta 35.8%–42.3%  [guaranteed 3HKO]
+  Electro Drift → Lunala       7.8%–15.1%  | meta 11.3%–13.3%  [possible 8HKO]
+  Volt Switch  → Chi-Yu      20.5%–32.3%  | meta 24.8%–30.7%  [99.9% chance to 4HKO]
+  Draco Meteor → Chi-Yu      29.5%–44.6%  | meta 35.8%–42.3%  [guaranteed 3HKO]
+  …plus 1 chip move(s): Snarl
+
+--- INCOMING (opp → us) ---
+[opp Chi-Yu]  (boosts={spe: -1, spa: -2})
+  Dark Pulse  → Miraidon       17.3%–22.3%  [possible 5HKO]  (off-meta)
+  Heat Wave [spread]: Miraidon 11.7%–13.7%, Iron Bundle 47.8%–62.6%  [Iron Bundle: guaranteed 2HKO]  (off-meta)
+  Overheat   → Iron Bundle    85.5%–116.8%  [87.5% chance to OHKO]  (off-meta)
+[opp Lunala]
+  Moongeist Beam → Iron Bundle  76.1%–119.8%  | meta 109.1%–129.5%  [guaranteed OHKO]
+  Meteor Beam   → Iron Bundle  179.7%–287.0%  | meta 260.6%–307.6%  [guaranteed OHKO]
 ```
 
-Volatile state — Atk-1 from Intimidate, Grassy Terrain recovery, Tera —
-threaded through every payload. The LLM sees the actual board, not a
-sterile lab calc.
+Notice four things at once:
+- **Volatile state in the calc** — Miraidon's `spa: -2` from Snarl is
+  threaded through Electro Drift / Volt Switch / Draco Meteor; numbers
+  are real-board numbers, not sterile-lab.
+- **`(off-meta)` on Chi-Yu's outgoing** — the inferencer has proven
+  Chi-Yu's SpA is clipped well below the canonical "max SpA Modest"
+  prior (Snarl-stacking does this fast), so the Probable column is
+  dropped entirely.
+- **`Heat Wave [spread]` as one line** — the 0.75× spread modifier is
+  baked into the per-defender numbers, and both Miraidon and Iron
+  Bundle's ranges sit on a single row.
+- **Chip footer** — Snarl is `< 15%` max against either opponent so it
+  collapses into the footer instead of taking 2 lines of prompt.
 
 **Move enumeration changes per format.** For each attacker, the threat
 matrix iterates `knownMoves` if present (Bo3 OTS — all 4 moves from the
@@ -373,15 +425,30 @@ you can't synthesize — it requires actual usage data.
 For the running example's Iron Valiant: Smogon's most-used is **Jolly
 0/252/0/0/4/248** (a physical sweeper). But our human player's Iron
 Valiant used Quick Guard — pointing at a *support* build, not the standard
-sweeper. That's exactly the kind of off-meta call the
-`[PRIOR CONTRADICTED]` flag will eventually fire on once enough evidence
-builds up.
+sweeper. That's exactly the kind of off-meta call the threat matrix's
+`(off-meta)` tag will eventually fire on once enough evidence builds
+up to clip the prior by ≥ 40 EVs.
 
 ---
 
 ## Part 4: Synthesizing the SFT dataset
 
 ### Step 8 — Action extraction (the ground-truth label)
+
+**Whose play do we extract?** Before extraction, the orchestrator runs
+`flip_match_to_winner(match)` so that the **series winner** becomes P1
+for the rest of the pipeline. Bo3: the player who took 2 of 3 games.
+Bo1: the per-game winner. The flip rewrites the entire match record —
+top-level `players[0] ↔ players[1]`, every snapshot's `p1 ↔ p2` and
+`tailwindP1 ↔ tailwindP2`, every `actionLog` event's slot identifiers
+(`p1a ↔ p2a`, `p1b ↔ p2b`), and per-game `teamSheets.p1 ↔ teamSheets.p2`.
+
+Why winner-only: we're training the model to play *correctly*, not to
+mimic losing-Elo patterns. Including in-series losses (the games the
+series-winner dropped along the way) preserves variance — sometimes a
+pro plays correctly and loses to RNG, and that reasoning is still
+high-quality training data. We don't filter game-by-game inside a
+series.
 
 For each turn, we need to know what each P1 active slot DID. That's the
 training label. We reverse-engineer it from `snap_pre`, `snap_post`, and
@@ -428,37 +495,52 @@ that doesn't itself know VGC at pro level.
 **Synthesis call shape:**
 
 ```
-system: "You are a world-class VGC competitor… [format-specific rules]… [Output schema]…"
+system: "You are a top-tier competitive VGC Reg I player…
+         [format-specific rule 1] [Tool] [Threat-Matrix] [Spread] [Alternatives] [Output]"
 
 user:   [board state: turn N, field, P1/P2 active+bench]
-        [threat matrix: dual-track Absolute + Probable per matchup-move]
+        [YOUR SPREADS (inferred per-stat ranges)]
+        [threat matrix: Absolute + Probable, off-meta lines drop Probable]
         ────── EXPERT'S DECISION (oracle truth) ──────
         { "slot_1": {"action_type": "move", "move": "Volt Switch", ...},
           "slot_2": {"action_type": "move", "move": "quickguard", ...} }
 
-assistant: [CoT explaining why this play is correct]
+assistant: [CoT articulating why this play is correct + briefly evaluating 1–2 alternatives]
            [optional calculate_damage tool call to verify a critical assumption]
 tool:      [calc result]
-assistant: { "pre_tool_thought": "Volt Switch lets us pivot Miraidon out of
-              the incoming Moongeist Beam from Lunala while still chipping
-              p2a, and Quick Guard from Iron Valiant blocks any priority
-              follow-up on slot a as it switches in.",
+assistant: { "pre_tool_thought": "Volt Switch pivots Miraidon out of Lunala's
+              incoming Moongeist Beam while still chipping p2a; Quick Guard
+              blocks any priority follow-up. Considered Discharge instead —
+              calc'd ~10% on Lunala — too little pressure for the slot loss.",
               "action": { "slot_1": {...}, "slot_2": {...} } }
 ```
 
-**Two system-prompt templates** — the format split from Step 4 carries
-all the way through. Same critical-rules backbone (Tool Rule,
-Threat-Matrix Rule, Output Rule), different team-knowledge framing:
+**Six rules in the system prompt** (same backbone, format-specific
+only on rule 1):
 
-- **Bo1 / CTS template:** says "Closed Team Sheet — only species are
-  visible at team preview" and shows the *reconstructed* P1 team with
-  `[UNREVEALED_MOVE]` placeholders. Includes the **Masking Rule**.
-- **Bo3 / OTS template:** says "Open Team Sheet — both players see each
-  other's full 6-Pokémon roster" and shows the *full sheets for both
-  sides*, with ★ markers on P1's brought 4. Replaces the Masking Rule
-  with the **OTS Rule** ("All 6 of your opponent's Pokémon, their items,
-  abilities, moves, and Tera types are PUBLIC knowledge — reason about
-  every one of them, including the backline").
+1. **Masking Rule** (Bo1) / **OTS Rule** (Bo3) — what's known about
+   the team sheet.
+2. **Tool Rule** — `calculate_damage` is for *hypotheticals the threat
+   matrix doesn't cover* (switch outcomes, future-turn calcs, opposing
+   Tera predictions). 1–3 per turn, don't recompute matrix cells.
+3. **Threat-Matrix Rule** — each line shows Absolute (provable) and,
+   when not contradicted, Probable (meta). Off-meta lines tagged
+   `(off-meta)` show only Absolute.
+4. **Spread Rule** — your spreads may be exact values or inferred
+   ranges. With ranges: worst-case for survival, best-case for offense.
+5. **Alternatives Rule** *(known limitation)* — briefly evaluate 1–2
+   plausible alternatives (other moves, switches) before committing.
+   `# TODO(rlhf-followup)`: this prompt-driven approach lets the
+   teacher cherry-pick weak alternatives because it knows the answer;
+   real fix is minimax / MCTS distillation in a separate workstream.
+6. **Output Rule** — strict JSON schema for `{pre_tool_thought,
+   action: {slot_1, slot_2}}`.
+
+**Two templates, one branch.** Bo1 includes the Masking Rule and
+shows the *reconstructed* P1 team with `[UNREVEALED_MOVE]`
+placeholders. Bo3 includes the OTS Rule and shows full sheets for both
+sides with ★ markers on P1's brought 4 (different per game in a
+series). Picked by `if match["format"] == "bo3"` in the orchestrator.
 
 Picking the right template per match is just `if match["format"] ==
 "bo3"` in the orchestrator.
@@ -481,32 +563,94 @@ Final output is constrained by OpenAI's `response_format: json_schema`
 
 ### Step 10 — Write the SFT JSONL row, update knowledge, repeat
 
-Each successful turn writes one row:
+Each successful turn writes one row in OpenAI fine-tuning JSONL format:
 
 ```json
 {
-  "match_id": "bo3-gen9vgc2026regibo3-2568132152",
+  "match_id":   "bo3-gen9vgc2026regibo3-2590204993",
   "game_index": 0,
-  "turn": 1,
-  "format_id": "gen9vgc2026regibo3",
-  "messages": [
-    {"role": "system", "content": "..."},
-    {"role": "user", "content": "..."},          ← state + threat matrix only (no ground truth)
-    {"role": "assistant", "tool_calls": [...]},
-    {"role": "tool", "content": "..."},
-    {"role": "assistant", "content": "{...JSON...}"}
-  ]
+  "turn":       3,
+  "format_id":  "gen9vgc2026regibo3",
+  "messages":   [<system>, <user>, <assistant tool_calls>?, <tool>?, …, <final assistant>]
 }
 ```
 
-After the row is written, we feed the same `actionLog` to
-`damage_inferencer.update_knowledge` — tightening both KnowledgeStates so
-the *next* turn's threat matrix is sharper. Bo3 series compound this:
-by turn 5 of game 2, the bounds are usually meaningfully tight.
+The `messages` array can include intermediate `assistant` (with
+`tool_calls`) and `tool` messages from the calc-tool loop, before the
+final structured `assistant` content. `--dry-run` mode skips the loop
+and produces a 3-message form (system / user / placeholder assistant)
+useful for verifying orchestration without OpenAI cost.
+
+**Concrete user-prompt body** for one Bo3 turn — turn 3 of a real
+match where the series winner (Bobbo1, after `flip_match_to_winner`)
+is now P1 with Miraidon + Iron Bundle active. Both have been Snarl'd
+to -2 SpA and the inferencer has tightened P1's bounds noticeably.
+
+```
+=== TURN 3 ===
+Field: weather=Sun, terrain=Electric, P1-tailwind=no, P2-tailwind=no
+
+YOUR (P1) ACTIVE:
+  [a] Miraidon    | HP 65% | item=Choice Scarf | tera=Electric | boosts=spa-2 | revealed=snarl
+  [b] Iron Bundle | HP 25% | item=Focus Sash   | tera=Ice      | boosts=spa-2 | revealed=icywind,icebeam
+
+OPP (P2) ACTIVE:
+  [a] Chi-Yu      | HP 72% | item=Choice Scarf | tera=Ghost    | boosts=spe-1,spa-2 | revealed=snarl
+  [b] Lunala      | HP 100%| item=Power Herb   | tera=Water
+
+=== YOUR SPREADS (inferred) ===
+  Miraidon:    Hp 0–35,  Atk ?, Def ?, Spa ?, Spd 0–11, Spe ?
+  Iron Bundle: Hp 0–59,  Atk ?, Def ?, Spa ?, Spd 0–43, Spe ?
+
+=== THREAT MATRIX  (turn 3, us=p1) ===
+
+--- OUTGOING (us → opp) ---
+[us Miraidon]  (boosts={spa: -2})
+  Electro Drift → Chi-Yu      29.5%–44.6%  | meta 35.8%–42.3%  [guaranteed 3HKO]
+  Electro Drift → Lunala       7.8%–15.1%  | meta 11.3%–13.3%  [possible 8HKO]
+  Volt Switch  → Chi-Yu      20.5%–32.3%  | meta 24.8%–30.7%  [99.9% chance to 4HKO]
+  Draco Meteor → Chi-Yu      29.5%–44.6%  | meta 35.8%–42.3%  [guaranteed 3HKO]
+  …plus 1 chip move(s): Snarl
+
+--- INCOMING (opp → us) ---
+[opp Chi-Yu]  (boosts={spe: -1, spa: -2})
+  Dark Pulse  → Miraidon       17.3%–22.3%  [possible 5HKO]                 (off-meta)
+  Heat Wave [spread]: Miraidon 11.7%–13.7%, Iron Bundle 47.8%–62.6%
+                                            [Iron Bundle: guaranteed 2HKO]  (off-meta)
+  Overheat   → Iron Bundle    85.5%–116.8%  [87.5% chance to OHKO]          (off-meta)
+[opp Lunala]
+  Moongeist Beam → Iron Bundle  76.1%–119.8%  | meta 109.1%–129.5%  [guaranteed OHKO]
+  Meteor Beam   → Iron Bundle 179.7%–287.0%  | meta 260.6%–307.6%  [guaranteed OHKO]
+```
+
+The structured ground-truth label (the human's actual play, kept *out*
+of saved messages but supplied to the teacher LLM during synthesis):
+
+```json
+{
+  "slot_1": {"action_type": "move", "move": "Snarl",       "target": "spread", "tera": false},
+  "slot_2": {"action_type": "move", "move": "Meteor Beam", "target": "p2a",    "tera": false}
+}
+```
+
+A real teacher LLM run (with `OPENAI_API_KEY` set) would replace the
+final assistant message with a `pre_tool_thought` chain that justifies
+this play — likely *"Snarl from Miraidon further drops both
+opponents' SpA, neutering them; Lunala fires Meteor Beam at Chi-Yu to
+deny Choice Scarf cleanup. Considered Volt Switch alternative — calc
+shows 20–32% on Chi-Yu, doesn't compensate for losing the SpA debuff
+this turn."* — followed by 0–2 calc tool calls verifying decisive
+hypotheticals.
+
+**After the row is written**, we feed the same `actionLog` to
+`damage_inferencer.update_knowledge` — tightening both KnowledgeStates
+so the *next* turn's threat matrix and `YOUR SPREADS` block are
+sharper. Bo3 series compound this: by turn 3 the inferencer has
+already proven Miraidon's HP EVs are at most 35.
 
 The whole loop is **resumable**. `(match_id, game_index, turn)` keys
 already in the output JSONL are skipped on rerun — useful when the
-OpenAI run inevitably 429s and we need to pick up where we left off.
+OpenAI run 429s and we need to pick up where we left off.
 
 ---
 
@@ -528,7 +672,15 @@ the first ~100 matches and inspecting before committing.
    spot-checks on CoT quality at each step.
 2. **A holdout eval set** — withhold a few hundred matches, measure
    whether the trained model's plays match the human's labels.
-3. **RLHF on top** — once SFT gives us a model that can think like a
+3. **A separate selection-model SFT corpus** — the team-preview 4-of-6
+   pick is a different decision (matchup theory, no tactical state)
+   and deserves its own model. Sibling workstream to this orchestrator.
+4. **Minimax / MCTS distillation for the alternatives loop** — replaces
+   the current prompt-driven Alternatives Rule (which lets the teacher
+   cherry-pick weak alternatives because it knows the answer) with a
+   real search step. Tracked as `# TODO(rlhf-followup)` in
+   `teacher_llm.py`.
+5. **RLHF on top** — once SFT gives us a model that can think like a
    pro, RLHF gives it the chance to outclass one. The SFT corpus we're
    building here is the floor, not the ceiling.
 
