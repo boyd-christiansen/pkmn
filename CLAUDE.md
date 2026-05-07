@@ -137,12 +137,19 @@ pipeline/parsed_data/sft_training_data.jsonl   # one fine-tuning example per tur
   shows both teams in full with ★ markers on P1's brought 4, **no
   Masking Rule**. EVs / IVs / Nature stay hidden in OTS too, so the
   dual-track inferencer continues to do the heavy spread-bound lifting.
-- **The Node parser gates P2 bench chronologically in OTS games.** At
-  turn 1 of a Bo3 replay, `snapshot.p2.bench` is empty (only the 2
-  active have actually appeared); it grows as the opponent's selection
-  is revealed via `|switch|`. P1 bench shows the full 4 brought from
-  turn 1 (computed via a one-pass pre-scan). Bo1 bench behavior is
-  unchanged.
+- **Bench rendering: parser is symmetric, perspective is applied in
+  Python.** The Node parser emits `bench` for BOTH sides as the full
+  pre-scanned brought-set (every species ever switched in across the
+  full game), regardless of format. Each side also carries a
+  `seenSpecies: string[]` field with the chronological set of species
+  that have actually been on field at any turn ≤ current. The
+  perspective-aware filtering happens in
+  `master_pipeline.format_user_prompt`: P1 bench renders the full
+  brought-set (the player knows their own selection from team
+  preview), while P2 bench is gated by `seenSpecies` (the player only
+  learns the opponent's selection as they switch in). Symmetric
+  parser output makes `flip_match_to_winner` clean — no asymmetric
+  data to reconstruct after the swap.
 - **Series-winner-as-P1.** Every SFT example is generated from the
   perspective of the player who won the series. `flip_match_to_winner`
   in `master_pipeline.py` rewrites the entire match record (players,

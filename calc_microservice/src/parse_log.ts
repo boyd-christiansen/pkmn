@@ -90,8 +90,11 @@ export type TurnEvent = MoveEvent | CantMoveEvent | TeraEvent | SwitchEvent | Fa
 
 // Callers that DON'T deposit the called move into the user's actual moveset.
 // Sleep Talk is excluded because it can only call moves the user already knows.
+// Mimic is excluded because it permanently overwrites a slot in-battle, so
+// subsequent uses of the copied move legitimately are "in the kit".
 const NON_OWN_CALLERS: ReadonlySet<string> = new Set([
   'Metronome', 'Copycat', 'Sketch', 'Snatch', 'Me First', 'Dancer', 'Instruct',
+  'Mirror Move', 'Assist', 'Nature Power',
 ]);
 
 // =============================================================================
@@ -142,7 +145,18 @@ export interface SideConditionState {
 export interface SideSnapshot {
   player: string;
   active: ActivePokemonSnapshot[];
+  // bench renders the full brought-set minus current actives, regardless of
+  // whether each species has been on field yet. Each player at team preview
+  // already knows their own selection; the chronological gating for the
+  // opponent's perspective is applied downstream (in Python's prompt
+  // formatter) using `seenSpecies` below.
   bench: BenchPokemonSnapshot[];
+  // Chronological set of species that have been active on this side at any
+  // turn ≤ current. Empty at turn 1 except for the starters. Grows with each
+  // |switch| / |drag| / |replace|. Used by the prompt formatter to gate the
+  // OPPONENT's bench display (the spectator only learns the opp's brought
+  // selection as they actually appear).
+  seenSpecies: string[];
   faints: number;                                        // cumulative this game
   teraUsed?: { species: string; teraType: string; onTurn: number };
   sideConditions: { [id: string]: SideConditionState };
@@ -275,11 +289,18 @@ function snapshotVolatiles(p: Pokemon): Volatiles {
   return out;
 }
 
-function snapshotChoiceLock(p: Pokemon): string | null {
-  const item = String(p.item ?? '').toLowerCase();
+function snapshotChoiceLock(p: Pokemon, resolvedItem: string | null): string | null {
+  // The item lookup must use the OTS-resolved item, not @pkmn/client's raw
+  // p.item — in Bo3 OTS, p.item only populates after a `|-item|` reveal,
+  // but Choice Scarf/Specs/Band are always known from the team sheet.
+  if (!resolvedItem) return null;
+  const item = resolvedItem.toLowerCase();
   if (!item.includes('choice')) return null;
   if (!p.lastMove) return null;
-  return String(p.lastMove);
+  const lastMoveId = String(p.lastMove);
+  // Normalize move ID → display name via the dex (e.g. "boltstrike" → "Bolt Strike").
+  const moveData = GENS.get(9).moves.get(lastMoveId);
+  return moveData?.name ?? lastMoveId;
 }
 
 function snapshotActive(
@@ -332,7 +353,7 @@ function snapshotActive(
     terastallizedAs: p.terastallized ?? null,
     boosts: { ...p.boosts } as Record<string, number>,
     volatiles: snapshotVolatiles(p),
-    choiceLockedInto: snapshotChoiceLock(p),
+    choiceLockedInto: snapshotChoiceLock(p, item),
     ...(toxicCounter && toxicCounter > 0 ? { toxicCounter } : {}),
   };
 }
@@ -377,30 +398,64 @@ function snapshotSide(
   teraUsed: { species: string; teraType: string; onTurn: number } | null,
 ): SideSnapshot {
   const activeSet = new Set(side.active.filter((p): p is Pokemon => p !== null));
+  // Active species match keys must cover Tera transformations so that the
+  // pre-Tera brought-set entry (e.g. "Terapagos") is recognized as the same
+  // mon as the active's transformed form (e.g. "Terapagos-Stellar"). For
+  // each active, we add the speciesForme + baseSpeciesForme + name + the
+  // Tera-suffix-stripped variant.
+  const activeSpeciesKeys = new Set<string>();
+  for (const p of activeSet) {
+    const candidates: string[] = [];
+    if (p.speciesForme) candidates.push(p.speciesForme);
+    if (p.baseSpeciesForme) candidates.push(p.baseSpeciesForme);
+    if (p.name) candidates.push(p.name);
+    for (const c of candidates) {
+      activeSpeciesKeys.add(speciesKey(c));
+      // Tera form variants — strip the in-battle suffixes that Showdown
+      // appends after Tera Shift / Terastallize.
+      const stripped = c
+        .replace(/-Stellar$/, '')
+        .replace(/-Terastal$/, '')
+        .replace(/-Tera$/, '');
+      if (stripped !== c) activeSpeciesKeys.add(speciesKey(stripped));
+    }
+  }
 
   const active: ActivePokemonSnapshot[] = [];
   side.active.forEach((p, idx) => {
     if (p) active.push(snapshotActive(p, idx, ots, sideIsP1, derivedMovesForSide));
   });
 
-  // Bench filtering rules:
-  //   CTS:  bench = team − active
-  //   OTS P1: bench = (team − active) ∩ broughtSet
-  //   OTS P2: bench = (team − active) ∩ onFieldSet
-  const filterSet = ots.isOTS
-    ? sideIsP1
-      ? ots.p1Brought
-      : onFieldSet
-    : null;
+  // Bench: always the full brought-set (pre-scanned) minus current actives.
+  // Each player knows their own brought selection at team preview, so this
+  // is the right "what the player would see" view. The opponent's
+  // perspective (only knowing what's been switched in so far) is applied
+  // by the prompt formatter using `seenSpecies` below.
+  const broughtSet = sideIsP1 ? ots.p1Brought : ots.p2Brought;
 
-  const bench: BenchPokemonSnapshot[] = side.team
-    .filter((p) => !activeSet.has(p))
-    .filter((p) => {
-      if (filterSet === null) return true;
-      const sp = p.speciesForme || p.baseSpeciesForme || p.name;
-      return filterSet.has(speciesKey(sp));
-    })
-    .map(snapshotBench);
+  // Look up each brought species' fainted state from @pkmn/client's tracked
+  // team if available. Species in broughtSet but not yet in @pkmn/client's
+  // team can't be fainted (haven't been on field), so default to false.
+  const teamBySpecies = new Map<string, Pokemon>();
+  for (const p of side.team) {
+    const sp = speciesKey(p.speciesForme || p.baseSpeciesForme || p.name);
+    teamBySpecies.set(sp, p);
+  }
+
+  const bench: BenchPokemonSnapshot[] = [];
+  for (const sp of broughtSet) {
+    if (activeSpeciesKeys.has(sp)) continue;
+    const pkm = teamBySpecies.get(sp);
+    if (pkm) {
+      bench.push(snapshotBench(pkm));
+    } else {
+      // Brought but not yet switched in — synthesize a placeholder.
+      bench.push({ species: prettySpeciesFromKey(sp, ots, sideIsP1), fainted: false });
+    }
+  }
+
+  // Chronological "ever on field" set through the current snapshot.
+  const seenSpecies = [...onFieldSet];
 
   const faints = side.team.filter((p) => p.fainted).length;
 
@@ -408,10 +463,24 @@ function snapshotSide(
     player: side.name || `p${side.n + 1}`,
     active,
     bench,
+    seenSpecies,
     faints,
     ...(teraUsed ? { teraUsed } : {}),
     sideConditions: snapshotSideConditions(side),
   };
+}
+
+/** Look up a display-name species from a normalized species key.
+ *  Tries the OTS team sheet first (best display), falls back to the key. */
+function prettySpeciesFromKey(spKey: string, ots: OtsContext, sideIsP1: boolean): string {
+  const sheets = sideIsP1 ? ots.p1Sheets : ots.p2Sheets;
+  if (sheets) {
+    for (const s of sheets) {
+      if (speciesKey(s.species) === spKey) return s.species;
+    }
+  }
+  // Best-effort: convert "calyrex-ice" key form back; preserve as-is otherwise.
+  return spKey;
 }
 
 function snapshotBattle(

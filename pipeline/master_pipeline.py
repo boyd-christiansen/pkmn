@@ -245,9 +245,11 @@ def _flip_event_inplace(ev: dict[str, Any]) -> None:
 def _brought_species_keys_for_game(game: dict) -> set[str]:
     """Species (normalized keys) actually brought by P1 to this single game.
 
-    Derived from the union of P1 active + P1 bench across this game's
-    snapshots. In OTS Bo3 the parser already gates P1 bench to broughtSet,
-    so this naturally yields the 4 brought.
+    Since the parser now emits P1 bench as the full pre-scanned brought-set
+    on every snapshot, the union of P1 active + P1 bench at any single
+    snapshot already gives the brought 4. We still take the union across
+    snapshots as a safety net (handles edge cases where a brought species
+    only appears in one of the two structures).
     """
     out: set[str] = set()
     for snap in game.get("snapshots", []):
@@ -420,17 +422,54 @@ def _summarize_bench(b: dict[str, Any]) -> str:
     return f"{b['species']}{' (fainted)' if b.get('fainted') else ''}"
 
 
-SPREAD_BOUND_WIDTH_THRESHOLD = 60  # stats whose (max - min) ≤ this get an explicit range shown
+def _format_actives_with_empty_slots(side_snap: dict[str, Any]) -> str:
+    """Render P1's active block, with explicit `[b] (empty — only Pokémon
+    remaining)` lines when a slot is genuinely vacant (last mon, no
+    replacement available).
+
+    A slot is "empty" when:
+      - There's no active entry for that letter, AND
+      - There are 0 living bench mons (i.e. no replacement could be sent
+        in next turn). If there ARE living bench mons but the slot is
+        currently empty, we don't render an empty annotation — the player
+        will be prompted for a replacement at end-of-turn before the next
+        snapshot, so the slot isn't "permanently" empty.
+    """
+    actives = side_snap.get("active", []) or []
+    by_slot = {a.get("slot"): a for a in actives}
+    bench = side_snap.get("bench", []) or []
+    living_bench = sum(1 for b in bench if not b.get("fainted"))
+
+    lines: list[str] = []
+    for letter in ("a", "b"):
+        if letter in by_slot:
+            lines.append(_summarize_active(by_slot[letter]))
+        else:
+            # Slot is unoccupied. If a living bench mon is available, the
+            # parser snapshot is mid-replacement; don't annotate. If no
+            # living bench mon, this is the genuine "last Pokémon" case.
+            if living_bench == 0:
+                lines.append(f"  [{letter}] (empty — no Pokémon remaining)")
+            # else: skip; the next snapshot will fill the slot.
+    return "\n".join(lines) if lines else "  (no active Pokémon)"
+
+
 _STAT_DISPLAY = ("hp", "atk", "def", "spa", "spd", "spe")
+_FULLY_OPEN_MIN = 0
+_FULLY_OPEN_MAX = 252
 
 
 def format_p1_inferred_spreads_block(
     snapshot: dict[str, Any],
     p1_knowledge: dict[str, dict[str, dict[str, int]]],
 ) -> str:
-    """Render an `=== YOUR SPREADS ===` block listing per-stat EV ranges for
-    each active P1 mon. Stats whose bound width exceeds the threshold are
-    shown as `?` to keep the prompt tight.
+    """Render `=== YOUR SPREADS (inferred) ===` block.
+
+    For each active P1 mon, show every stat whose bound has been tightened
+    on either side beyond the fully-open `[0, 252]` defaults. Stats with
+    no constraint render as `?`. If the upper bound is tightened only,
+    show as `≤ N`; lower bound only, `≥ N`; both, the explicit range.
+    Pinned to a single value when min == max.
     """
     actives = (snapshot.get("p1") or {}).get("active") or []
     if not actives:
@@ -441,22 +480,31 @@ def format_p1_inferred_spreads_block(
         key = _species_key(species)
         entry = p1_knowledge.get(key)
         if not entry:
-            lines.append(f"  {species}: (no inference yet)")
+            lines.append(f"  {species}: (no observations yet)")
             continue
         mins = entry.get("min_evs", {})
         maxs = entry.get("max_evs", {})
-        parts: list[str] = []
+        constrained: list[str] = []
+        unconstrained: list[str] = []
         for s in _STAT_DISPLAY:
-            lo = mins.get(s, 0)
-            hi = maxs.get(s, 252)
-            if hi - lo <= SPREAD_BOUND_WIDTH_THRESHOLD:
-                if lo == hi:
-                    parts.append(f"{s.capitalize()} {lo}")
-                else:
-                    parts.append(f"{s.capitalize()} {lo}–{hi}")
+            lo = mins.get(s, _FULLY_OPEN_MIN)
+            hi = maxs.get(s, _FULLY_OPEN_MAX)
+            stat_label = s.capitalize()
+            if lo == _FULLY_OPEN_MIN and hi == _FULLY_OPEN_MAX:
+                unconstrained.append(stat_label)
+            elif lo == hi:
+                constrained.append(f"{stat_label} {lo}")
+            elif lo == _FULLY_OPEN_MIN:
+                constrained.append(f"{stat_label} ≤{hi}")
+            elif hi == _FULLY_OPEN_MAX:
+                constrained.append(f"{stat_label} ≥{lo}")
             else:
-                parts.append(f"{s.capitalize()} ?")
-        lines.append(f"  {species}: " + ", ".join(parts))
+                constrained.append(f"{stat_label} {lo}–{hi}")
+        if not constrained:
+            lines.append(f"  {species}: (no observations yet)")
+        else:
+            tail = ", others ?" if unconstrained else ""
+            lines.append(f"  {species}: " + ", ".join(constrained) + tail)
     return "\n".join(lines)
 
 
@@ -475,9 +523,10 @@ def _slot_label(slot: str) -> str:
 def _maybe_turns_left(n: int | None, total: int | None = None) -> str:
     if n is None:
         return ""
+    unit = "turn" if n == 1 else "turns"
     if total is not None:
-        return f" ({n}/{total} turns left)"
-    return f" ({n} turns left)"
+        return f" ({n}/{total} {unit} left)"
+    return f" ({n} {unit} left)"
 
 
 def _scan_events(snapshots: list[dict[str, Any]], current_idx: int):
@@ -624,7 +673,92 @@ def format_game_state_ledger(
         # Only show the last 4 to keep the prompt tight.
         lines.append("Item events:   " + "; ".join(item_history[-4:]))
 
+    # Cumulative damage taken by each currently-active mon, walking prior
+    # turns' move events. Counts hits where the active was a defender +
+    # turns the active spent on field. Only-when-active row.
+    cumulative_lines: list[str] = []
+    for side_label, side_snap in (("P1", p1), ("P2", p2)):
+        for active in side_snap.get("active") or []:
+            if not active:
+                continue
+            slot = active.get("slot", "?")
+            species = active.get("species", "?")
+            full_slot = f"{side_label.lower()}{slot}"  # "p1a"
+            stats = _accumulate_active_stats(snapshots_so_far, current_idx, full_slot, species)
+            if stats["turns_on_field"] == 0 and stats["damage_pct"] == 0:
+                continue
+            label = f"{side_label}[{slot}] {species}"
+            if stats["damage_pct"] > 0:
+                cumulative_lines.append(
+                    f"{label} took {stats['damage_pct']}% across {stats['hits']} hit(s) "
+                    f"over {stats['turns_on_field']} turn(s) on field"
+                )
+            elif stats["turns_on_field"] > 0:
+                cumulative_lines.append(
+                    f"{label} no damage taken over {stats['turns_on_field']} turn(s) on field"
+                )
+    if cumulative_lines:
+        if len(cumulative_lines) == 1:
+            lines.append("Cumulative:    " + cumulative_lines[0])
+        else:
+            lines.append("Cumulative:    " + cumulative_lines[0])
+            for extra in cumulative_lines[1:]:
+                lines.append("               " + extra)
+
     return "=== GAME-STATE LEDGER ===\n" + "\n".join(lines)
+
+
+def _accumulate_active_stats(
+    snapshots_so_far: list[dict[str, Any]],
+    current_idx: int,
+    target_slot: str,
+    target_species: str,
+) -> dict[str, int]:
+    """Walk prior turns' events and accumulate damage / hits / turns-on-field
+    for a specific (slot, species) combination.
+
+    Stops counting backwards once the target slot's species changes (i.e.
+    walking back across a switch to a different mon). Damage is summed as
+    integer percent (HP before − HP after) for every damage hit on the
+    target's slot during a turn where the slot's mon was the target species.
+    """
+    if current_idx <= 0 or not snapshots_so_far:
+        return {"damage_pct": 0, "hits": 0, "turns_on_field": 0}
+
+    target_key = _species_key(target_species)
+    damage_pct = 0
+    hits = 0
+    turns_on_field = 0
+
+    for i in range(min(current_idx, len(snapshots_so_far))):
+        s = snapshots_so_far[i]
+        side = target_slot[:2]      # "p1" or "p2"
+        letter = target_slot[2]      # "a" or "b"
+        active_at_t = next(
+            (a for a in (s.get(side, {}) or {}).get("active", []) if a and a.get("slot") == letter),
+            None,
+        )
+        if not active_at_t:
+            continue
+        if _species_key(active_at_t.get("species", "")) != target_key:
+            continue
+        turns_on_field += 1
+        # Sum damage taken this turn from move events targeting this slot.
+        for ev in s.get("events") or []:
+            if ev.get("type") != "move":
+                continue
+            for hit in ev.get("hits") or []:
+                if hit.get("defender_slot") != target_slot:
+                    continue
+                if hit.get("outcome") != "damage":
+                    continue
+                hp_b = hit.get("hp_before_pct")
+                hp_a = hit.get("hp_after_pct")
+                if hp_b is None or hp_a is None:
+                    continue
+                damage_pct += max(0, int(hp_b) - int(hp_a))
+                hits += 1
+    return {"damage_pct": damage_pct, "hits": hits, "turns_on_field": turns_on_field}
 
 
 def _format_event_inline(ev: dict[str, Any]) -> str | None:
@@ -751,7 +885,18 @@ def format_series_state(
     current_game_index: int,
     total_games_in_series: int,
 ) -> str:
-    """=== SERIES STATE (Bo3, game N of M) ===  block. Bo3-only."""
+    """=== SERIES STATE (Bo3, game N of M) ===  block. Bo3-only.
+
+    For each prior game in the series: a short header (winner, turns,
+    brought rosters, Tera resolutions) followed by the FULL turn-by-turn
+    action log of that game.
+
+    TODO(token-efficient-series-summary): the verbatim rollup is verbose
+    and consumes a lot of attention. A learned or rule-based summarizer
+    that distills "what mattered for THIS turn's decision" would be a
+    big improvement. Until we have one, raw inlining keeps the model
+    from missing context.
+    """
     if current_game_index == 0 or not prior_games:
         return ""
     lines: list[str] = [
@@ -766,7 +911,8 @@ def format_series_state(
         we_won = winner == "p1"
         turns = len(snaps)
         winner_label = "we won" if we_won else ("opp won" if winner == "p2" else "tied/aborted")
-        lines.append(f"Game {gi + 1} ({winner_label}, {turns} turns):")
+        lines.append(f"")  # blank separator between games
+        lines.append(f"--- Game {gi + 1} ({winner_label}, {turns} turns) ---")
 
         # Brought rosters: union of all-time-seen actives + bench across that game.
         def _brought(side_snap_seq: list[dict[str, Any]], side: str) -> list[str]:
@@ -783,36 +929,33 @@ def format_series_state(
                         seen.add(sp); seen_order.append(sp)
             return seen_order
         p1_brought = _brought(snaps, "p1")
-        p2_brought = _brought(snaps, "p2")
+        # For opponent's roster in series state: only include species that
+        # actually saw field (chronological — the same gating logic the
+        # current-frame OPP BENCH uses).
+        opp_seen: set[str] = set()
+        for s in snaps:
+            for sp in (s.get("p2", {}) or {}).get("seenSpecies") or []:
+                opp_seen.add(sp)
+        p2_brought = [sp for sp in _brought(snaps, "p2") if _species_key(sp) in opp_seen]
+
         if p1_brought:
             lines.append(f"  We brought:  {', '.join(p1_brought)}")
         if p2_brought:
             lines.append(f"  Opp brought: {', '.join(p2_brought)}")
 
-        # Tera (last snapshot's stickied teraUsed has the resolution).
+        # Tera resolutions (sticky teraUsed on last snapshot).
         for side_label, side in (("Our Tera:   ", "p1"), ("Opp Tera:   ", "p2")):
             tu = (last.get(side) or {}).get("teraUsed")
             if tu:
                 lines.append(f"  {side_label}{tu['species']} → {tu['teraType']} on T{tu['onTurn']}")
 
-        # Notable: heuristic 1-2 lines.
-        notable: list[str] = []
-        # Choice lock surfaced.
-        for s in snaps:
-            for p in (s.get("p2", {}).get("active") or []):
-                lock = (p or {}).get("choiceLockedInto")
-                if lock and not any("locked into" in n for n in notable):
-                    notable.append(f"Opp {p.get('species', '?')} locked into {lock}")
-                    break
-        # Pseudo-weather setup (Trick Room).
-        for s in snaps:
-            pw = (s.get("field", {}) or {}).get("pseudoWeather") or {}
-            for pwid in pw:
-                if "trickroom" in pwid.lower() and not any("Trick Room" in n for n in notable):
-                    notable.append("Opp set Trick Room")
-                    break
-        if notable:
-            lines.append(f"  Notable:     {'; '.join(notable[:2])}")
+        # Inline the full turn-by-turn action log for this prior game.
+        # We pass `current_idx=len(snaps)` to render every turn.
+        rollup = format_turn_by_turn(snaps, len(snaps), game_index=gi)
+        # Strip the rollup's own header — we already labelled the game above.
+        rollup_body = rollup.split("\n", 1)[1] if "\n" in rollup else ""
+        if rollup_body:
+            lines.append(rollup_body)
     return "\n".join(lines)
 
 
@@ -847,10 +990,19 @@ def format_user_prompt(
     p1 = snapshot.get("p1", {})
     p2 = snapshot.get("p2", {})
 
-    p1_active_lines = "\n".join(_summarize_active(p) for p in p1.get("active", []))
+    p1_active_lines = _format_actives_with_empty_slots(p1)
     p2_active_lines = "\n".join(_summarize_active(p) for p in p2.get("active", []))
+    # P1 bench: full brought-set (player knows their own selection from team preview).
     p1_bench = ", ".join(_summarize_bench(b) for b in p1.get("bench", [])) or "(none)"
-    p2_bench = ", ".join(_summarize_bench(b) for b in p2.get("bench", [])) or "(none)"
+    # P2 bench: chronologically gated — the player only learns the opponent's
+    # brought selection as the opponent actually switches them in. Use
+    # `seenSpecies` (emitted by the parser) as the visibility filter.
+    p2_seen = {_species_key(s) for s in (p2.get("seenSpecies") or [])}
+    p2_bench_visible = [
+        b for b in p2.get("bench", [])
+        if _species_key(b.get("species", "")) in p2_seen
+    ]
+    p2_bench = ", ".join(_summarize_bench(b) for b in p2_bench_visible) or "(none)"
 
     # New historical context blocks.
     snaps = snapshots_so_far or []
