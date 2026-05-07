@@ -1,9 +1,11 @@
 # pipeline
 
 Atomic Python modules that turn raw Pokémon Showdown replays into SFT-ready
-conversational training data. **All six modules are implemented**:
-`replay_parser.py`, `canonical_priors.py`, `damage_inferencer.py`,
-`threat_matrix.py`, `teacher_llm.py`, and `master_pipeline.py`.
+conversational training data. The six core modules — `replay_parser.py`,
+`canonical_priors.py`, `damage_inferencer.py`, `threat_matrix.py`,
+`teacher_llm.py`, and `master_pipeline.py` — plus three teacher-provider
+adapters (`teacher_openai.py`, `teacher_anthropic.py`, `teacher_google.py`)
+and a `bakeoff.py` head-to-head runner.
 
 ## Setup
 
@@ -29,8 +31,9 @@ The orchestrator (`master_pipeline.py`) is the **only** file allowed to import
 from all the others. The reverse is forbidden — sibling modules never import
 each other and never import the orchestrator.
 
-This rule is what lets us swap out e.g. the teacher LLM (GPT-4o → Claude →
-o-series) or the calc engine without rewriting the whole pipeline.
+This rule is what lets us swap out e.g. the teacher LLM provider
+(OpenAI ↔ Anthropic ↔ Google, all behind the `TeacherProvider` ABC)
+or the calc engine without rewriting the whole pipeline.
 
 ## Modules
 
@@ -391,11 +394,12 @@ cd pipeline
 # Smoke test (no API key needed):
 .venv/bin/python master_pipeline.py --limit 1 --dry-run
 
-# Real run on a single Bo3 match:
+# Real run on a single Bo3 match (OpenAI default, gpt-5.5):
 OPENAI_API_KEY=sk-... .venv/bin/python master_pipeline.py --limit 1
 
-# Full run (default model gpt-4o, concurrency 1):
-OPENAI_API_KEY=sk-... .venv/bin/python master_pipeline.py
+# Pick a different provider:
+ANTHROPIC_API_KEY=sk-... .venv/bin/python master_pipeline.py \
+    --provider anthropic --limit 1
 ```
 
 | Flag | Default | Notes |
@@ -405,9 +409,10 @@ OPENAI_API_KEY=sk-... .venv/bin/python master_pipeline.py
 | `--calc-base-url` | `http://localhost:3000` | |
 | `--format-id` | auto from filename | Drives chaos-priors lookup. |
 | `--limit` | none | Process first N matches (test batch). |
-| `--concurrency` | `1` | Keep low to respect OpenAI rate limits. |
-| `--dry-run` | off | Skip the OpenAI call. |
-| `--model` | `gpt-4o` | Or `TEACHER_MODEL` env var. |
+| `--concurrency` | `1` | Keep low to respect provider rate limits. |
+| `--dry-run` | off | Skip the LLM call entirely. |
+| `--provider` | `openai` | Choice of `openai` / `anthropic` / `google`. |
+| `--model` | per-provider default | OpenAI: `gpt-5.5`. Anthropic: `claude-sonnet-4-6`. Google: `gemini-3.1-pro-preview`. Override with `TEACHER_MODEL_{OPENAI,ANTHROPIC,GOOGLE}` env vars. |
 
 ### Orchestrator data flow
 
@@ -422,7 +427,7 @@ raw replay JSON
     │    → master_pipeline.extract_p1_actions(snap_pre, snap_post, events)
     │      (the human's ground-truth play; skip turn if ambiguous)
     │    → threat_matrix.generate(snap_pre, "p1", K1, K2, format_id=…)
-    │      (dual-track Absolute + Probable, [PRIOR CONTRADICTED] flagged)
+    │      (dual-track Absolute + Probable; off-meta lines drop Probable)
     │    → format_user_prompt(snap_pre, ..., snapshots_so_far, current_idx,
     │                         prior_games, game_index, match_format)
     │      (composes board state + GAME-STATE LEDGER + TURN-BY-TURN +
@@ -442,11 +447,11 @@ raw replay JSON
 | `replay_parser.py` | Working. Run `python replay_parser.py --help`. Captures per-turn `events` (TurnEvent[]) from `/parse_log` into the JSONL. |
 | `canonical_priors.py` | Working. Library + bootstrap CLI. Reads Smogon Chaos JSON when present; falls back to curated table → heuristic. |
 | `damage_inferencer.py` | Working. Dual-state, two-way binary search, atomic apply, 508-EV constraint pass, crit-aware via `/calc isCrit`, multi-hit filter, `events_to_damage_events()` filter for non-own-move callers (Metronome / Copycat / Sketch / Snatch / Me First / Dancer / Instruct / Mirror Move / Assist / Nature Power excluded; Sleep Talk allowed). |
-| `threat_matrix.py` | Working. Dual-track Absolute + Probable output with `[PRIOR CONTRADICTED]` flag. Optional `format_id` drives Smogon-backed priors. |
-| `teacher_llm.py` | Provider-agnostic core: `TeacherProvider` ABC, schemas (incl. `submit_decision` tool), prompt templates (6 rules: Masking/OTS, Tool, Threat-Matrix, Spread, Alternatives, Output), ground-truth stripping. `# TODO(rlhf-followup)` flags the prompt-driven alternative evaluation as temporary. |
-| `teacher_openai.py` | OpenAI adapter (gpt-4o / gpt-4.1 / gpt-5). Forces `calculate_damage` on iter 0, `tool_choice=required` thereafter. Default. |
-| `teacher_anthropic.py` | Anthropic adapter (claude-sonnet-4.x). Same tool-loop semantics. |
-| `teacher_google.py` | Google adapter (gemini-2.5-pro / gemini-3-x). Same tool-loop semantics. |
+| `threat_matrix.py` | Working. Dual-track Absolute + Probable output. When canonical priors are ≥40-EV-clipped by the inferred bounds, the Probable column is dropped and the line tagged `(off-meta)`. Optional `format_id` drives Smogon-backed priors. |
+| `teacher_llm.py` | Provider-agnostic core: `TeacherProvider` ABC, schemas (incl. `submit_decision` tool), prompt templates (6 rules: Masking/OTS, Tool, Threat-Matrix, Spread, Alternatives, Output), ground-truth stripping. Present-tense system prompts. `# TODO(rlhf-followup)` flags the prompt-driven alternative evaluation as temporary. |
+| `teacher_openai.py` | OpenAI adapter; default model `gpt-5.5`. Forces `calculate_damage` on iter 0, `tool_choice=required` thereafter. Default provider. |
+| `teacher_anthropic.py` | Anthropic adapter; default model `claude-sonnet-4-6`. Same tool-loop semantics. |
+| `teacher_google.py` | Google adapter; default model `gemini-3.1-pro-preview`. Same tool-loop semantics. |
 | `bakeoff.py` | Head-to-head bake-off runner. Reports per-provider cost, tool-call rate, CoT length, action-match rate. |
 | `master_pipeline.py` | Working. `flip_match_to_winner` makes every SFT example come from the series winner's perspective; inferred-spread block (one-sided constraints) in user prompt; per-format system prompt branch; three new historical-context blocks (`GAME-STATE LEDGER` with Cumulative damage row, `TURN-BY-TURN`, `SERIES STATE` with full prior-game rollups); explicit empty-slot annotation for last-Pokémon scenarios; perspective-aware bench rendering (P1: full brought-set, P2: chronological via `seenSpecies`); `--provider {openai,anthropic,google}` flag. `--dry-run` exercises orchestration without LLM cost. |
 
@@ -457,16 +462,15 @@ raw replay JSON
   parallelises N turns' tool loops by submitting each loop iteration as
   one batch via OpenAI Batch / Anthropic Message Batches / Vertex batch
   prediction. ~50% cost reduction on the full-corpus run (~$1,150 saved
-  on ~$2,300). `master_pipeline.py --mode {sync,batch,hybrid}` selects
-  the path; hybrid runs the first ~1K matches sync to validate quality,
-  then batches the rest.
-- **Richer turn-history context in the user prompt.** Today the LLM sees
-  only the current frame + threat matrix + inferred spreads — no
-  last-turn damage, no Tera-used flags, no pseudo-weather state (Trick
-  Room / screens / Helping Hand turns), no faint ledger. All in the
-  parsed data already; needs a `format_recent_history` helper in
-  `master_pipeline.py` that inserts a 1–3 turn rollup + structured
-  game-state ledger between the board state and the threat matrix.
+  on ~$2,300). `master_pipeline.py` would gain a
+  `--mode {sync,batch,hybrid}` flag — hybrid runs the first ~1K matches
+  sync to validate quality, then batches the rest.
+- **Token-efficient series-state summarizer.** `format_series_state`
+  currently inlines the full prior-game rollup verbatim, which is
+  high-fidelity but verbose. A learned (or careful rule-based)
+  summarizer that distills "what mattered for THIS turn's decision"
+  would conserve attention without losing decision-relevant signal.
+  Tracked as `# TODO(token-efficient-series-summary)` in the function.
 - **Selection-model SFT corpus** — separate dataset for the team-preview
   4-of-6 pick decision. Walks the same parsed replays, extracts P1's
   brought set per game, generates one selection example per game with

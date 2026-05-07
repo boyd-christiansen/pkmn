@@ -185,9 +185,9 @@ pipeline/parsed_data/sft_training_data.jsonl   # one fine-tuning example per tur
 The teacher LLM tool-loop now goes through a `TeacherProvider` ABC
 (`teacher_llm.py`) with three concrete adapters:
 
-- `teacher_openai.py` — `gpt-4o` / `gpt-5` etc. via the OpenAI SDK.
-- `teacher_anthropic.py` — `claude-sonnet-4-x` etc. via the Anthropic SDK.
-- `teacher_google.py` — `gemini-2.5-pro` etc. via the `google-genai` SDK.
+- `teacher_openai.py` — `gpt-5.5` (default) / `gpt-5.5-pro` / `gpt-5.5-mini` etc. via the OpenAI SDK.
+- `teacher_anthropic.py` — `claude-sonnet-4-6` (default) / `claude-opus-4-7` / `claude-haiku-4-5` etc. via the Anthropic SDK.
+- `teacher_google.py` — `gemini-3.1-pro-preview` (default) / `gemini-3.1-flash-preview` etc. via the `google-genai` SDK.
 
 Each adapter implements the same `submit_decision`-tool architecture:
 the model **must** call `calculate_damage` at least once before calling
@@ -196,7 +196,7 @@ are the only output channel, which is what fixed the zero-tool-call
 regression we saw on the first real run.
 
 Pick a provider via `master_pipeline.py --provider {openai,anthropic,google}`
-(default: `openai`). Override the model id with `--model gpt-5` etc.
+(default: `openai`). Override the model id with `--model gpt-5.5-pro` etc.
 
 For a head-to-head comparison: `python bakeoff.py --providers openai,anthropic,google`
 runs the same match through each provider and reports per-row cost,
@@ -247,20 +247,17 @@ against the provider's pricing page before scaling to the full corpus.
   Vertex batch prediction — all ~50% off sync prices). Per-turn state
   persisted to disk so runs can resume mid-batch-cycle. Each provider
   gets a `BatchTeacherProvider` extension (`OpenAIBatchProvider`, etc.)
-  exposing `submit_batch` / `await_batch`. `master_pipeline.py` gains a
-  `--mode {sync,batch,hybrid}` flag — hybrid runs the first ~1K matches
-  sync to validate quality, then migrates the rest to batch for the cost
-  win. Estimated savings on full corpus: ~$1,150 of ~$2,300. Estimated
-  wall-clock: 3 batch cycles × 30min–12h ≈ 2h–36h.
-- **Richer turn-history context in the user prompt.** Today the LLM only
-  sees the current snapshot's frame + threat matrix + inferred spreads.
-  It doesn't see what happened on previous turns (last move used by each
-  side, last-turn damage exchange, Tera-used flags, pseudo-weather state
-  like Trick Room/screens/Helping Hand, total faint count per side). All
-  of this is in the parsed data already — needs a `format_recent_history`
-  helper in `master_pipeline.py` that summarises the last 1–3 turns'
-  `actionLog` plus a structured "game-state ledger" (Tera-used, screens,
-  faints) inserted between the board state and the threat matrix.
+  exposing `submit_batch` / `await_batch`. `master_pipeline.py` would
+  gain a `--mode {sync,batch,hybrid}` flag — hybrid runs the first
+  ~1K matches sync to validate quality, then migrates the rest to
+  batch for the cost win. Estimated savings on full corpus: ~$1,150
+  of ~$2,300. Estimated wall-clock: 3 batch cycles × 30min–12h ≈
+  2h–36h.
+- **Token-efficient series-state summarizer.** Today's `format_series_state`
+  inlines the full turn-by-turn rollup of every prior Bo3 game.
+  Distilling those into a "what mattered for THIS turn's decision"
+  summary would conserve attention. Tracked as
+  `# TODO(token-efficient-series-summary)` in `master_pipeline.py`.
 - **Selection-model SFT corpus** — separate dataset for the
   team-preview 4-of-6 pick decision. Sibling module to
   `master_pipeline.py`. Generates `{full p1, full p2, format_meta} →

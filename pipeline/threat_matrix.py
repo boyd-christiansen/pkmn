@@ -11,9 +11,11 @@ Pipeline role:
         running their canonical meta spread (`canonical_priors`). Narrow,
         quick, and only as good as the prior.
 
-    Whenever the canonical prior falls outside the absolute bounds for any
-    relevant stat, the line is flagged `[PRIOR CONTRADICTED]` so the LLM
-    can reason about off-meta opponents.
+    When the canonical prior is clipped from the inferred KnowledgeState
+    bounds by ≥ 40 EVs on any relevant stat (`PRIOR_CONTRADICTION_EV_GAP`),
+    the Probable calc is **skipped entirely** for that line and only the
+    Absolute envelope is shown, tagged `(off-meta)`. This avoids
+    surfacing a meta range we've already disproven.
 
 Inputs:
     snapshot           — one TurnSnapshot dict from /parse_log.

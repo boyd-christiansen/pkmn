@@ -562,11 +562,13 @@ Now the keystone insight that makes the whole pipeline work:
 > **The teacher LLM doesn't have to FIND the optimal play. It has to
 > JUSTIFY a known good play.**
 
-Finding the optimal VGC play requires Day-2-Worlds intuition. GPT-4o
-doesn't have that. But *rationalizing* a play it's been told is correct
-— given the board state and a precomputed threat matrix — is a much
-easier task. We get high-quality CoT essentially for free from a model
-that doesn't itself know VGC at pro level.
+Finding the optimal VGC play requires Day-2-Worlds intuition. No
+frontier LLM has that out of the box. But *rationalizing* a play it's
+been told is correct — given the board state and a precomputed threat
+matrix — is a much easier task. We get high-quality CoT essentially
+for free from a model that doesn't itself know VGC at pro level. (The
+teacher itself is provider-pluggable: OpenAI / Anthropic / Google
+adapters all behind one `TeacherProvider` ABC.)
 
 **Synthesis call shape:**
 
