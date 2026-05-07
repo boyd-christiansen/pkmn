@@ -277,7 +277,14 @@ type TurnEvent =
 interface SideSnapshot {
   player: string;                    // username
   active: ActivePokemonSnapshot[];   // doubles slots a, b (length 2 in VGC)
-  bench: BenchPokemonSnapshot[];     // not-currently-active known team members
+  // bench is the full pre-scanned brought-set minus currently-active mons.
+  // Symmetric across p1/p2; perspective gating (chronological reveal for
+  // opponent) is applied downstream by master_pipeline.format_user_prompt
+  // using `seenSpecies` below.
+  bench: BenchPokemonSnapshot[];
+  // Chronological set of species ever active on this side at any turn ≤
+  // current. Used to gate opponent-bench rendering at format time.
+  seenSpecies: string[];
   faints: number;                    // cumulative faints this game
   teraUsed?: {                       // sticky once a side Tera's; absent until then
     species: string;
@@ -361,6 +368,7 @@ Truncated example output (turn 2 of a real Reg I replay):
       }
     ],
     "bench": [...],
+    "seenSpecies": ["calyrexshadow", "zamazentacrowned"],
     "faints": 0,
     "teraUsed": { "species": "Zamazenta-Crowned", "teraType": "Water", "onTurn": 1 },
     "sideConditions": {}
@@ -412,19 +420,38 @@ Truncated example output (turn 2 of a real Reg I replay):
   Talk"}`. This avoids polluting Hatterene's / Smeargle's reconstructed
   CTS moveset with Bleakwind Storm / Boomburst / etc. that they called
   via Metronome.
-- **OTS / CTS bench gating** (Bo3 only — Bo1 behavior unchanged):
-  - `snapshot.p1.bench` is intersected with the **brought-set** for the
-    game (computed in a one-pass pre-scan over the log for every species
-    that ever appears via `|switch|` / `|drag|` / `|replace|`). At turn 1
-    P1 bench shows the 4 brought minus the 2 active, even before the
-    bench Pokémon switch in.
-  - `snapshot.p2.bench` is intersected with the **on-field-set** (running
-    — populated as P2 actually switches in). At turn 1, P2 bench is empty;
-    it grows over the game as the opponent's selection is revealed.
-  - Active Pokémon get their `item` / `ability` / `teraType` filled from
-    OTS at turn 1 (instead of waiting for in-game reveal). This is what
-    makes downstream `damage_inferencer` and `threat_matrix` calc payloads
-    immediately tighter on Bo3, with **zero changes** to those modules.
+- **Bench rendering: symmetric brought-set, perspective applied
+  downstream.** Both `snapshot.p1.bench` and `snapshot.p2.bench` are
+  rendered as the full pre-scanned brought-set (every species that
+  appears via `|switch|` / `|drag|` / `|replace|` anywhere in the
+  game) minus the current actives. This applies in **both Bo3 OTS
+  and Bo1 CTS** — in both formats the player at team preview already
+  knows their own brought selection. The chronological gating that
+  protects the opponent's perspective happens in
+  `pipeline/master_pipeline.format_user_prompt` using the
+  `seenSpecies` field below. Edge case: in very short games where a
+  brought mon never switches in, the brought-set is incomplete; we
+  accept the gap rather than guess.
+- **`seenSpecies` per side.** Chronological set of species ever
+  active up to the current turn. Empty-except-starters at turn 1,
+  grows with each switch. Used by the prompt formatter to gate the
+  opponent's bench display (since the player only learns the
+  opponent's selection as they switch in).
+- **Tera-form aliasing.** When an active Pokémon undergoes a Tera
+  transformation (Terapagos → Terapagos-Stellar, Ogerpon-Wellspring
+  → Ogerpon-Wellspring-Tera), the parser strips the `-Stellar` /
+  `-Terastal` / `-Tera` suffixes when computing match keys, so the
+  pre-Tera brought-set entry is correctly recognized as the same
+  Pokémon and doesn't double-render on the bench.
+- **Active Pokémon OTS overlay.** Item / ability / teraType are
+  filled from the OTS team sheet at turn 1 (instead of waiting for
+  in-game reveal). `choiceLockedInto` uses this OTS-resolved item
+  (not @pkmn/client's raw `p.item`, which is null until the item is
+  revealed in play); the move ID from `p.lastMove` is normalized to
+  a display name via `@pkmn/dex` so the prompt renders "Bolt Strike"
+  instead of "boltstrike". This makes downstream calc payloads
+  immediately tighter on Bo3 with **zero changes** to the calc
+  engine itself.
 
 ## `GET /dex/move/:name`
 

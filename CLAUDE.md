@@ -115,14 +115,16 @@ pipeline/parsed_data/sft_training_data.jsonl   # one fine-tuning example per tur
   per hit) after `events_to_damage_events` flattens the new event
   schema; the `damage_inferencer` detects and drops them (would need a
   `hits` field on `/calc` to handle properly).
-- **Non-own-move callers are filtered for inference.** Metronome, Copycat,
-  Sketch, Snatch, Me First, Dancer, Instruct can call moves the user
-  doesn't own — their hits would corrupt EV inference. The
-  `events_to_damage_events` filter keeps `called_via in {None, "Sleep
-  Talk"}` only. (Sleep Talk is allowed because it can only call own
-  moves.) The same filter governs `derivedRevealedMoves` on the Node
-  side, so reconstructed CTS movesets aren't polluted by Hatterene /
-  Smeargle Metronome calls.
+- **Non-own-move callers are filtered for inference and revealed-set
+  attribution.** Metronome, Copycat, Sketch, Snatch, Me First, Dancer,
+  Instruct, Mirror Move, Assist, Nature Power can all call moves the
+  user doesn't own — their hits would corrupt EV inference and
+  pollute reconstructed CTS movesets. The Node `NON_OWN_CALLERS` set
+  drives both `derivedRevealedMoves` filtering and the
+  `events_to_damage_events` filter (`called_via in {None, "Sleep
+  Talk"}` only). Sleep Talk is allowed because it only calls own
+  moves; Mimic is allowed because it permanently overwrites a slot
+  in-battle.
 - **Ambiguous turns are skipped silently.** If `extract_p1_actions` can't
   pin a P1 slot's choice (e.g. forced out before acting), the whole
   turn is skipped — no SFT row written, but `update_knowledge` still
@@ -157,13 +159,26 @@ pipeline/parsed_data/sft_training_data.jsonl   # one fine-tuning example per tur
   protocol P2 won. Don't assume "p1" in a saved row corresponds to the
   protocol's p1 — it's whoever won the series.
 - **Historical context lives in the user prompt.** Each turn's prompt
-  includes a `=== GAME-STATE LEDGER ===` (faints / Tera-used / field /
-  side conditions / volatiles / choice locks / item events), a
+  includes a `=== GAME-STATE LEDGER ===` (faints, Tera-used, field +
+  pseudo-weather + side conditions with turns-left, on-active
+  volatiles, choice locks with display-name-normalized move, recent
+  item events, and per-active Cumulative damage taken), a
   `=== TURN-BY-TURN (game N) ===` rollup of every prior turn's events
-  this game, and (Bo3 game ≥ 2) a `=== SERIES STATE ===` block
-  summarizing who brought what / Tera'd what / "notable" patterns from
-  prior games. Built by `format_game_state_ledger`,
-  `format_turn_by_turn`, `format_series_state` in `master_pipeline.py`.
+  this game, and (Bo3 game ≥ 2) a `=== SERIES STATE ===` block whose
+  per-prior-game summary now inlines the **full turn-by-turn rollup**
+  of that game (an earlier `Notable` heuristic was dropped because it
+  was too thin — TODO marker for a future learned summarizer). Built
+  by `format_game_state_ledger`, `format_turn_by_turn`,
+  `format_series_state` in `master_pipeline.py`.
+- **Empty-slot annotation.** When P1 is down to 1 mon (slot vacant,
+  no living bench replacement), the prompt explicitly renders
+  `[b] (empty — no Pokémon remaining)` so the model doesn't have to
+  infer slot vacancy from the absence of an active line.
+- **System-prompt tense is present, not historical.** The model is
+  trained as if playing live — wording like "you don't yet know
+  which 4 they will bring" / "you'll learn that as the battle
+  unfolds." Don't reintroduce past-tense framing when editing
+  templates in `teacher_llm.py`.
 
 ## Provider-agnostic teacher LLM
 

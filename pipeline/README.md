@@ -260,10 +260,13 @@ tuning-ready conversation messages.
 - **Tools exposed to the LLM:** `calculate_damage` — JSON schema mirrors
   `/calc`'s payload (Pokémon × move × field, with `isCrit` / `evs` / `nature`
   / etc. all optional).
-- **Final-output schema:** strict JSON schema enforced via OpenAI's
-  `response_format: json_schema`. Shape: `{ pre_tool_thought: string,
-  action: { slot_1, slot_2 } }`. Each slot has
-  `{action_type: "move"|"switch"|"pass", move?, target?, tera?, switch_to?}`.
+- **Final-output schema:** strict JSON schema lives on the
+  `submit_decision` tool's `parameters` (NOT on `response_format`).
+  Shape: `{ pre_tool_thought: string, action: { slot_1, slot_2 } }`.
+  Each slot has `{action_type: "move"|"switch"|"pass", move?, target?,
+  tera?, switch_to?}`. The model has only one output channel — tool
+  calls — so it can't bypass `calculate_damage` by emitting a direct
+  structured response (this fixed an earlier zero-tool-call regression).
 - **Ground-truth handling:** during the API call, the user message has the
   human's play appended as an `=== EXPERT'S DECISION ===` suffix. The
   returned messages have that suffix **stripped** — saved SFT examples
@@ -300,12 +303,14 @@ series-winner sometimes drops a game to RNG / matchup, and that
 reasoning is still high-quality.
 
 **Inferred P1 spreads in the user prompt.** Each turn's user prompt
-includes a `=== YOUR SPREADS (inferred) ===` block listing per-stat EV
-ranges for each active P1 mon, derived from the running
-`p1_knowledge`. Stats whose bound width exceeds 60 EVs collapse to
-`?` so wide-open turn-1 bounds don't flood the prompt. The Spread Rule
-in the system prompt tells the model how to reason from ranges (worst
-case for survival checks, best case for offensive checks) and
+includes a `=== YOUR SPREADS (inferred) ===` block listing every
+tightened EV bound for each active P1 mon. The render uses one-sided
+constraints — `Stat ≤N` when only the upper bound has narrowed,
+`Stat ≥N` when only the lower bound has narrowed, the explicit range
+when both, or `Stat N` when pinned to a single value. Fully-open
+stats roll up into a trailing `, others ?`. The Spread Rule in the
+system prompt tells the model how to reason from ranges (worst case
+for survival checks, best case for offensive checks) and
 acknowledges that exact values may also be presented at deploy time.
 
 - **`reconstruct_p1_team(games)`** — forward-scan over every snapshot in
@@ -330,14 +335,30 @@ acknowledges that exact values may also be presented at deploy time.
 - **Historical context blocks.** `format_user_prompt` composes three
   prompt sections in addition to the current-frame board state:
   - `=== GAME-STATE LEDGER ===` — faints, Tera-used per side, field +
-    pseudo-weather + side conditions with turns-left, on-active
-    volatiles (Substitute / Encore / Taunt / …), choice locks, and
-    recent item events. Only-when-active rows: empty rows omit.
+    pseudo-weather + side conditions with turns-left (singular/plural
+    handled), on-active volatiles (Substitute / Encore / Taunt / …),
+    choice locks (move name normalized via the dex), recent item
+    events, and a Cumulative damage row showing per-active total
+    damage taken across past turns + turns on field. Only-when-active
+    rows: empty rows omit.
   - `=== TURN-BY-TURN (game N) ===` — every prior turn's events as
     indented one-liners. No length cap.
   - `=== SERIES STATE (Bo3, game N of M) ===` — Bo3 game ≥ 2 only.
-    One block per prior game: who brought what, Tera resolutions,
-    "Notable" heuristic line (choice lock surfaced, Trick Room set, …).
+    For each prior game: header (winner, turns, brought rosters, Tera
+    resolutions) followed by the full inlined turn-by-turn rollup.
+    `# TODO(token-efficient-series-summary)` flags this for a future
+    learned summarizer; raw inlining is the right move until that
+    lands.
+- **Active slot empty-state.** `_format_actives_with_empty_slots`
+  emits an explicit `[b] (empty — no Pokémon remaining)` line when
+  P1 is down to 1 mon (slot vacant, no living bench replacement).
+  The model doesn't have to infer slot vacancy from active-line
+  count + bench fainted-counts.
+- **Bench rendering perspective.** The parser emits `bench` for both
+  sides as the full pre-scanned brought-set (player's own knowledge);
+  `format_user_prompt` filters P2's bench by `seenSpecies`
+  (chronological reveal — what the player has actually observed of
+  the opponent's selection).
 - **Process loop** per match:
   1. `reconstruct_p1_team` + gather P2 species from snapshots.
   2. `init_knowledge` for both sides at fully-open `[0, 252]` bounds (per
@@ -420,14 +441,14 @@ raw replay JSON
 |---|---|
 | `replay_parser.py` | Working. Run `python replay_parser.py --help`. Captures per-turn `events` (TurnEvent[]) from `/parse_log` into the JSONL. |
 | `canonical_priors.py` | Working. Library + bootstrap CLI. Reads Smogon Chaos JSON when present; falls back to curated table → heuristic. |
-| `damage_inferencer.py` | Working. Dual-state, two-way binary search, atomic apply, 508-EV constraint pass, crit-aware via `/calc isCrit`, multi-hit filter. |
+| `damage_inferencer.py` | Working. Dual-state, two-way binary search, atomic apply, 508-EV constraint pass, crit-aware via `/calc isCrit`, multi-hit filter, `events_to_damage_events()` filter for non-own-move callers (Metronome / Copycat / Sketch / Snatch / Me First / Dancer / Instruct / Mirror Move / Assist / Nature Power excluded; Sleep Talk allowed). |
 | `threat_matrix.py` | Working. Dual-track Absolute + Probable output with `[PRIOR CONTRADICTED]` flag. Optional `format_id` drives Smogon-backed priors. |
 | `teacher_llm.py` | Provider-agnostic core: `TeacherProvider` ABC, schemas (incl. `submit_decision` tool), prompt templates (6 rules: Masking/OTS, Tool, Threat-Matrix, Spread, Alternatives, Output), ground-truth stripping. `# TODO(rlhf-followup)` flags the prompt-driven alternative evaluation as temporary. |
 | `teacher_openai.py` | OpenAI adapter (gpt-4o / gpt-4.1 / gpt-5). Forces `calculate_damage` on iter 0, `tool_choice=required` thereafter. Default. |
 | `teacher_anthropic.py` | Anthropic adapter (claude-sonnet-4.x). Same tool-loop semantics. |
 | `teacher_google.py` | Google adapter (gemini-2.5-pro / gemini-3-x). Same tool-loop semantics. |
 | `bakeoff.py` | Head-to-head bake-off runner. Reports per-provider cost, tool-call rate, CoT length, action-match rate. |
-| `master_pipeline.py` | Working. `flip_match_to_winner` makes every SFT example come from the series winner's perspective; inferred-spread block in user prompt; per-format system prompt branch; `--provider {openai,anthropic,google}` flag. `--dry-run` exercises orchestration without LLM cost. |
+| `master_pipeline.py` | Working. `flip_match_to_winner` makes every SFT example come from the series winner's perspective; inferred-spread block (one-sided constraints) in user prompt; per-format system prompt branch; three new historical-context blocks (`GAME-STATE LEDGER` with Cumulative damage row, `TURN-BY-TURN`, `SERIES STATE` with full prior-game rollups); explicit empty-slot annotation for last-Pokémon scenarios; perspective-aware bench rendering (P1: full brought-set, P2: chronological via `seenSpecies`); `--provider {openai,anthropic,google}` flag. `--dry-run` exercises orchestration without LLM cost. |
 
 ## Planned follow-up workstreams (TODO)
 

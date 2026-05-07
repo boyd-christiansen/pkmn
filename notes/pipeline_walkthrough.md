@@ -129,13 +129,32 @@ revealed chronologically).
 attach to `snapshot[N].events`, so we always pair `(snap[N], snap[N+1],
 snap[N].events)` for inference and label extraction.
 
-**Format-aware bench gating** (Bo3 only): the parser pre-scans the log to
-find every Pokémon each side ever sends to the field. P1's bench at turn 1
-shows the 4 brought minus the 2 active (we know our own selection). P2's
-bench at turn 1 is **empty** — even though `|showteam|` revealed all 6 to
-the spectator, the human player didn't know which 4 the opponent would
-bring until they switched in. Strict chronological view for the
-opponent's backline.
+**Symmetric brought-set bench, perspective applied in Python.** The
+parser pre-scans the log once to find every Pokémon each side ever
+sends to the field, and emits `bench` for **both sides** as the full
+brought-set minus the current actives — symmetrically, regardless of
+format. Each side also carries a `seenSpecies: string[]` field with
+the chronological set of species ever active up to the current turn.
+
+The perspective gating happens in `pipeline/master_pipeline.py`'s
+`format_user_prompt`:
+
+- **YOUR (P1) BENCH** renders the full brought-set. The player knows
+  their own selection from team preview, so we always show all 4
+  brought (minus any currently active). This applies in both Bo3 OTS
+  and Bo1 CTS — in both formats the player's perspective at preview
+  is "I know which 4 I'm bringing."
+- **OPP (P2) BENCH** is filtered by `seenSpecies`: only species that
+  have actually appeared on field at any turn ≤ current are shown.
+  At turn 1 of any game, that's empty even when the parser knows P2
+  has 4 brought somewhere — the player only learns the opponent's
+  selection as they switch in.
+
+This symmetric parser output is what makes
+`flip_match_to_winner` clean: when we relabel the protocol-P2 winner
+as the new P1, both sides already carry both views' worth of data, and
+the post-flip P1 inherits the full-brought view of their own team
+(which, before the flip, lived in `snap.p2`).
 
 Real turn 1 events from the running example (the new discriminated-union
 schema replaces the previous flat `DamageEvent[]`):
@@ -156,11 +175,27 @@ schema replaces the previous flat `DamageEvent[]`):
 ```
 
 The full TurnEvent union has six variants (`move`, `cant_move`, `tera`,
-`switch`, `faint`, `item_event`) — see `calc_microservice/README.md` for
-the schema. The Python `damage_inferencer.events_to_damage_events()`
-helper flattens move events with `called_via in {null, "Sleep Talk"}`
-and `outcome == "damage"` into the legacy `DamageEvent` shape for the
-binary-search inferencer.
+`switch`, `faint`, `item_event`) — see `calc_microservice/README.md`
+for the schema.
+
+**Move-caller filter.** Each `move` event carries `called_via`: null
+when the attacker used the move directly, or the calling-move name
+when something else triggered it. The parser's
+`derivedRevealedMoves` (the `revealedMoves` field on each active mon)
+and the Python `damage_inferencer.events_to_damage_events()` filter
+both keep only `called_via in {null, "Sleep Talk"}`. The excluded
+callers — Metronome, Copycat, Sketch, Snatch, Me First, Dancer,
+Instruct, Mirror Move, Assist, Nature Power — can call moves the
+attacker doesn't actually own, so attributing the called move to
+their kit (or feeding the damage observation to EV inference) would
+corrupt downstream state. Sleep Talk is included because it can only
+call own moves. Mimic stays out of the filter set because in-battle
+it permanently overwrites a slot, so subsequent uses really are in
+the kit.
+
+This filter directly fixes a CTS-Bo1 bug we used to have where
+Hatterene/Smeargle Metronome calls were polluting their reconstructed
+movesets.
 
 Two events. Miraidon hit Lunala for 21%. Lunala hit Iron Valiant for 99%.
 Notice that turn 1 had Iron Valiant doing *something else* too — but no
@@ -329,12 +364,29 @@ math stays unchanged.
 **P1's bounds get surfaced to the LLM.** The same KnowledgeState that
 drives the Absolute track also feeds a `=== YOUR SPREADS (inferred) ===`
 block in the user prompt — per-stat ranges for each active P1 Pokémon.
-Stats whose bound width is still > 60 EVs collapse to `?` (so wide-open
-turn-1 bounds don't flood the prompt). The system prompt's *Spread Rule*
-tells the model how to use them: worst-case for survival checks,
-best-case for offensive checks. At deploy time the operator can present
-exact spreads from a team-builder JSON instead of inferred ranges; the
-trained model is robust to either form.
+
+The render uses **one-sided constraints** rather than masking everything
+that hasn't narrowed below an arbitrary width:
+
+- Tightened upper bound only → `Stat ≤N`
+- Tightened lower bound only → `Stat ≥N`
+- Both sides tightened → `Stat lo–hi`
+- Pinned to a single value → `Stat N`
+- Fully open `[0, 252]` → not shown; trailing `, others ?` summarizes them
+- Mon with no observations yet → `(no observations yet)`
+
+Concrete example after a 3-game match: `Kingambit: HP ≤91, Def ≤99,
+others ?`. This surfaces real signal that earlier renders (which
+required a tight two-sided range) hid: every binary search produces a
+one-sided bound, and one-sided bounds *are* useful — "Kingambit has
+at most 91 HP EVs" tells the model to assume the worst case for its
+own offense, even if the lower bound is still 0.
+
+The system prompt's *Spread Rule* tells the model how to use the
+ranges: worst-case for survival checks, best-case for offensive
+checks. At deploy time the operator can present exact spreads from a
+team-builder JSON instead of inferred ranges; the trained model is
+robust to either form.
 
 ### Step 6 — Threat matrix: dual-track damage envelope
 
@@ -546,7 +598,9 @@ only on rule 1):
    the team sheet.
 2. **Tool Rule** — `calculate_damage` is for *hypotheticals the threat
    matrix doesn't cover* (switch outcomes, future-turn calcs, opposing
-   Tera predictions). 1–3 per turn, don't recompute matrix cells.
+   Tera predictions). The model **must** call it at least once before
+   committing via `submit_decision`; the matrix cells themselves are
+   pre-computed and shouldn't be re-calc'd.
 3. **Threat-Matrix Rule** — each line shows Absolute (provable) and,
    when not contradicted, Probable (meta). Off-meta lines tagged
    `(off-meta)` show only Absolute.
@@ -557,17 +611,27 @@ only on rule 1):
    `# TODO(rlhf-followup)`: this prompt-driven approach lets the
    teacher cherry-pick weak alternatives because it knows the answer;
    real fix is minimax / MCTS distillation in a separate workstream.
-6. **Output Rule** — strict JSON schema for `{pre_tool_thought,
-   action: {slot_1, slot_2}}`.
+6. **Output Rule** — commit via `submit_decision` tool with arguments
+   `{pre_tool_thought, action: {slot_1, slot_2}}`.
 
 **Two templates, one branch.** Bo1 includes the Masking Rule and
 shows the *reconstructed* P1 team with `[UNREVEALED_MOVE]`
-placeholders. Bo3 includes the OTS Rule and shows full sheets for both
-sides with ★ markers on P1's brought 4 (different per game in a
-series). Picked by `if match["format"] == "bo3"` in the orchestrator.
+placeholders for moves the player hasn't yet used this match. Bo3
+includes the OTS Rule and shows full sheets for both sides with ★
+markers on P1's brought 4 (different per game in a series). Picked by
+`if match["format"] == "bo3"` in the orchestrator. **All wording is
+present-tense** — the model is trained to think it's playing live, not
+reviewing a recording.
 
-Picking the right template per match is just `if match["format"] ==
-"bo3"` in the orchestrator.
+**Tool architecture, not response_format.** The model has only one
+output channel: tool calls. It can either call `calculate_damage` or
+commit via `submit_decision` (called exactly once per turn). The
+JSON schema lives on `submit_decision`'s parameters, not on
+`response_format`. This was an explicit fix — an earlier
+`response_format: json_schema` setup let the model bypass the calc
+tool entirely on some turns. With `submit_decision` being the only
+way to produce structured output, the model is forced through the
+tool loop.
 
 **Two things to notice:**
 
@@ -582,8 +646,50 @@ Picking the right template per match is just `if match["format"] ==
    calc service handles `isCrit`, `isTera`, `boosts`, `status`, weather,
    terrain — all the volatile state the LLM might want to vary.
 
-Final output is constrained by OpenAI's `response_format: json_schema`
-(strict mode) to the `{ pre_tool_thought, action: {slot_1, slot_2} }` shape.
+#### The user prompt's structure (eight sections)
+
+The user prompt is composed turn-by-turn from the snapshot + threat
+matrix + accumulated KnowledgeStates. In order of appearance:
+
+1. **Turn / field header** — turn number, weather, terrain, tailwind
+   booleans.
+2. **YOUR (P1) ACTIVE / BENCH** — current actives with HP %, status,
+   item, ability, Tera state, boosts, revealed moves; bench is the
+   full brought-set (the player knows their selection from team
+   preview). When a slot is genuinely vacant (last Pokémon, no
+   replacement), it's annotated as `[b] (empty — no Pokémon
+   remaining)` so the model doesn't have to infer slot vacancy.
+3. **OPP (P2) ACTIVE / BENCH** — same shape, but bench is gated
+   chronologically by `seenSpecies` (the player only learns opp's
+   selection as they switch in).
+4. **`=== GAME-STATE LEDGER ===`** — only-when-active rows: faints
+   (always), Tera used per side (when fired), field/pseudo-weather
+   with turns-left, side conditions (screens / spikes / safeguard /
+   tailwind), volatiles on actives (substitute / encore / taunt /
+   etc.), choice locks (when item + lastMove imply one), recent item
+   events, and a **Cumulative damage** row showing per-active total
+   damage taken across past turns and turns-on-field. Empty rows
+   omit; the section is dense but compact.
+5. **`=== TURN-BY-TURN (game N) ===`** — every prior turn this game
+   rendered as one-liners, indented continuation. No length cap.
+   Sequence-aware reasoning is the entire point — we don't truncate.
+6. **`=== SERIES STATE (Bo3, game N of M) ===`** *(Bo3 game ≥ 2
+   only)* — for each prior game: header (winner, turns, brought
+   rosters, Tera resolutions) followed by the **full inlined
+   turn-by-turn rollup** of that game. There used to be a `Notable`
+   heuristic line here that fired only on choice-lock + Trick Room;
+   that wasn't robust enough so we dropped it in favor of raw
+   inlining. There's a `# TODO(token-efficient-series-summary)`
+   marker — distilling priors via a learned summarizer would
+   conserve attention, but until that's built, raw is the right
+   move.
+7. **`=== YOUR SPREADS (inferred) ===`** — per-active P1 mon, every
+   tightened EV bound (one-sided constraints surface real signal that
+   earlier render thresholds hid).
+8. **`=== THREAT MATRIX (turn N, us=p1) ===`** — dual-track damage
+   envelope from `threat_matrix.py`.
+
+The total prompt is ~2,500–4,500 tokens depending on game length.
 
 ### Step 10 — Write the SFT JSONL row, update knowledge, repeat
 
@@ -605,66 +711,89 @@ final structured `assistant` content. `--dry-run` mode skips the loop
 and produces a 3-message form (system / user / placeholder assistant)
 useful for verifying orchestration without OpenAI cost.
 
-**Concrete user-prompt body** for one Bo3 turn — turn 3 of a real
-match where the series winner (Bobbo1, after `flip_match_to_winner`)
-is now P1 with Miraidon + Iron Bundle active. Both have been Snarl'd
-to -2 SpA and the inferencer has tightened P1's bounds noticeably.
+**Concrete user-prompt body** for one mid-game Bo1 turn — turn 23 of a
+real match where the series winner is P1, with Amoonguss and a
+Tera'd-Water Calyrex-Ice active and 2 unrevealed bench mons:
 
 ```
-=== TURN 3 ===
-Field: weather=Sun, terrain=Electric, P1-tailwind=no, P2-tailwind=no
+=== TURN 23 ===
+Field: weather=Rain, P1-tailwind=no, P2-tailwind=no
 
 YOUR (P1) ACTIVE:
-  [a] Miraidon    | HP 65% | item=Choice Scarf | tera=Electric | boosts=spa-2 | revealed=snarl
-  [b] Iron Bundle | HP 25% | item=Focus Sash   | tera=Ice      | boosts=spa-2 | revealed=icywind,icebeam
+  [a] Amoonguss     | HP 30% | revealed=Spore,Rage Powder
+  [b] Calyrex-Ice   | HP 50% | status=par | item=leftovers | TERA-ACTIVE (Water) | boosts=spa-1,atk+3 | revealed=Protect,Leech Seed,Trick Room,Glacial Lance
+YOUR (P1) BENCH: Flutter Mane, Incineroar
 
 OPP (P2) ACTIVE:
-  [a] Chi-Yu      | HP 72% | item=Choice Scarf | tera=Ghost    | boosts=spe-1,spa-2 | revealed=snarl
-  [b] Lunala      | HP 100%| item=Power Herb   | tera=Water
+  [b] Kyogre | HP 15% | item=leftovers | ability=drizzle
+OPP (P2) BENCH: Grimmsnarl (fainted), Annihilape (fainted), Calyrex-Ice (fainted)
+
+=== GAME-STATE LEDGER ===
+Faints:        P1 0/4   |   P2 3/4
+Tera used:     P1 ✓ Calyrex-Ice → Water on T2; P2 ✓ Annihilape → Poison on T1
+Field:         Rain (5 turns left)
+P2 side:       reflect L1
+Item events:   P1[a] Focus Sash consumed (T1); P1[a] Eject Button consumed (T2)
+Cumulative:    P1[a] Amoonguss took 69% across 1 hit(s) over 13 turn(s) on field
+               P1[b] Calyrex-Ice took 189% across 6 hit(s) over 22 turn(s) on field
+               P2[b] Kyogre took 31% across 1 hit(s) over 8 turn(s) on field
+
+=== TURN-BY-TURN (game 1) ===
+T1: P1[b] Fake Out → P2[a] 95%
+    P2[a] couldn't move (flinch)
+    …(22 prior turns)…
+T22: P1[a] Spore → P2[a] sleep
+     P1[b] Glacial Lance (spread) → P2[a] 0% KO, P2[b] 22%
+     P2 switched P2[a]: (empty slot) → Kyogre
 
 === YOUR SPREADS (inferred) ===
-  Miraidon:    Hp 0–35,  Atk ?, Def ?, Spa ?, Spd 0–11, Spe ?
-  Iron Bundle: Hp 0–59,  Atk ?, Def ?, Spa ?, Spd 0–43, Spe ?
+  Amoonguss:    HP ≤91, Def ≤120, others ?
+  Calyrex-Ice:  HP ≤140, others ?
 
-=== THREAT MATRIX  (turn 3, us=p1) ===
+=== THREAT MATRIX  (turn 23, us=p1) ===
 
 --- OUTGOING (us → opp) ---
-[us Miraidon]  (boosts={spa: -2})
-  Electro Drift → Chi-Yu      29.5%–44.6%  | meta 35.8%–42.3%  [guaranteed 3HKO]
-  Electro Drift → Lunala       7.8%–15.1%  | meta 11.3%–13.3%  [possible 8HKO]
-  Volt Switch  → Chi-Yu      20.5%–32.3%  | meta 24.8%–30.7%  [99.9% chance to 4HKO]
-  Draco Meteor → Chi-Yu      29.5%–44.6%  | meta 35.8%–42.3%  [guaranteed 3HKO]
-  …plus 1 chip move(s): Snarl
+[us Calyrex-Ice]  (boosts={atk: +3, spa: -1})
+  Glacial Lance → Kyogre  20.5%–48.6%  | meta 38.3%–45.3%  [guaranteed 2HKO]
+  …plus 2 chip moves: Protect, Leech Seed
 
 --- INCOMING (opp → us) ---
-[opp Chi-Yu]  (boosts={spe: -1, spa: -2})
-  Dark Pulse  → Miraidon       17.3%–22.3%  [possible 5HKO]                 (off-meta)
-  Heat Wave [spread]: Miraidon 11.7%–13.7%, Iron Bundle 47.8%–62.6%
-                                            [Iron Bundle: guaranteed 2HKO]  (off-meta)
-  Overheat   → Iron Bundle    85.5%–116.8%  [87.5% chance to OHKO]          (off-meta)
-[opp Lunala]
-  Moongeist Beam → Iron Bundle  76.1%–119.8%  | meta 109.1%–129.5%  [guaranteed OHKO]
-  Meteor Beam   → Iron Bundle 179.7%–287.0%  | meta 260.6%–307.6%  [guaranteed OHKO]
+[opp Kyogre]
+  Water Spout → Calyrex-Ice  6.8%–11.2%  | meta 8.4%–10.0%  [possible 9HKO]
+  …plus 2 chip moves: Origin Pulse, Ice Beam
 ```
+
+For a Bo3 game-2-or-later turn, an additional `=== SERIES STATE (Bo3,
+game 2 of 3) ===` block sits between TURN-BY-TURN and YOUR SPREADS,
+inlining the full action log of every prior game in the series.
 
 The structured ground-truth label (the human's actual play, kept *out*
 of saved messages but supplied to the teacher LLM during synthesis):
 
 ```json
 {
-  "slot_1": {"action_type": "move", "move": "Snarl",       "target": "spread", "tera": false},
-  "slot_2": {"action_type": "move", "move": "Meteor Beam", "target": "p2a",    "tera": false}
+  "slot_1": {"action_type": "move", "move": "Spore",         "target": "p2b", "tera": false, "switch_to": null},
+  "slot_2": {"action_type": "move", "move": "Glacial Lance", "target": "spread", "tera": false, "switch_to": null}
 }
 ```
 
-A real teacher LLM run (with `OPENAI_API_KEY` set) would replace the
-final assistant message with a `pre_tool_thought` chain that justifies
-this play — likely *"Snarl from Miraidon further drops both
-opponents' SpA, neutering them; Lunala fires Meteor Beam at Chi-Yu to
-deny Choice Scarf cleanup. Considered Volt Switch alternative — calc
-shows 20–32% on Chi-Yu, doesn't compensate for losing the SpA debuff
-this turn."* — followed by 0–2 calc tool calls verifying decisive
-hypotheticals.
+A real teacher LLM run replaces the final assistant message with a
+`submit_decision` tool call carrying a `pre_tool_thought` chain that
+justifies this play — likely *"Amoonguss Spores Kyogre to take it out
+of the picture for several turns; +3 Calyrex-Ice's Glacial Lance pins
+Kyogre to a guaranteed 2HKO and threatens any switch-in. Considered
+Leech Seed instead — the recovery isn't worth the lost damage this
+turn."* — preceded by 1–2 `calculate_damage` tool calls verifying
+decisive hypotheticals.
+
+**Action shapes.** A slot's action is one of:
+
+- `move` — `move`, `target` (`p2a` / `p2b` / `spread` / `self`),
+  `tera` (bool).
+- `switch` — `switch_to` (species name).
+- `pass` — slot is genuinely vacant (last Pokémon, no replacement
+  available) or the mon couldn't act (sleep / paralysis / flinch /
+  disable). Real Pokémon mechanics, not a "do nothing" option.
 
 **After the row is written**, we filter the same `events` stream
 through `damage_inferencer.events_to_damage_events()` (keeping only
@@ -683,32 +812,56 @@ OpenAI run 429s and we need to pick up where we left off.
 
 ## Where we are, what's next
 
-**Current state:** end-to-end pipeline works in `--dry-run` mode (no
-OpenAI call). One match through the orchestrator produces 5 SFT examples
-covering damage moves, switches, status moves, and spread moves with
-correctly-extracted ground-truth labels.
+**Current state:** end-to-end pipeline works in both `--dry-run` mode
+and live with provider adapters for OpenAI, Anthropic, and Google
+(`teacher_openai.py` / `teacher_anthropic.py` / `teacher_google.py`).
+One match through the orchestrator produces 8–10 SFT rows covering
+damage moves, switches, status moves, and spread moves with
+correctly-extracted ground-truth labels and the new historical-context
+prompt structure.
 
 **Rough scale:** 13,919 matches × ~5 turns/match × ~70% extractable ≈
-**~50k SFT examples** at full corpus scale. At GPT-4o pricing, the
-synthesis run is roughly $1.5K–$3K — manageable, but worth running
-the first ~100 matches and inspecting before committing.
+**~50k SFT examples** at full corpus scale. At gpt-5.5 pricing the
+synchronous run is roughly $2K–$3K. The deferred batch orchestrator
+(OpenAI Batch / Anthropic Message Batches / Vertex batch) would
+roughly halve that.
+
+**What's landed beyond the original walkthrough:**
+
+- Provider-agnostic teacher LLM (OpenAI / Anthropic / Google).
+- `submit_decision` tool architecture (replaced `response_format`).
+- Historical-context user prompt (GAME-STATE LEDGER with Cumulative
+  damage row, TURN-BY-TURN, SERIES STATE with full prior-game
+  rollups, empty-slot annotation, present-tense system prompt).
+- Symmetric brought-set bench rendering with perspective gating in
+  Python (`seenSpecies`); Tera-form aliasing for Terapagos / Ogerpon.
+- Move-caller filter expanded (Mirror Move / Assist / Nature Power
+  added to NON_OWN_CALLERS).
+- Choice-lock detection working (uses OTS-resolved item, normalizes
+  move ID → display name via the dex).
+- `bakeoff.py` for head-to-head provider comparison.
+- One-sided EV constraint rendering in the YOUR SPREADS block.
 
 **What we still want:**
 
-1. **Real OpenAI run on the first 1 match → 10 → 100 → full**, with
+1. **Bake-off** to pick a teacher LLM provider on the production
+   prompt.
+2. **`batch_orchestrator.py`** — coordinated multi-batch tool-use
+   loop (~50% off via batch APIs, $1K+ savings on full corpus).
+3. **Real run on the first 1 match → 10 → 100 → full**, with
    spot-checks on CoT quality at each step.
-2. **A holdout eval set** — withhold a few hundred matches, measure
+4. **A holdout eval set** — withhold a few hundred matches, measure
    whether the trained model's plays match the human's labels.
-3. **A separate selection-model SFT corpus** — the team-preview 4-of-6
-   pick is a different decision (matchup theory, no tactical state)
-   and deserves its own model. Sibling workstream to this orchestrator.
-4. **Minimax / MCTS distillation for the alternatives loop** — replaces
-   the current prompt-driven Alternatives Rule (which lets the teacher
-   cherry-pick weak alternatives because it knows the answer) with a
-   real search step. Tracked as `# TODO(rlhf-followup)` in
-   `teacher_llm.py`.
-5. **RLHF on top** — once SFT gives us a model that can think like a
-   pro, RLHF gives it the chance to outclass one. The SFT corpus we're
-   building here is the floor, not the ceiling.
+5. **A separate selection-model SFT corpus** — the team-preview
+   4-of-6 pick is a different decision (matchup theory, no tactical
+   state) and deserves its own model.
+6. **Minimax / MCTS distillation for the alternatives loop** —
+   replaces the current prompt-driven Alternatives Rule (which lets
+   the teacher cherry-pick weak alternatives because it knows the
+   answer) with a real search step. Tracked as
+   `# TODO(rlhf-followup)` in `teacher_llm.py`.
+7. **RLHF on top** — once SFT gives us a model that can think like a
+   pro, RLHF gives it the chance to outclass one. The SFT corpus
+   we're building here is the floor, not the ceiling.
 
 But the floor is the hard part. That's what's done.
