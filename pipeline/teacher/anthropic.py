@@ -21,7 +21,7 @@ from typing import Any
 import aiohttp
 from anthropic import AsyncAnthropic
 
-from teacher_llm import (
+from .base import (
     CALCULATE_DAMAGE_TOOL,
     DEFAULT_CALC_URL,
     MAX_TOOL_ITERATIONS,

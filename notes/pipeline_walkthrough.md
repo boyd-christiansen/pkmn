@@ -816,7 +816,8 @@ OpenAI run 429s and we need to pick up where we left off.
 
 **Current state:** end-to-end pipeline works in both `--dry-run` mode
 and live with provider adapters for OpenAI, Anthropic, and Google
-(`teacher_openai.py` / `teacher_anthropic.py` / `teacher_google.py`).
+(`teacher/openai.py` / `teacher/anthropic.py` / `teacher/google.py`,
+all re-exported via `teacher/__init__.py`).
 One match through the orchestrator produces 8–10 SFT rows covering
 damage moves, switches, status moves, and spread moves with
 correctly-extracted ground-truth labels and the new historical-context
@@ -861,7 +862,7 @@ roughly halve that.
    replaces the current prompt-driven Alternatives Rule (which lets
    the teacher cherry-pick weak alternatives because it knows the
    answer) with a real search step. Tracked as
-   `# TODO(rlhf-followup)` in `teacher_llm.py`.
+   `# TODO(rlhf-followup)` in `teacher/base.py`.
 7. **RLHF on top** — once SFT gives us a model that can think like a
    pro, RLHF gives it the chance to outclass one. The SFT corpus
    we're building here is the floor, not the ceiling.

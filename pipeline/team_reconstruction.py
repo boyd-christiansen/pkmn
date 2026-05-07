@@ -1,0 +1,112 @@
+"""Team reconstruction helpers — extract per-side team info from parsed match games.
+
+Pipeline role:
+    Used by `master_pipeline.py` to seed knowledge states and render the
+    Bo1 system-prompt team block, and by `prompt_formatting.py` for
+    species-key normalization.
+
+Isolation contract:
+    Pure data transforms over snapshots. No I/O, no LLM, no calc service.
+    Imports nothing from sibling pipeline modules.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+
+def _species_key(s: str) -> str:
+    """Normalize a species name to its lowercase, alphanumeric-only form.
+
+    Used as a stable key for cross-snapshot identity (e.g.
+    "Calyrex-Shadow" → "calyrexshadow"). Same convention used downstream
+    by `damage_inferencer` and `threat_matrix`.
+    """
+    return "".join(c for c in s.lower() if c.isalnum())
+
+
+def reconstruct_p1_team(games: list[dict]) -> dict[str, dict[str, Any]]:
+    """Forward-scan all snapshots in a match, aggregate revealed P1 info per species.
+
+    Pads each Pokémon's move list to exactly 4 with `"[UNREVEALED_MOVE]"`.
+    """
+    aggregated: dict[str, dict[str, Any]] = {}
+
+    def _ensure(species: str) -> dict[str, Any]:
+        return aggregated.setdefault(
+            species,
+            {
+                "species": species,
+                "item": None,
+                "ability": None,
+                "teraType": None,
+                "isTerastallized": False,
+                "moves": [],
+            },
+        )
+
+    for game in games:
+        for snap in game.get("snapshots", []):
+            for p in snap.get("p1", {}).get("active", []):
+                entry = _ensure(p["species"])
+                if p.get("item") and not entry["item"]:
+                    entry["item"] = p["item"]
+                if p.get("ability") and not entry["ability"]:
+                    entry["ability"] = p["ability"]
+                if p.get("teraType") and not entry["teraType"]:
+                    entry["teraType"] = p["teraType"]
+                if p.get("isTerastallized"):
+                    entry["isTerastallized"] = True
+                for mv in p.get("revealedMoves") or []:
+                    if mv not in entry["moves"]:
+                        entry["moves"].append(mv)
+            for b in snap.get("p1", {}).get("bench", []):
+                _ensure(b["species"])
+
+    for entry in aggregated.values():
+        while len(entry["moves"]) < 4:
+            entry["moves"].append("[UNREVEALED_MOVE]")
+        entry["moves"] = entry["moves"][:4]
+
+    return aggregated
+
+
+def reconstruct_p2_species(games: list[dict]) -> list[str]:
+    """Union of every P2 species observed (active or bench) across the match."""
+    seen: list[str] = []
+    for game in games:
+        for snap in game.get("snapshots", []):
+            for p in snap.get("p2", {}).get("active", []) + snap.get("p2", {}).get("bench", []):
+                if p["species"] not in seen:
+                    seen.append(p["species"])
+    return seen
+
+
+def team_sheets_for_match(games: list[dict]) -> dict[str, list[dict]] | None:
+    """Return the first non-null `teamSheets` from any game in the match.
+
+    All games in a Bo3 series carry the same sheet, so we just take the
+    earliest one available. None means CTS for the whole match.
+    """
+    for g in games:
+        sheets = g.get("teamSheets")
+        if sheets and sheets.get("p1") and sheets.get("p2"):
+            return sheets
+    return None
+
+
+def brought_species_keys_for_game(game: dict) -> set[str]:
+    """Species (normalized keys) actually brought by P1 to this single game.
+
+    Since the parser now emits P1 bench as the full pre-scanned brought-set
+    on every snapshot, the union of P1 active + P1 bench at any single
+    snapshot already gives the brought 4. We still take the union across
+    snapshots as a safety net (handles edge cases where a brought species
+    only appears in one of the two structures).
+    """
+    out: set[str] = set()
+    for snap in game.get("snapshots", []):
+        for p in snap.get("p1", {}).get("active", []):
+            out.add(_species_key(p["species"]))
+        for b in snap.get("p1", {}).get("bench", []):
+            out.add(_species_key(b["species"]))
+    return out

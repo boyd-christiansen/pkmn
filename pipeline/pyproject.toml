@@ -17,4 +17,15 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["replay_parser", "threat_matrix", "teacher_llm", "master_pipeline"]
+py-modules = [
+    "replay_parser",
+    "canonical_priors",
+    "damage_inferencer",
+    "threat_matrix",
+    "team_reconstruction",
+    "action_extraction",
+    "prompt_formatting",
+    "master_pipeline",
+    "bakeoff",
+]
+packages = ["teacher"]

@@ -12,7 +12,7 @@ Reg I doubles). Four self-contained components under one umbrella:
 |---|---|---|
 | `data_scraper/` | Python | Pulls top-500 ladder users + replays from Pokémon Showdown. |
 | `calc_microservice/` | Node + TS | HTTP wrapper for `@smogon/calc`, `@pkmn/client`, `@pkmn/dex` (3 endpoints). |
-| `pipeline/` | Python | 6 atomic modules ending in `master_pipeline.py`, which writes the SFT JSONL. |
+| `pipeline/` | Python | Atomic modules + a `teacher/` sub-package. Orchestrator is `master_pipeline.py`, which writes the SFT JSONL. See `pipeline/README.md` for the full file map. |
 | `notes/` | — | Free-form planning notes. |
 
 The SFT generation pipeline is **complete end-to-end**. Status of each piece
@@ -178,16 +178,18 @@ pipeline/parsed_data/sft_training_data.jsonl   # one fine-tuning example per tur
   trained as if playing live — wording like "you don't yet know
   which 4 they will bring" / "you'll learn that as the battle
   unfolds." Don't reintroduce past-tense framing when editing
-  templates in `teacher_llm.py`.
+  templates in `teacher/base.py`.
 
 ## Provider-agnostic teacher LLM
 
-The teacher LLM tool-loop now goes through a `TeacherProvider` ABC
-(`teacher_llm.py`) with three concrete adapters:
+The teacher LLM tool-loop goes through a `TeacherProvider` ABC
+(`pipeline/teacher/base.py`) with three concrete adapters in the
+`pipeline/teacher/` sub-package, all re-exported via `teacher/__init__.py`
+so callers write `from teacher import TeacherProvider, OpenAIProvider`:
 
-- `teacher_openai.py` — `gpt-5.5` (default) / `gpt-5.5-pro` / `gpt-5.5-mini` etc. via the OpenAI SDK.
-- `teacher_anthropic.py` — `claude-sonnet-4-6` (default) / `claude-opus-4-7` / `claude-haiku-4-5` etc. via the Anthropic SDK.
-- `teacher_google.py` — `gemini-3.1-pro-preview` (default) / `gemini-3.1-flash-preview` etc. via the `google-genai` SDK.
+- `teacher/openai.py` — `gpt-5.5` (default) / `gpt-5.5-pro` / `gpt-5.5-mini` etc. via the OpenAI SDK.
+- `teacher/anthropic.py` — `claude-sonnet-4-6` (default) / `claude-opus-4-7` / `claude-haiku-4-5` etc. via the Anthropic SDK.
+- `teacher/google.py` — `gemini-3.1-pro-preview` (default) / `gemini-3.1-flash-preview` etc. via the `google-genai` SDK.
 
 Each adapter implements the same `submit_decision`-tool architecture:
 the model **must** call `calculate_damage` at least once before calling
@@ -265,7 +267,7 @@ against the provider's pricing page before scaling to the full corpus.
 - **Minimax / MCTS distillation for the tool-use loop** — replaces the
   current prompt-driven Alternatives Rule (teacher cherry-picks
   alternatives because it already knows the answer) with a proper
-  search step. See `# TODO(rlhf-followup)` in `teacher_llm.py`.
+  search step. See `# TODO(rlhf-followup)` in `teacher/base.py`.
 - **Migrate `master_pipeline` default provider to the bake-off winner**
   once empirical results are in. Today's default is `openai/gpt-5.5`;
   whichever provider wins the bake-off becomes the next default.

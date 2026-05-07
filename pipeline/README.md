@@ -1,11 +1,27 @@
 # pipeline
 
 Atomic Python modules that turn raw Pokémon Showdown replays into SFT-ready
-conversational training data. The six core modules — `replay_parser.py`,
-`canonical_priors.py`, `damage_inferencer.py`, `threat_matrix.py`,
-`teacher_llm.py`, and `master_pipeline.py` — plus three teacher-provider
-adapters (`teacher_openai.py`, `teacher_anthropic.py`, `teacher_google.py`)
-and a `bakeoff.py` head-to-head runner.
+conversational training data.
+
+```
+pipeline/
+├── replay_parser.py          # raw replay JSONs → per-turn snapshot JSONL
+├── canonical_priors.py       # Smogon chaos data lookup (no network)
+├── damage_inferencer.py      # binary-search EV bound inference
+├── threat_matrix.py          # dual-track damage envelope per turn
+├── team_reconstruction.py    # P1 team / brought-set / sheet helpers
+├── action_extraction.py      # winner-flip + extract_p1_actions
+├── prompt_formatting.py      # 8-section user-prompt composer
+├── master_pipeline.py        # CLI orchestrator (the only file allowed
+│                             #   to import from every other module here)
+├── bakeoff.py                # head-to-head provider runner
+└── teacher/                  # provider-agnostic teacher LLM
+    ├── __init__.py           # re-exports for `from teacher import ...`
+    ├── base.py               # TeacherProvider ABC, schemas, prompts
+    ├── openai.py             # OpenAI adapter
+    ├── anthropic.py          # Anthropic adapter
+    └── google.py             # Google adapter
+```
 
 ## Setup
 
@@ -252,14 +268,25 @@ already disproven.
   …plus 1 chip move(s): Snarl
 ```
 
-### `teacher_llm.py` *(implemented)*
+### `teacher/` sub-package *(implemented)*
 
-Drives a frontier OpenAI model through a tool-calling loop, eliciting a
-chain-of-thought that JUSTIFIES a known human play. Returns OpenAI-fine-
-tuning-ready conversation messages.
+Provider-agnostic tool-calling loop that elicits a chain-of-thought
+JUSTIFYING a known human play. The model has only one output channel
+— tool calls — so it can't bypass the calc tool; commits via the
+`submit_decision` tool.
 
-- **API:** `await synthesize_turn(system_prompt, user_prompt, human_action,
-  *, tools_allowed=True, ...)` → `list[dict] | None`.
+- **Layout:** `teacher/base.py` carries the `TeacherProvider` ABC, the
+  `calculate_damage` and `submit_decision` tool schemas, the system-
+  prompt templates, the cost-table, and a shared `_call_calc` helper.
+  Concrete adapters in `teacher/openai.py`, `teacher/anthropic.py`,
+  `teacher/google.py` each implement `synthesize_turn` against their
+  SDK's tool-call format. `teacher/__init__.py` re-exports the public
+  surface so call sites use `from teacher import TeacherProvider,
+  OpenAIProvider`.
+- **API:** `await provider.synthesize_turn(system_prompt, user_prompt,
+  human_action, ...)` → `ProviderResult` with `.messages: list[dict]
+  | None`, `.iterations`, `.input_tokens`, `.output_tokens`,
+  `.calc_calls`, `.cost_usd`, `.elapsed_seconds`, `.error`.
 - **Tools exposed to the LLM:** `calculate_damage` — JSON schema mirrors
   `/calc`'s payload (Pokémon × move × field, with `isCrit` / `evs` / `nature`
   / etc. all optional).
@@ -448,10 +475,11 @@ raw replay JSON
 | `canonical_priors.py` | Working. Library + bootstrap CLI. Reads Smogon Chaos JSON when present; falls back to curated table → heuristic. |
 | `damage_inferencer.py` | Working. Dual-state, two-way binary search, atomic apply, 508-EV constraint pass, crit-aware via `/calc isCrit`, multi-hit filter, `events_to_damage_events()` filter for non-own-move callers (Metronome / Copycat / Sketch / Snatch / Me First / Dancer / Instruct / Mirror Move / Assist / Nature Power excluded; Sleep Talk allowed). |
 | `threat_matrix.py` | Working. Dual-track Absolute + Probable output. When canonical priors are ≥40-EV-clipped by the inferred bounds, the Probable column is dropped and the line tagged `(off-meta)`. Optional `format_id` drives Smogon-backed priors. |
-| `teacher_llm.py` | Provider-agnostic core: `TeacherProvider` ABC, schemas (incl. `submit_decision` tool), prompt templates (6 rules: Masking/OTS, Tool, Threat-Matrix, Spread, Alternatives, Output), ground-truth stripping. Present-tense system prompts. `# TODO(rlhf-followup)` flags the prompt-driven alternative evaluation as temporary. |
-| `teacher_openai.py` | OpenAI adapter; default model `gpt-5.5`. Forces `calculate_damage` on iter 0, `tool_choice=required` thereafter. Default provider. |
-| `teacher_anthropic.py` | Anthropic adapter; default model `claude-sonnet-4-6`. Same tool-loop semantics. |
-| `teacher_google.py` | Google adapter; default model `gemini-3.1-pro-preview`. Same tool-loop semantics. |
+| `teacher/base.py` | Provider-agnostic core: `TeacherProvider` ABC, schemas (incl. `submit_decision` tool), prompt templates (6 rules: Masking/OTS, Tool, Threat-Matrix, Spread, Alternatives, Output), ground-truth stripping. Present-tense system prompts. `# TODO(rlhf-followup)` flags the prompt-driven alternative evaluation as temporary. |
+| `teacher/openai.py` | OpenAI adapter; default model `gpt-5.5`. Forces `calculate_damage` on iter 0, `tool_choice=required` thereafter. Default provider. |
+| `teacher/anthropic.py` | Anthropic adapter; default model `claude-sonnet-4-6`. Same tool-loop semantics. |
+| `teacher/google.py` | Google adapter; default model `gemini-3.1-pro-preview`. Same tool-loop semantics. |
+| `team_reconstruction.py` / `action_extraction.py` / `prompt_formatting.py` | Helper modules split out of the orchestrator so `master_pipeline.py` stays focused on CLI + per-match async loop. `bakeoff.py` imports from these directly rather than from `master_pipeline`. |
 | `bakeoff.py` | Head-to-head bake-off runner. Reports per-provider cost, tool-call rate, CoT length, action-match rate. |
 | `master_pipeline.py` | Working. `flip_match_to_winner` makes every SFT example come from the series winner's perspective; inferred-spread block (one-sided constraints) in user prompt; per-format system prompt branch; three new historical-context blocks (`GAME-STATE LEDGER` with Cumulative damage row, `TURN-BY-TURN`, `SERIES STATE` with full prior-game rollups); explicit empty-slot annotation for last-Pokémon scenarios; perspective-aware bench rendering (P1: full brought-set, P2: chronological via `seenSpecies`); `--provider {openai,anthropic,google}` flag. `--dry-run` exercises orchestration without LLM cost. |
 
@@ -484,4 +512,4 @@ raw replay JSON
   genuinely-competitive alternative plays for the teacher to articulate
   rejection of. The current approach has the teacher cherry-picking
   weak alternatives because it knows the answer. See the
-  `# TODO(rlhf-followup)` in `teacher_llm.py`.
+  `# TODO(rlhf-followup)` in `teacher/base.py`.

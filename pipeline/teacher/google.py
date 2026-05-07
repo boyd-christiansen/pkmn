@@ -21,7 +21,7 @@ import aiohttp
 from google import genai
 from google.genai import types as genai_types
 
-from teacher_llm import (
+from .base import (
     CALCULATE_DAMAGE_TOOL,
     DEFAULT_CALC_URL,
     MAX_TOOL_ITERATIONS,

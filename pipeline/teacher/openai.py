@@ -18,7 +18,7 @@ from typing import Any
 import aiohttp
 from openai import AsyncOpenAI
 
-from teacher_llm import (
+from .base import (
     CALCULATE_DAMAGE_TOOL,
     DEFAULT_CALC_URL,
     DEFAULT_MODEL,

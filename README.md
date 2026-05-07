@@ -15,7 +15,7 @@ without touching the others.
 |---|---|---|
 | [`data_scraper/`](data_scraper/) | Python 3.11+ | Pulls top-500 ladder users + all their saved replays from Pokémon Showdown. |
 | [`calc_microservice/`](calc_microservice/) | Node 20+ / TS | HTTP service wrapping `@smogon/calc` (`POST /calc`), `@pkmn/client` + `@pkmn/sets` (`POST /parse_log` — per-turn snapshots, `events` stream, and Bo3 OTS `teamSheets`), and `@pkmn/dex` (`GET /dex/move/:name`). |
-| [`pipeline/`](pipeline/) | Python 3.11+ | Atomic modules that turn raw replays into SFT-ready conversational training data. The six core modules — `replay_parser`, `canonical_priors`, `damage_inferencer`, `threat_matrix`, `teacher_llm`, `master_pipeline` — plus three teacher-provider adapters (`teacher_openai`, `teacher_anthropic`, `teacher_google`) and a head-to-head `bakeoff` runner. |
+| [`pipeline/`](pipeline/) | Python 3.11+ | Atomic modules that turn raw replays into SFT-ready conversational training data. Inference modules (`replay_parser`, `canonical_priors`, `damage_inferencer`, `threat_matrix`); orchestration helpers split out of the orchestrator (`team_reconstruction`, `action_extraction`, `prompt_formatting`); the orchestrator + CLI (`master_pipeline`); a `teacher/` sub-package holding the `TeacherProvider` ABC plus OpenAI / Anthropic / Google adapters; and a head-to-head `bakeoff` runner. |
 | [`notes/`](notes/) | — | Free-form planning notes (data sourcing options, scope decisions, etc). |
 
 ## Pipeline overview
@@ -49,7 +49,8 @@ Pokémon Showdown
 │         │    when the prior is ≥40-EV-clipped, drop the meta             │
 │         │    column and tag the line `(off-meta)`)                       │
 │         ▼                                                                │
-│  teacher_llm.py       ── HTTP ────────────▶  frontier model              │
+│  teacher/             ── HTTP ────────────▶  frontier model              │
+│   (base + openai/anthropic/google adapters behind one ABC)               │
 │         │                                                                │
 │         ▼                                                                │
 │  master_pipeline.py  →  conversational SFT .jsonl                        │
@@ -196,7 +197,7 @@ ANTHROPIC_API_KEY=sk-... .venv/bin/python master_pipeline.py \
 | `pipeline/canonical_priors.py` | Working. Library + bootstrap CLI. Real Smogon Chaos JSON when cached on disk; curated table + heuristic fallback. |
 | `pipeline/damage_inferencer.py` | Working. Dual-state, two-way binary search, atomic application, 508-EV constraint pass, crit-aware (via `/calc isCrit`), multi-hit filter, `events_to_damage_events()` filter that excludes non-own-move callers (Metronome / Copycat / Sketch / Snatch / Me First / Dancer / Instruct / Mirror Move / Assist / Nature Power; Sleep Talk allowed). |
 | `pipeline/threat_matrix.py` | Working. Dual-track Absolute + Probable output. When canonical priors are ≥40-EV-clipped by the inferred bounds, the Probable column is dropped and the line tagged `(off-meta)`. Optional `format_id` drives chaos-backed priors. |
-| `pipeline/teacher_llm.py` + `teacher_openai.py` / `teacher_anthropic.py` / `teacher_google.py` | Working. Provider-agnostic `TeacherProvider` ABC; tool-use loop with `calculate_damage` + `submit_decision`. The model has only one output channel — tool calls — so it can't bypass the calc tool. Two system-prompt templates: Bo1 CTS (Masking Rule + reconstructed team) vs Bo3 OTS (full sheets + ★ brought-flag). Present-tense framing throughout. |
+| `pipeline/teacher/` (sub-package: `base.py` + `openai.py` / `anthropic.py` / `google.py`, re-exported via `__init__.py`) | Working. Provider-agnostic `TeacherProvider` ABC; tool-use loop with `calculate_damage` + `submit_decision`. The model has only one output channel — tool calls — so it can't bypass the calc tool. Two system-prompt templates: Bo1 CTS (Masking Rule + reconstructed team) vs Bo3 OTS (full sheets + ★ brought-flag). Present-tense framing throughout. |
 | `pipeline/master_pipeline.py` | Working. CLI orchestrator. `flip_match_to_winner` makes every example come from the series winner's perspective. Three historical-context blocks in the user prompt (GAME-STATE LEDGER / TURN-BY-TURN / SERIES STATE). One-sided EV constraint rendering. Empty-slot annotation. Perspective-aware bench gating (P1: full brought-set, P2: chronological via `seenSpecies`). `--provider {openai,anthropic,google}` flag. Resumable. |
 | `pipeline/bakeoff.py` | Working. Runs the same match through multiple providers in lockstep and reports per-row cost, tool-call rate, action-match rate, CoT length, wall-clock. |
 

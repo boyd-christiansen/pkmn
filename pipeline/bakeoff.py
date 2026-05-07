@@ -36,18 +36,24 @@ import threat_matrix
 from master_pipeline import (
     DEFAULT_BO3_INPUT,
     DEFAULT_PARSED_DATA_DIR,
+)
+from action_extraction import (
     extract_p1_actions,
     flip_match_to_winner,
+    slot_action,
+)
+from prompt_formatting import (
     format_p1_inferred_spreads_block,
     format_p1_team_block,
     format_user_prompt,
+)
+from team_reconstruction import (
+    brought_species_keys_for_game,
     reconstruct_p1_team,
     reconstruct_p2_species,
-    _slot_action,
-    _team_sheets_for_match,
-    _brought_species_keys_for_game,
+    team_sheets_for_match,
 )
-from teacher_llm import (
+from teacher import (
     ProviderResult,
     TeacherProvider,
     render_system_prompt,
@@ -63,21 +69,21 @@ def _build_providers(selected: set[str]) -> list[TeacherProvider]:
 
     if "openai" in selected:
         if os.environ.get("OPENAI_API_KEY"):
-            from teacher_openai import OpenAIProvider
+            from teacher import OpenAIProvider
             providers.append(OpenAIProvider())
         else:
             click.echo("[skip] openai — OPENAI_API_KEY not set", err=True)
 
     if "anthropic" in selected:
         if os.environ.get("ANTHROPIC_API_KEY"):
-            from teacher_anthropic import AnthropicProvider
+            from teacher import AnthropicProvider
             providers.append(AnthropicProvider())
         else:
             click.echo("[skip] anthropic — ANTHROPIC_API_KEY not set", err=True)
 
     if "google" in selected:
         if os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY"):
-            from teacher_google import GoogleProvider
+            from teacher import GoogleProvider
             providers.append(GoogleProvider())
         else:
             click.echo("[skip] google — GOOGLE_API_KEY (or GEMINI_API_KEY) not set", err=True)
@@ -143,7 +149,7 @@ async def _bakeoff_one_match(
         return
 
     match_format = match_record.get("format", "bo1")
-    team_sheets = _team_sheets_for_match(games) if match_format == "bo3" else None
+    team_sheets = team_sheets_for_match(games) if match_format == "bo3" else None
 
     p1_team_recon = reconstruct_p1_team(games)
     if team_sheets:
@@ -177,7 +183,7 @@ async def _bakeoff_one_match(
         snapshots = game.get("snapshots") or []
 
         if team_sheets:
-            brought = _brought_species_keys_for_game(game)
+            brought = brought_species_keys_for_game(game)
             system_prompt = render_system_prompt_bo3(
                 p1_sheet=team_sheets["p1"],
                 p2_sheet=team_sheets["p2"],
@@ -197,8 +203,8 @@ async def _bakeoff_one_match(
                 continue
 
             human_action = {
-                "slot_1": human_action_dict.get("a", _slot_action("pass")),
-                "slot_2": human_action_dict.get("b", _slot_action("pass")),
+                "slot_1": human_action_dict.get("a", slot_action("pass")),
+                "slot_2": human_action_dict.get("b", slot_action("pass")),
             }
             human_norm = _normalize_action({"slot_1": human_action["slot_1"],
                                             "slot_2": human_action["slot_2"]})
