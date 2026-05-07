@@ -152,10 +152,17 @@ via binary search against the calc microservice.
   multiplier and bypasses the defender's positive boosts, so the inference
   remains valid for crit observations.
 - **Multi-hit filter.** Triple Axel / Bullet Seed / Population Bomb / etc.
-  emit one `DamageEvent` per hit. The inferencer counts same
-  `(attacker_slot, move_name, defender_slot)` tuples per turn and **skips
-  all of them** if the count > 1 — supporting them properly would need
-  `/calc` to accept a `hits` field and the events to be aggregated upstream.
+  put multiple entries in a single move event's `hits[]` array (typically
+  all targeting the same defender). `events_to_damage_events()` flattens
+  these into multiple `DamageEvent` objects, then the inferencer counts
+  same `(attacker_slot, move_name, defender_slot)` tuples per turn and
+  **skips all of them** if the count > 1 — supporting them properly would
+  need `/calc` to accept a `hits` field.
+- **Caller filter.** `events_to_damage_events()` keeps only `type=="move"`
+  events with `called_via in {None, "Sleep Talk"}`. Metronome / Copycat /
+  Sketch / Snatch / Me First / Dancer / Instruct hits are excluded —
+  those moves may not be in the user's actual kit and would corrupt EV
+  bounds.
 - **508-EV total constraint.** After the six binary searches, a cheap pass
   enforces the 508-EV usable budget per Pokémon: `max_evs[s] ≤ 508 −
   (sum_of_other_min_evs)`. Once one or two stats are known to be heavily
@@ -167,10 +174,12 @@ via binary search against the calc microservice.
 - **Skip rules:** Status-category moves, missing slots, multi-hit
   occurrences, and observations with no consistent EV in `[0, 252]` (data
   inconsistency — bounds left untouched).
-- **Source of `action_log`:** `/parse_log` now emits per-turn `actionLog`
-  arrays inline with each snapshot. The orchestrator pairs
-  `snapshot[N].actionLog` with `snapshot_pre = snapshot[N]`,
-  `snapshot_post = snapshot[N+1]`.
+- **Source of `events`:** `/parse_log` emits per-turn `events` arrays
+  (TurnEvent discriminated union) inline with each snapshot. The
+  orchestrator pairs `snapshot[N].events` with `snapshot_pre =
+  snapshot[N]`, `snapshot_post = snapshot[N+1]`. Use
+  `damage_inferencer.events_to_damage_events()` to filter the stream
+  for inference-eligible damage observations.
 
 ### Format split: CTS (Bo1) vs OTS (Bo3)
 
@@ -278,10 +287,11 @@ per identifiable turn, writes to `parsed_data/sft_training_data.jsonl`.
 perspective of the player who won the series (Bo3: 2 of 3 games; Bo1:
 the per-game winner). `flip_match_to_winner` rewrites the entire match
 record — `players[0] ↔ players[1]`, every snapshot's `p1 ↔ p2` and
-`tailwindP1 ↔ tailwindP2`, every `actionLog` event's slot identifiers
-(`p1a ↔ p2a`, `p1b ↔ p2b`), and per-game `teamSheets.p1 ↔ teamSheets.p2`
-— so all downstream code (action extraction, threat matrix, system
-prompt rendering) reads "p1" as the winner from this point on.
+`tailwindP1 ↔ tailwindP2` (plus `tailwindP*TurnsLeft`), every
+`events[i]` slot/side fields (per discriminated-union variant), and
+per-game `teamSheets.p1 ↔ teamSheets.p2` — so all downstream code
+(action extraction, threat matrix, system prompt rendering) reads "p1"
+as the winner from this point on.
 
 Why winner-only: the model is trained to play *correctly*, not to mimic
 losing patterns at the same Elo. Including some intra-series losses
@@ -302,29 +312,49 @@ acknowledges that exact values may also be presented at deploy time.
   the match (across all Bo3 games), aggregating revealed `item`, `ability`,
   `teraType`, `isTerastallized`, and `revealedMoves` per P1 species. Pads
   each Pokémon's move list to exactly 4 with `"[UNREVEALED_MOVE]"`.
-- **`extract_p1_actions(snap_pre, snap_post, action_log)`** —
-  reverse-engineers each P1 active slot's action:
-  - Damage move → look in `action_log` (`attacker_slot == "p1a"|"p1b"`).
-    Multiple `defender_slot`s on one attacker = `"spread"` target.
+- **`extract_p1_actions(snap_pre, snap_post, events)`** —
+  reverse-engineers each P1 active slot's action from the new TurnEvent
+  stream:
+  - `move` event with `attacker_slot == "p1a"|"p1b"` and `called_via in
+    {None, "Sleep Talk"}` → move action. Target is the single
+    `defender_slot` if there's one damage hit, `"spread"` if multiple,
+    `"self"` if `hits[]` is empty (status / self-target).
+  - `switch` event with `side="p1"` and `forced_by is None` → intentional
+    switch. Forced switches (Volt Switch redirect / Eject Button / Roar)
+    are NOT the human's choice and are excluded.
+  - `cant_move` event for the slot → pass.
   - Tera detected by `isTerastallized` going false→true between snapshots.
-  - Switch detected by species change at the same slot.
-  - Status move detected by exactly-1 new entry in `revealedMoves` between
-    snapshots when neither damage event nor switch was observed.
-  - Returns `None` if any slot is ambiguous → caller skips the turn.
+  - Slot empty / fainted at `snap_pre` → pass.
+  - Returns `None` if no choice event exists for an active non-fainted
+    slot (likely forced out before acting) → caller skips the turn.
+- **Historical context blocks.** `format_user_prompt` composes three
+  prompt sections in addition to the current-frame board state:
+  - `=== GAME-STATE LEDGER ===` — faints, Tera-used per side, field +
+    pseudo-weather + side conditions with turns-left, on-active
+    volatiles (Substitute / Encore / Taunt / …), choice locks, and
+    recent item events. Only-when-active rows: empty rows omit.
+  - `=== TURN-BY-TURN (game N) ===` — every prior turn's events as
+    indented one-liners. No length cap.
+  - `=== SERIES STATE (Bo3, game N of M) ===` — Bo3 game ≥ 2 only.
+    One block per prior game: who brought what, Tera resolutions,
+    "Notable" heuristic line (choice lock surfaced, Trick Room set, …).
 - **Process loop** per match:
   1. `reconstruct_p1_team` + gather P2 species from snapshots.
   2. `init_knowledge` for both sides at fully-open `[0, 252]` bounds (per
      project spec: canonical priors live in the threat-matrix Probable
      track only; the inferencer's Absolute track stays strict-math).
   3. Render system prompt (with team block + Masking Rule).
-  4. For each `(snap_pre, snap_post, snap_pre.actionLog)` triple in turn
+  4. For each `(snap_pre, snap_post, snap_pre.events)` triple in turn
      order:
      - Extract P1's action; skip turn if ambiguous.
      - Generate threat matrix (uses `format_id` for chaos-backed Probable).
-     - Format user prompt (snapshot + threat matrix).
+     - Format user prompt — passes the full snapshot history of this
+       game (`snapshots_so_far`, `current_idx`) and prior games
+       (`prior_games`) for the new historical context blocks.
      - `await teacher_llm.synthesize_turn(...)`.
      - Append the resulting messages as one row to the SFT JSONL.
-     - `await damage_inferencer.update_knowledge(...)` to tighten both
+     - Filter `events` via `events_to_damage_events()` and
+       `await damage_inferencer.update_knowledge(...)` to tighten both
        KnowledgeStates for the next iteration.
 - **Resumable:** `(match_id, game_index, turn)` keys already present in the
   output JSONL are skipped on rerun.
@@ -362,20 +392,25 @@ OPENAI_API_KEY=sk-... .venv/bin/python master_pipeline.py
 
 ```
 raw replay JSON
-    → replay_parser  →  per-turn snapshots (with actionLog)
+    → replay_parser  →  per-turn snapshots (with TurnEvent[] events stream)
     │
     │  per match: K1, K2 = init_knowledge(p1_team), init_knowledge(p2_team)
     │             (full open bounds — canonical priors live in Probable track only)
     │
     │  for each turn in order:
-    │    → master_pipeline.extract_p1_actions(snap_pre, snap_post, action_log)
+    │    → master_pipeline.extract_p1_actions(snap_pre, snap_post, events)
     │      (the human's ground-truth play; skip turn if ambiguous)
     │    → threat_matrix.generate(snap_pre, "p1", K1, K2, format_id=…)
     │      (dual-track Absolute + Probable, [PRIOR CONTRADICTED] flagged)
+    │    → format_user_prompt(snap_pre, ..., snapshots_so_far, current_idx,
+    │                         prior_games, game_index, match_format)
+    │      (composes board state + GAME-STATE LEDGER + TURN-BY-TURN +
+    │       SERIES STATE + YOUR SPREADS + threat matrix)
     │    → teacher_llm.synthesize_turn(system, user, human_action)
     │      (tool-call loop, returns OpenAI fine-tuning messages)
     │    → write JSONL row
-    │    → damage_inferencer.update_knowledge(snap_pre, snap_post, events, K1, K2)
+    │    → damage_events = events_to_damage_events(events)  # filter callers + outcomes
+    │    → damage_inferencer.update_knowledge(snap_pre, snap_post, damage_events, K1, K2)
     │      (tightens both KnowledgeStates atomically + 508-EV constraint)
 ```
 
@@ -383,7 +418,7 @@ raw replay JSON
 
 | Module | State |
 |---|---|
-| `replay_parser.py` | Working. Run `python replay_parser.py --help`. Captures per-turn `actionLog` from `/parse_log` into the JSONL. |
+| `replay_parser.py` | Working. Run `python replay_parser.py --help`. Captures per-turn `events` (TurnEvent[]) from `/parse_log` into the JSONL. |
 | `canonical_priors.py` | Working. Library + bootstrap CLI. Reads Smogon Chaos JSON when present; falls back to curated table → heuristic. |
 | `damage_inferencer.py` | Working. Dual-state, two-way binary search, atomic apply, 508-EV constraint pass, crit-aware via `/calc isCrit`, multi-hit filter. |
 | `threat_matrix.py` | Working. Dual-track Absolute + Probable output with `[PRIOR CONTRADICTED]` flag. Optional `format_id` drives Smogon-backed priors. |
@@ -396,6 +431,21 @@ raw replay JSON
 
 ## Planned follow-up workstreams (TODO)
 
+- **`batch_orchestrator.py` — multi-batch tool-use loop** *(next up after
+  the bake-off picks a winner)*. New sibling of `master_pipeline.py` that
+  parallelises N turns' tool loops by submitting each loop iteration as
+  one batch via OpenAI Batch / Anthropic Message Batches / Vertex batch
+  prediction. ~50% cost reduction on the full-corpus run (~$1,150 saved
+  on ~$2,300). `master_pipeline.py --mode {sync,batch,hybrid}` selects
+  the path; hybrid runs the first ~1K matches sync to validate quality,
+  then batches the rest.
+- **Richer turn-history context in the user prompt.** Today the LLM sees
+  only the current frame + threat matrix + inferred spreads — no
+  last-turn damage, no Tera-used flags, no pseudo-weather state (Trick
+  Room / screens / Helping Hand turns), no faint ledger. All in the
+  parsed data already; needs a `format_recent_history` helper in
+  `master_pipeline.py` that inserts a 1–3 turn rollup + structured
+  game-state ledger between the board state and the threat matrix.
 - **Selection-model SFT corpus** — separate dataset for the team-preview
   4-of-6 pick decision. Walks the same parsed replays, extracts P1's
   brought set per game, generates one selection example per game with

@@ -211,30 +211,80 @@ happened up to and including the end of turn `N-1`.
 interface TurnSnapshot {
   turn: number;
   field: {
-    weather: string | null;          // "Sun", "Rain", "Sand", "Snow", "Electric Terrain", etc.
-    terrain: string | null;
+    weather: string | null;          // "Sun", "Rain", "Sand", "Snow"
+    weatherTurnsLeft?: number;
+    terrain: string | null;          // "Grassy", "Electric", "Misty", "Psychic"
+    terrainTurnsLeft?: number;
+    pseudoWeather: { [id: string]: { turnsLeft: number } };  // trickroom, gravity, magicroom, ...
     tailwindP1: boolean;
+    tailwindP1TurnsLeft?: number;
     tailwindP2: boolean;
+    tailwindP2TurnsLeft?: number;
   };
   p1: SideSnapshot;
   p2: SideSnapshot;
-  actionLog: DamageEvent[];          // damage events that occurred DURING this turn
+  events: TurnEvent[];               // discriminated union — see below
 }
 
-interface DamageEvent {
-  attacker_slot: string;             // "p1a" | "p1b" | "p2a" | "p2b"
-  defender_slot: string;
-  move_name: string;                 // PS display name, e.g. "Wood Hammer"
-  hp_before_pct: number;             // 0–100, defender HP just BEFORE the hit
-  hp_after_pct: number;              // 0–100, after the hit (0 if KO'd)
-  is_crit: boolean;
-  is_ko: boolean;
-}
+// A discriminated union of every per-turn event the parser can surface.
+// Replaces the old `actionLog: DamageEvent[]` shape. Forward-looking:
+// `snapshot[N].events` describes things that happened DURING turn N.
+type TurnEvent =
+  | { type: "move",
+      attacker_slot: string,         // "p1a" | "p1b" | "p2a" | "p2b"
+      move_name: string,             // PS display name, e.g. "Glacial Lance"
+      called_via: string | null,     // null for direct use; else "Sleep Talk"/"Metronome"/etc.
+      hits: Array<{
+        defender_slot: string,
+        outcome: "damage" | "miss" | "blocked" | "immune" | "no_effect" | "fail",
+        hp_before_pct?: number,      // present iff outcome="damage"
+        hp_after_pct?: number,
+        is_crit?: boolean,
+        is_ko?: boolean,
+        cause?: string               // e.g. "Protect", "Wide Guard" for blocked
+      }>
+    }
+  | { type: "cant_move",
+      slot: string,
+      reason: string,                // "asleep" | "paralyzed" | "frozen" | "flinch" | ...
+      attempted_move?: string
+    }
+  | { type: "tera",
+      side: "p1" | "p2",
+      slot: string,
+      species: string,
+      to_type: string                // "Water", "Fairy", "Stellar", ...
+    }
+  | { type: "switch",
+      side: "p1" | "p2",
+      slot: string,
+      from_species: string | null,   // null when slot was empty (post-faint)
+      to_species: string,
+      forced_by: string | null       // "Volt Switch" / "U-turn" / "Eject Button" / "Roar" / null
+    }
+  | { type: "faint",
+      side: "p1" | "p2",
+      slot: string,
+      species: string
+    }
+  | { type: "item_event",
+      slot: string,
+      kind: "consumed" | "knocked_off" | "tricked" | "flung" | "stolen" | "harvested" | "incinerated" | "popped",
+      item: string,
+      cause?: string                 // e.g. "Knock Off", "Trick", "Magician"
+    };
 
 interface SideSnapshot {
   player: string;                    // username
   active: ActivePokemonSnapshot[];   // doubles slots a, b (length 2 in VGC)
   bench: BenchPokemonSnapshot[];     // not-currently-active known team members
+  faints: number;                    // cumulative faints this game
+  teraUsed?: {                       // sticky once a side Tera's; absent until then
+    species: string;
+    teraType: string;
+    onTurn: number;
+  };
+  sideConditions: { [id: string]: { level?: number; turnsLeft?: number } };
 }
 
 interface ActivePokemonSnapshot {
@@ -245,12 +295,25 @@ interface ActivePokemonSnapshot {
   status: 'brn' | 'par' | 'psn' | 'tox' | 'slp' | 'frz' | null;
   ability: string | null;            // OTS-known if isOTS, else revealed via play
   item: string | null;               // OTS-known if isOTS, else revealed via play
-  revealedMoves: string[];           // move IDs the Pokémon has actually used so far (chronological)
+  revealedMoves: string[];           // PS display names — derived from events stream (excludes
+                                     // moves called via Metronome/Copycat/etc.; Sleep Talk OK).
   knownMoves: string[] | null;       // OTS full moveset (4 entries) when isOTS; null in CTS
   teraType: string | null;           // OTS-known if isOTS, else revealed via team preview / Tera event
   isTerastallized: boolean;
   terastallizedAs: string | null;
   boosts: Record<string, number>;
+  volatiles: {                       // only-when-active subset; only fields that apply are present
+    substitute?: { hp: number };
+    encoredInto?: string;            // move display name
+    disabled?: string;
+    taunt?: { turnsLeft: number };
+    healBlock?: { turnsLeft: number };
+    perishCount?: number;
+    confusion?: { turnsLeft: number };
+    leechSeed?: boolean;
+  };
+  choiceLockedInto: string | null;   // move display name when item+last-move imply Choice lock
+  toxicCounter?: number;             // for Toxic damage doubling
 }
 
 interface BenchPokemonSnapshot {
@@ -273,27 +336,43 @@ Truncated example output (turn 2 of a real Reg I replay):
 ```json
 {
   "turn": 2,
-  "field": { "weather": null, "terrain": null, "tailwindP1": false, "tailwindP2": false },
+  "field": {
+    "weather": null,
+    "terrain": "Grassy", "terrainTurnsLeft": 4,
+    "pseudoWeather": {},
+    "tailwindP1": false, "tailwindP2": false
+  },
   "p2": {
     "player": "VJ2511",
     "active": [
       {
         "slot": "a", "species": "Calyrex-Shadow", "hpPercent": 91, "fainted": false,
         "status": null, "ability": "unnerve", "item": "lifeorb",
-        "revealedMoves": ["psychic"],
-        "teraType": null, "isTerastallized": false, "terastallizedAs": null, "boosts": {}
+        "revealedMoves": ["Psychic"],
+        "teraType": null, "isTerastallized": false, "terastallizedAs": null,
+        "boosts": {}, "volatiles": {}, "choiceLockedInto": null
       },
       {
         "slot": "b", "species": "Zamazenta-Crowned", "hpPercent": 54, "fainted": false,
         "status": null, "ability": "dauntlessshield", "item": null,
-        "revealedMoves": ["bodypress"],
+        "revealedMoves": ["Body Press"],
         "teraType": "Water", "isTerastallized": true, "terastallizedAs": "Water",
-        "boosts": { "def": 1 }
+        "boosts": { "def": 1 }, "volatiles": {}, "choiceLockedInto": null
       }
     ],
-    "bench": [...]
+    "bench": [...],
+    "faints": 0,
+    "teraUsed": { "species": "Zamazenta-Crowned", "teraType": "Water", "onTurn": 1 },
+    "sideConditions": {}
   },
-  "p1": { ... }
+  "p1": { ... },
+  "events": [
+    { "type": "move", "attacker_slot": "p2a", "move_name": "Volt Switch",
+      "called_via": null,
+      "hits": [{ "defender_slot": "p1b", "outcome": "blocked", "cause": "Protect" }] },
+    { "type": "switch", "side": "p2", "slot": "p2a", "from_species": "Miraidon",
+      "to_species": "Terapagos", "forced_by": "Volt Switch" }
+  ]
 }
 ```
 
@@ -309,16 +388,30 @@ Truncated example output (turn 2 of a real Reg I replay):
   are tracked symmetrically.
 - Malformed individual lines are skipped silently rather than failing the whole
   parse.
-- **`actionLog` semantics** — events are forward-looking: `snapshot[N].actionLog`
-  contains damage events that happened during turn N (between this snapshot and
+- **`events` semantics** — events are forward-looking: `snapshot[N].events`
+  contains everything that happened during turn N (between this snapshot and
   the next). For inference: pair `snapshot_pre = snapshots[N]`,
-  `snapshot_post = snapshots[N+1]`, `events = snapshots[N].actionLog`.
-- Only direct move damage is captured. `|-damage|` events with a `[from] …`
-  kwarg (burn / sand / Life Orb / Rocky Helmet / Future Sight / etc.) are
-  filtered out — incidental/end-of-turn damage isn't useful for EV inference.
-- Multi-hit moves (Triple Axel, Bullet Seed) emit one `DamageEvent` per hit;
-  downstream consumers (the Python inferencer) detect them by counting same
-  `(attacker_slot, move_name, defender_slot)` tuples per turn.
+  `snapshot_post = snapshots[N+1]`, `events = snapshots[N].events`.
+- The Python `damage_inferencer.events_to_damage_events()` helper filters
+  for damage observations: `type == "move" AND called_via in {None, "Sleep
+  Talk"} AND hit.outcome == "damage"`. Metronome / Copycat / Sketch /
+  Snatch / Me First / Dancer / Instruct hits are excluded — those moves
+  may not be in the user's actual kit and would corrupt EV bounds.
+- Only direct move damage is captured under `outcome: "damage"`. `|-damage|`
+  events with a `[from] …` kwarg (burn / sand / Life Orb / Rocky Helmet /
+  Future Sight / etc.) are surfaced separately as `item_event` /
+  `cant_move` / `faint` — never as part of a move's `hits[]`.
+- Multi-hit moves (Triple Axel, Bullet Seed) emit one move event with
+  multiple entries in `hits[]` (typically all the same defender_slot);
+  the inferencer flattens these via `events_to_damage_events` and the
+  multi-hit filter (`(attacker_slot, move_name, defender_slot)` count > 1
+  per turn) drops them since `/calc` can't model `hits` properly yet.
+- **`derivedRevealedMoves`** is computed from the events stream rather
+  than from `@pkmn/client`'s `pokemon.moves`. A move is added to a slot's
+  revealed list only when the move event has `called_via in {null, "Sleep
+  Talk"}`. This avoids polluting Hatterene's / Smeargle's reconstructed
+  CTS moveset with Bleakwind Storm / Boomburst / etc. that they called
+  via Metronome.
 - **OTS / CTS bench gating** (Bo3 only — Bo1 behavior unchanged):
   - `snapshot.p1.bench` is intersected with the **brought-set** for the
     game (computed in a one-pass pre-scan over the log for every species

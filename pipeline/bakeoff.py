@@ -189,10 +189,10 @@ async def _bakeoff_one_match(
         for i in range(len(snapshots) - 1):
             snap_pre = snapshots[i]
             snap_post = snapshots[i + 1]
-            action_log = snap_pre.get("actionLog") or []
+            events_stream = snap_pre.get("events") or []
             turn = int(snap_pre.get("turn", 0))
 
-            human_action_dict = extract_p1_actions(snap_pre, snap_post, action_log)
+            human_action_dict = extract_p1_actions(snap_pre, snap_post, events_stream)
             if human_action_dict is None:
                 continue
 
@@ -221,7 +221,16 @@ async def _bakeoff_one_match(
                     continue
 
                 inferred = format_p1_inferred_spreads_block(snap_pre, state["p1_knowledge"])
-                user_prompt = format_user_prompt(snap_pre, tm_text, p1_inferred_block=inferred)
+                user_prompt = format_user_prompt(
+                    snap_pre, tm_text,
+                    p1_inferred_block=inferred,
+                    snapshots_so_far=snapshots,
+                    current_idx=i,
+                    prior_games=games[:game_idx],
+                    game_index=game_idx,
+                    total_games_in_series=len(games),
+                    match_format=match_format,
+                )
 
                 res: ProviderResult = await p.synthesize_turn(
                     system_prompt=system_prompt,
@@ -270,17 +279,18 @@ async def _bakeoff_one_match(
                     })
 
             # Update knowledge for all providers using the actual events.
-            events = [damage_inferencer.DamageEvent(**e) for e in action_log]
-            for p in providers:
-                state = provider_state[p.name]
-                try:
-                    await damage_inferencer.update_knowledge(
-                        snap_pre, snap_post, events,
-                        state["p1_knowledge"], state["p2_knowledge"],
-                        session=aiohttp_session, base_url=calc_base_url,
-                    )
-                except Exception:
-                    pass
+            damage_events = damage_inferencer.events_to_damage_events(events_stream)
+            if damage_events:
+                for p in providers:
+                    state = provider_state[p.name]
+                    try:
+                        await damage_inferencer.update_knowledge(
+                            snap_pre, snap_post, damage_events,
+                            state["p1_knowledge"], state["p2_knowledge"],
+                            session=aiohttp_session, base_url=calc_base_url,
+                        )
+                    except Exception:
+                        pass
 
     # Save per-provider output + print summary.
     output_dir.mkdir(parents=True, exist_ok=True)

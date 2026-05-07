@@ -46,7 +46,7 @@ cd data_scraper && .venv/bin/python scrape.py
 cd pipeline && .venv/bin/python canonical_priors.py --format-id gen9vgc2026regi
                                                     --format-id gen9vgc2026regibo3
 
-# 4. Parse + stitch replays → per-turn snapshots + actionLog
+# 4. Parse + stitch replays → per-turn snapshots + events stream
 cd pipeline && .venv/bin/python replay_parser.py
 
 # 5. Generate SFT training JSONL  (set OPENAI_API_KEY)
@@ -80,7 +80,7 @@ Pokémon Showdown
 data_scraper/data/replays/{format_id}/{replay_id}.json
     │
     ▼ (replay_parser → /parse_log)
-pipeline/parsed_data/{bo1,bo3}.jsonl    # per-turn snapshots + actionLog
+pipeline/parsed_data/{bo1,bo3}.jsonl    # per-turn snapshots + events stream
     │
     ▼ (master_pipeline → threat_matrix → /calc, teacher_llm → OpenAI)
 pipeline/parsed_data/sft_training_data.jsonl   # one fine-tuning example per turn
@@ -91,7 +91,9 @@ pipeline/parsed_data/sft_training_data.jsonl   # one fine-tuning example per tur
 - `data_scraper/data/replays/` — ~140 MB, 16,537 cached replay JSONs.
 - `pipeline/data/smogon_chaos_*.json` — Smogon usage data per format
   (regi: 492 species; regibo3: 426 species, both as of 2026-04).
-- `pipeline/parsed_data/{bo1,bo3}.jsonl` — parsed snapshots + actionLog.
+- `pipeline/parsed_data/{bo1,bo3}.jsonl` — parsed snapshots + events stream
+  (TurnEvent discriminated union: move / switch / cant_move / tera / faint /
+  item_event).
 - `pipeline/parsed_data/sft_training_data.jsonl` — final SFT dataset
   (append-only, resumable).
 
@@ -109,13 +111,22 @@ pipeline/parsed_data/sft_training_data.jsonl   # one fine-tuning example per tur
 - **`--dry-run` first.** Before burning OpenAI credits on the real
   `master_pipeline` run, verify orchestration with `--dry-run --limit 1`.
 - **Multi-hit moves are skipped during inference.** Triple Axel / Bullet
-  Seed / Population Bomb produce one `DamageEvent` per hit; the
-  `damage_inferencer` detects and drops them (would need a `hits` field
-  on `/calc` to handle properly).
+  Seed / Population Bomb expand to multiple `DamageEvent` records (one
+  per hit) after `events_to_damage_events` flattens the new event
+  schema; the `damage_inferencer` detects and drops them (would need a
+  `hits` field on `/calc` to handle properly).
+- **Non-own-move callers are filtered for inference.** Metronome, Copycat,
+  Sketch, Snatch, Me First, Dancer, Instruct can call moves the user
+  doesn't own — their hits would corrupt EV inference. The
+  `events_to_damage_events` filter keeps `called_via in {None, "Sleep
+  Talk"}` only. (Sleep Talk is allowed because it can only call own
+  moves.) The same filter governs `derivedRevealedMoves` on the Node
+  side, so reconstructed CTS movesets aren't polluted by Hatterene /
+  Smeargle Metronome calls.
 - **Ambiguous turns are skipped silently.** If `extract_p1_actions` can't
-  pin a P1 slot's choice (e.g. multiple new revealed moves), the whole
-  turn is skipped — no SFT row written, but `update_knowledge` still runs
-  on the action_log so we don't lose inference signal.
+  pin a P1 slot's choice (e.g. forced out before acting), the whole
+  turn is skipped — no SFT row written, but `update_knowledge` still
+  runs on the events stream so we don't lose inference signal.
 - **CTS vs OTS format split.** `gen9vgc2026regi` (Bo1) is **Closed Team
   Sheet** — items / abilities / moves hidden until activated, P1 team
   reconstructed by forward-scan with `[UNREVEALED_MOVE]` padding. The Bo1
@@ -135,9 +146,17 @@ pipeline/parsed_data/sft_training_data.jsonl   # one fine-tuning example per tur
 - **Series-winner-as-P1.** Every SFT example is generated from the
   perspective of the player who won the series. `flip_match_to_winner`
   in `master_pipeline.py` rewrites the entire match record (players,
-  snapshots, actionLog slot identifiers, teamSheets) when the protocol
-  P2 won. Don't assume "p1" in a saved row corresponds to the protocol's
-  p1 — it's whoever won the series.
+  snapshots, every TurnEvent's slot/side fields, teamSheets) when the
+  protocol P2 won. Don't assume "p1" in a saved row corresponds to the
+  protocol's p1 — it's whoever won the series.
+- **Historical context lives in the user prompt.** Each turn's prompt
+  includes a `=== GAME-STATE LEDGER ===` (faints / Tera-used / field /
+  side conditions / volatiles / choice locks / item events), a
+  `=== TURN-BY-TURN (game N) ===` rollup of every prior turn's events
+  this game, and (Bo3 game ≥ 2) a `=== SERIES STATE ===` block
+  summarizing who brought what / Tera'd what / "notable" patterns from
+  prior games. Built by `format_game_state_ledger`,
+  `format_turn_by_turn`, `format_series_state` in `master_pipeline.py`.
 
 ## Provider-agnostic teacher LLM
 
@@ -198,6 +217,28 @@ against the provider's pricing page before scaling to the full corpus.
 
 ## Planned follow-up workstreams (not built yet)
 
+- **`batch_orchestrator.py` — coordinated multi-batch tool-use loop.**
+  *Next up after the bake-off picks a winner.* New sibling of
+  `master_pipeline.py`; owns a poll-and-resume state machine that runs N
+  turns through their tool loops in parallel by submitting each tool-loop
+  iteration as one batch (OpenAI Batch API / Anthropic Message Batches /
+  Vertex batch prediction — all ~50% off sync prices). Per-turn state
+  persisted to disk so runs can resume mid-batch-cycle. Each provider
+  gets a `BatchTeacherProvider` extension (`OpenAIBatchProvider`, etc.)
+  exposing `submit_batch` / `await_batch`. `master_pipeline.py` gains a
+  `--mode {sync,batch,hybrid}` flag — hybrid runs the first ~1K matches
+  sync to validate quality, then migrates the rest to batch for the cost
+  win. Estimated savings on full corpus: ~$1,150 of ~$2,300. Estimated
+  wall-clock: 3 batch cycles × 30min–12h ≈ 2h–36h.
+- **Richer turn-history context in the user prompt.** Today the LLM only
+  sees the current snapshot's frame + threat matrix + inferred spreads.
+  It doesn't see what happened on previous turns (last move used by each
+  side, last-turn damage exchange, Tera-used flags, pseudo-weather state
+  like Trick Room/screens/Helping Hand, total faint count per side). All
+  of this is in the parsed data already — needs a `format_recent_history`
+  helper in `master_pipeline.py` that summarises the last 1–3 turns'
+  `actionLog` plus a structured "game-state ledger" (Tera-used, screens,
+  faints) inserted between the board state and the threat matrix.
 - **Selection-model SFT corpus** — separate dataset for the
   team-preview 4-of-6 pick decision. Sibling module to
   `master_pipeline.py`. Generates `{full p1, full p2, format_meta} →
@@ -207,6 +248,5 @@ against the provider's pricing page before scaling to the full corpus.
   alternatives because it already knows the answer) with a proper
   search step. See `# TODO(rlhf-followup)` in `teacher_llm.py`.
 - **Migrate `master_pipeline` default provider to the bake-off winner**
-  once empirical results are in. Today's default is `openai/gpt-4o`
-  (verified working post-Phase-1 fix); whichever provider wins the
-  bake-off becomes the next default.
+  once empirical results are in. Today's default is `openai/gpt-5.5`;
+  whichever provider wins the bake-off becomes the next default.

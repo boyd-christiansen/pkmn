@@ -21,7 +21,7 @@ data_scraper/   ──►  16,537 raw replay logs on disk
       │
       │  POST /parse_log per game
       ▼
-calc_microservice/  ──►  per-turn snapshots + actionLog (Node side)
+calc_microservice/  ──►  per-turn snapshots + events stream (Node side)
       │
       │  read JSONL, run inference + LLM
       ▼
@@ -76,7 +76,7 @@ The service exposes three endpoints:
 | Endpoint | Backed by | Purpose |
 |---|---|---|
 | `POST /calc` | `@smogon/calc` | Damage range for one (attacker, move, defender, field). Accepts `isCrit`. |
-| `POST /parse_log` | `@pkmn/protocol` + `@pkmn/client` + `@pkmn/sets` | Raw log → per-turn snapshots + per-turn `actionLog` (damage events) + Bo3 `teamSheets` (Open Team Sheet decoded from `\|showteam\|`). |
+| `POST /parse_log` | `@pkmn/protocol` + `@pkmn/client` + `@pkmn/sets` | Raw log → per-turn snapshots + per-turn `events` (TurnEvent discriminated union: move / switch / cant_move / tera / faint / item_event) + Bo3 `teamSheets` (Open Team Sheet decoded from `\|showteam\|`). |
 | `GET /dex/move/:name` | `@pkmn/dex` | Move metadata (category, type, base power). Used to skip Status moves. |
 
 ---
@@ -114,7 +114,7 @@ Each snapshot looks like:
     "bench": [ {"species": "Lunala", "fainted": false}, ... ]
   },
   "p2": { ... },
-  "actionLog": [ ... events that happen DURING this turn ... ]
+  "events": [ ... TurnEvent[] that happen DURING this turn ... ]
 }
 ```
 
@@ -125,9 +125,9 @@ those moves had been used yet. In Bo1 CTS replays, `teamSheets` is `null`
 and `knownMoves` is `null` for every active mon (we only know what's been
 revealed chronologically).
 
-**Key design choice:** `actionLog` is *forward-looking*. Events for turn N
-attach to `snapshot[N].actionLog`, so we always pair `(snap[N], snap[N+1],
-snap[N].actionLog)` for inference and label extraction.
+**Key design choice:** `events` is *forward-looking*. Events for turn N
+attach to `snapshot[N].events`, so we always pair `(snap[N], snap[N+1],
+snap[N].events)` for inference and label extraction.
 
 **Format-aware bench gating** (Bo3 only): the parser pre-scans the log to
 find every Pokémon each side ever sends to the field. P1's bench at turn 1
@@ -137,16 +137,30 @@ the spectator, the human player didn't know which 4 the opponent would
 bring until they switched in. Strict chronological view for the
 opponent's backline.
 
-Real turn 1 actionLog from the running example:
+Real turn 1 events from the running example (the new discriminated-union
+schema replaces the previous flat `DamageEvent[]`):
 
 ```json
 [
-  {"attacker_slot": "p1a", "defender_slot": "p2a", "move_name": "Volt Switch",
-   "hp_before_pct": 100, "hp_after_pct": 79, "is_crit": false, "is_ko": false},
-  {"attacker_slot": "p2a", "defender_slot": "p1b", "move_name": "Moongeist Beam",
-   "hp_before_pct": 100, "hp_after_pct": 1, "is_crit": false, "is_ko": false}
+  { "type": "move", "attacker_slot": "p1a", "move_name": "Volt Switch",
+    "called_via": null,
+    "hits": [{ "defender_slot": "p2a", "outcome": "damage",
+               "hp_before_pct": 100, "hp_after_pct": 79,
+               "is_crit": false, "is_ko": false }] },
+  { "type": "move", "attacker_slot": "p2a", "move_name": "Moongeist Beam",
+    "called_via": null,
+    "hits": [{ "defender_slot": "p1b", "outcome": "damage",
+               "hp_before_pct": 100, "hp_after_pct": 1,
+               "is_crit": false, "is_ko": false }] }
 ]
 ```
+
+The full TurnEvent union has six variants (`move`, `cant_move`, `tera`,
+`switch`, `faint`, `item_event`) — see `calc_microservice/README.md` for
+the schema. The Python `damage_inferencer.events_to_damage_events()`
+helper flattens move events with `called_via in {null, "Sleep Talk"}`
+and `outcome == "damage"` into the legacy `DamageEvent` shape for the
+binary-search inferencer.
 
 Two events. Miraidon hit Lunala for 21%. Lunala hit Iron Valiant for 99%.
 Notice that turn 1 had Iron Valiant doing *something else* too — but no
@@ -440,8 +454,9 @@ up to clip the prior by ≥ 40 EVs.
 for the rest of the pipeline. Bo3: the player who took 2 of 3 games.
 Bo1: the per-game winner. The flip rewrites the entire match record —
 top-level `players[0] ↔ players[1]`, every snapshot's `p1 ↔ p2` and
-`tailwindP1 ↔ tailwindP2`, every `actionLog` event's slot identifiers
-(`p1a ↔ p2a`, `p1b ↔ p2b`), and per-game `teamSheets.p1 ↔ teamSheets.p2`.
+`tailwindP1 ↔ tailwindP2` (plus `tailwindP*TurnsLeft`), and every
+`events[i]` slot/side fields (per discriminated-union variant), and
+per-game `teamSheets.p1 ↔ teamSheets.p2`.
 
 Why winner-only: we're training the model to play *correctly*, not to
 mimic losing-Elo patterns. Including in-series losses (the games the
@@ -452,25 +467,34 @@ series.
 
 For each turn, we need to know what each P1 active slot DID. That's the
 training label. We reverse-engineer it from `snap_pre`, `snap_post`, and
-`snap_pre.actionLog`:
+the new `snap_pre.events` discriminated-union stream:
 
 | Signal | Action type |
 |---|---|
-| `attacker_slot == "p1a"` in actionLog | move (target = single defender_slot, or `"spread"` if multiple) |
+| `move` event with `attacker_slot == "p1a"` and `called_via in {null, "Sleep Talk"}` | move (target = single `defender_slot`, or `"spread"` if multiple, or `"self"` if `hits[]` is empty) |
 | `isTerastallized` flips false→true at this slot | tera flag set on the move |
-| Species at slot changes between pre and post | switch (`switch_to = post.species`) |
-| Same species, exactly 1 new revealed move, no damage event | status move (target = `"self"`) |
-| None of the above | **ambiguous → skip turn** |
+| `switch` event with `side="p1"`, `slot="p1a"`, `forced_by` is `null` | switch (`switch_to = to_species`) |
+| `cant_move` event for this slot | pass (reason: `asleep` / `paralyzed` / `flinch` / `disable` / …) |
+| Slot is empty or fainted at `snap_pre` | pass |
+| None of the above (likely forced out by opponent before acting) | **ambiguous → skip turn** |
 
 Real example, our running game 1 turn 1:
 
-- **slot a (Miraidon)**: `attacker_slot="p1a"` appears in actionLog → move.
-  Single defender_slot=`"p2a"` → `target="p2a"`. No Tera. →
-  `{"action_type": "move", "move": "Volt Switch", "target": "p2a", "tera": false}`.
-- **slot b (Iron Valiant)**: no actionLog entry. Species same as turn 2
-  start. `revealedMoves` diff: post has `["quickguard"]`, pre had `[]`.
-  Exactly 1 new move. → `{"action_type": "move", "move": "quickguard",
-  "target": "self", "tera": false}`.
+- **slot a (Miraidon)**: a `move` event with `attacker_slot="p1a"`,
+  `move_name="Volt Switch"`, `called_via=null`, single damage hit on
+  `p2a`. No Tera. → `{"action_type": "move", "move": "Volt Switch",
+  "target": "p2a", "tera": false}`.
+- **slot b (Iron Valiant)**: a `move` event with `move_name="Quick
+  Guard"` and empty `hits[]` (status / self-target). →
+  `{"action_type": "move", "move": "Quick Guard", "target": "self",
+  "tera": false}`.
+
+Forced switches (Volt Switch redirect, Eject Button, Roar, Whirlwind)
+are NOT the human's choice for the slot they affect — those events
+have `forced_by` set, and `extract_p1_actions` ignores them. If a slot
+has no move / intentional switch / cant_move and isn't empty at
+`snap_pre`, the turn is skipped (we can't recover what the human
+*would* have chosen).
 
 **We're conservative:** if any slot is ambiguous, the WHOLE turn is
 skipped. Bad labels poison SFT — better to lose 30% of turns than label
@@ -642,7 +666,10 @@ shows 20–32% on Chi-Yu, doesn't compensate for losing the SpA debuff
 this turn."* — followed by 0–2 calc tool calls verifying decisive
 hypotheticals.
 
-**After the row is written**, we feed the same `actionLog` to
+**After the row is written**, we filter the same `events` stream
+through `damage_inferencer.events_to_damage_events()` (keeping only
+`type=="move"` events with `called_via in {null, "Sleep Talk"}` and
+`hits[i].outcome == "damage"`) and feed those into
 `damage_inferencer.update_knowledge` — tightening both KnowledgeStates
 so the *next* turn's threat matrix and `YOUR SPREADS` block are
 sharper. Bo3 series compound this: by turn 3 the inferencer has

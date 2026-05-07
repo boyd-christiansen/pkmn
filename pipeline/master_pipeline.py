@@ -5,16 +5,16 @@ Pipeline role:
     and for each turn of each match:
       1. reconstructs P1's team (revealed item / ability / tera / moves with
          `[UNREVEALED_MOVE]` padding for slots the human never used);
-      2. extracts P1's actual two-slot decision from `snap[N].actionLog` +
-         the diff to `snap[N+1]` (damage moves, switches, status moves,
-         Tera flag);
+      2. extracts P1's actual two-slot decision from `snap[N].events` +
+         the diff to `snap[N+1]` (move / switch / cant_move events, Tera flag);
       3. asks `threat_matrix` to render the dual-track damage envelope;
       4. drives `teacher_llm.synthesize_turn` to elicit a chain-of-thought
          that justifies that exact decision;
       5. writes the resulting OpenAI-fine-tuning conversation to
          `parsed_data/sft_training_data.jsonl`;
-      6. feeds the same `actionLog` to `damage_inferencer.update_knowledge`
-         to tighten both KnowledgeStates for the next turn.
+      6. filters the same `events` stream for damage observations and
+         feeds them to `damage_inferencer.update_knowledge` to tighten
+         both KnowledgeStates for the next turn.
 
     KnowledgeStates start at fully-open `[0, 252]` bounds — the canonical
     priors are used by `threat_matrix` for its Probable track only,
@@ -172,7 +172,8 @@ def flip_match_to_winner(match: dict) -> dict:
       - top-level `players[0] ↔ players[1]`
       - per game: `teamSheets.p1 ↔ teamSheets.p2`, `winner` flipped
       - per snapshot: `p1 ↔ p2`, `field.tailwindP1 ↔ tailwindP2`,
-        every `actionLog` event's `attacker_slot` / `defender_slot` slot-flipped
+        `field.tailwindP1TurnsLeft ↔ tailwindP2TurnsLeft`,
+        every `events[i]` slot/side fields flipped per the discriminated union
     """
     games = match.get("games") or []
     winner = _series_winner(games)
@@ -200,13 +201,45 @@ def flip_match_to_winner(match: dict) -> dict:
                 field.get("tailwindP2", False),
                 field.get("tailwindP1", False),
             )
+            if "tailwindP1TurnsLeft" in field or "tailwindP2TurnsLeft" in field:
+                field["tailwindP1TurnsLeft"], field["tailwindP2TurnsLeft"] = (
+                    field.get("tailwindP2TurnsLeft"),
+                    field.get("tailwindP1TurnsLeft"),
+                )
             snap["field"] = field
 
-            for ev in snap.get("actionLog") or []:
-                ev["attacker_slot"] = _flip_slot(ev.get("attacker_slot"))
-                ev["defender_slot"] = _flip_slot(ev.get("defender_slot"))
+            for ev in snap.get("events") or []:
+                _flip_event_inplace(ev)
 
     return flipped
+
+
+def _flip_side(side: str | None) -> str | None:
+    if side == "p1": return "p2"
+    if side == "p2": return "p1"
+    return side
+
+
+def _flip_event_inplace(ev: dict[str, Any]) -> None:
+    """Mutate a TurnEvent dict to swap p1↔p2 references."""
+    t = ev.get("type")
+    if t == "move":
+        ev["attacker_slot"] = _flip_slot(ev.get("attacker_slot"))
+        for hit in ev.get("hits") or []:
+            hit["defender_slot"] = _flip_slot(hit.get("defender_slot"))
+    elif t == "cant_move":
+        ev["slot"] = _flip_slot(ev.get("slot"))
+    elif t == "tera":
+        ev["side"] = _flip_side(ev.get("side"))
+        ev["slot"] = _flip_slot(ev.get("slot"))
+    elif t == "switch":
+        ev["side"] = _flip_side(ev.get("side"))
+        ev["slot"] = _flip_slot(ev.get("slot"))
+    elif t == "faint":
+        ev["side"] = _flip_side(ev.get("side"))
+        ev["slot"] = _flip_slot(ev.get("slot"))
+    elif t == "item_event":
+        ev["slot"] = _flip_slot(ev.get("slot"))
 
 
 def _brought_species_keys_for_game(game: dict) -> set[str]:
@@ -250,12 +283,17 @@ def _slot_action(
 def extract_p1_actions(
     snap_pre: dict[str, Any],
     snap_post: dict[str, Any],
-    action_log: list[dict[str, Any]],
+    events: list[dict[str, Any]],
 ) -> dict[str, dict[str, Any]] | None:
     """Reverse-engineer what each P1 active slot did this turn.
 
+    Reads the new TurnEvent stream (move / switch / cant_move / faint /
+    tera / item_event). Only events that represent the human's choice
+    count: move events with called_via in {None, "Sleep Talk"}, intentional
+    switches (forced_by is None), and cant_move events.
+
     Returns a dict `{ "a": slot_action, "b": slot_action }` or `None` when
-    any slot's action is ambiguous (skip the turn).
+    any slot's action is ambiguous (e.g. forced out before acting).
     """
     out: dict[str, dict[str, Any]] = {}
     pre_active = {p["slot"]: p for p in snap_pre.get("p1", {}).get("active", [])}
@@ -270,39 +308,65 @@ def extract_p1_actions(
             out[letter] = _slot_action("pass")
             continue
 
-        attacker_events = [e for e in action_log if e.get("attacker_slot") == slot_id]
-        if attacker_events:
-            move_name = attacker_events[0]["move_name"]
-            targets = sorted({e["defender_slot"] for e in attacker_events})
-            target = targets[0] if len(targets) == 1 else "spread"
+        # Pull events that represent the human's CHOICE for this slot.
+        # Forced switches and called-via-other-move moves are consequences,
+        # not decisions, so they're excluded.
+        my_moves = [
+            e for e in events
+            if e.get("type") == "move"
+            and e.get("attacker_slot") == slot_id
+            and e.get("called_via") in (None, "Sleep Talk")
+        ]
+        my_intentional_switches = [
+            e for e in events
+            if e.get("type") == "switch"
+            and e.get("side") == "p1"
+            and e.get("slot") == slot_id
+            and e.get("forced_by") is None
+        ]
+        my_cant_moves = [
+            e for e in events
+            if e.get("type") == "cant_move" and e.get("slot") == slot_id
+        ]
+
+        # Intentional switch wins over move if both present (rare — would be
+        # a parse glitch). Fall through to move otherwise.
+        if my_intentional_switches:
+            sw = my_intentional_switches[-1]
+            out[letter] = _slot_action("switch", switch_to=sw.get("to_species"))
+            continue
+
+        if my_moves:
+            mv = my_moves[0]
+            move_name = mv.get("move_name")
+            hits = mv.get("hits") or []
+            unique_targets = sorted({h["defender_slot"] for h in hits if h.get("defender_slot")})
+            if not unique_targets:
+                target = "self"  # status / self-target (Calm Mind, Protect, Substitute, ...)
+            elif len(unique_targets) == 1:
+                target = unique_targets[0]
+            else:
+                target = "spread"
             tera = (
                 post_p is not None
-                and post_p["species"] == pre_p["species"]
+                and post_p.get("species") == pre_p.get("species")
                 and bool(post_p.get("isTerastallized"))
                 and not bool(pre_p.get("isTerastallized"))
             )
             out[letter] = _slot_action("move", move=move_name, target=target, tera=tera)
             continue
 
-        if post_p is not None and pre_p["species"] != post_p["species"]:
-            out[letter] = _slot_action("switch", switch_to=post_p["species"])
+        if my_cant_moves:
+            # The slot couldn't act (asleep / paralyzed / flinch / disable).
+            # Recordable as a pass — the prompt rollup will explain why.
+            out[letter] = _slot_action("pass")
             continue
 
-        if post_p is not None and post_p["species"] == pre_p["species"]:
-            pre_moves = set(pre_p.get("revealedMoves") or [])
-            post_moves = set(post_p.get("revealedMoves") or [])
-            new_moves = post_moves - pre_moves
-            if len(new_moves) == 1:
-                tera = (
-                    bool(post_p.get("isTerastallized"))
-                    and not bool(pre_p.get("isTerastallized"))
-                )
-                out[letter] = _slot_action(
-                    "move", move=next(iter(new_moves)), target="self", tera=tera
-                )
-                continue
-
-        return None  # ambiguous — skip the whole turn
+        # No move / intentional switch / cant_move from this slot. The mon
+        # was likely forced out (Roar / Whirlwind / Volt Switch redirect /
+        # Eject Button) before having a chance to act. We can't recover
+        # the decision the human would have made — skip the turn.
+        return None
 
     return out
 
@@ -396,12 +460,380 @@ def format_p1_inferred_spreads_block(
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Historical-context blocks (game-state ledger / turn-by-turn / series state)
+# ---------------------------------------------------------------------------
+
+
+def _slot_label(slot: str) -> str:
+    """'p1a' -> 'P1[a]'."""
+    if len(slot) >= 3:
+        return f"{slot[:2].upper()}[{slot[2]}]"
+    return slot.upper()
+
+
+def _maybe_turns_left(n: int | None, total: int | None = None) -> str:
+    if n is None:
+        return ""
+    if total is not None:
+        return f" ({n}/{total} turns left)"
+    return f" ({n} turns left)"
+
+
+def _scan_events(snapshots: list[dict[str, Any]], current_idx: int):
+    """Yield (turn_number, event) for every event in snapshots[0..current_idx-1].
+
+    Note: snapshot at index N stores events that happened DURING turn N
+    (i.e. between |turn|N and |turn|N+1 markers). For "what was the state
+    at the start of turn current_idx+1", we read events from snapshots
+    [0..current_idx-1] (all turns *before* the current one).
+    """
+    for i in range(min(current_idx, len(snapshots))):
+        s = snapshots[i]
+        turn_num = s.get("turn", i + 1)
+        for ev in s.get("events") or []:
+            yield turn_num, ev
+
+
+def format_game_state_ledger(
+    snapshot: dict[str, Any],
+    snapshots_so_far: list[dict[str, Any]],
+    current_idx: int,
+) -> str:
+    """=== GAME-STATE LEDGER ===  block.
+
+    Only-when-active rows: empty rows are omitted entirely.
+    """
+    lines: list[str] = []
+    p1, p2 = snapshot.get("p1", {}), snapshot.get("p2", {})
+    field = snapshot.get("field", {})
+
+    # Faints (always shown — useful even at 0/0 to anchor the player).
+    p1_faints, p2_faints = p1.get("faints", 0), p2.get("faints", 0)
+    lines.append(f"Faints:        P1 {p1_faints}/4   |   P2 {p2_faints}/4")
+
+    # Tera used (only-when-active per side).
+    tera_rows: list[str] = []
+    for side, side_snap in (("P1", p1), ("P2", p2)):
+        tu = side_snap.get("teraUsed")
+        if tu:
+            tera_rows.append(f"{side} ✓ {tu['species']} → {tu['teraType']} on T{tu['onTurn']}")
+    if tera_rows:
+        lines.append("Tera used:     " + "; ".join(tera_rows))
+
+    # Field weather / terrain with turns-left if known.
+    field_parts: list[str] = []
+    if field.get("weather"):
+        wt = field.get("weatherTurnsLeft")
+        field_parts.append(f"{field['weather']}{_maybe_turns_left(wt)}")
+    if field.get("terrain"):
+        tt = field.get("terrainTurnsLeft")
+        field_parts.append(f"{field['terrain']}{_maybe_turns_left(tt)}")
+    if field_parts:
+        lines.append("Field:         " + ", ".join(field_parts))
+
+    # Pseudo-weather (Trick Room, Gravity, Magic Room, ...).
+    pw = field.get("pseudoWeather") or {}
+    if pw:
+        pw_parts = []
+        for pwid, info in pw.items():
+            pw_parts.append(f"{pwid}{_maybe_turns_left((info or {}).get('turnsLeft'))}")
+        lines.append("Pseudo-weather: " + ", ".join(pw_parts))
+
+    # Side conditions (per side: tailwind / screens / spikes / safeguard).
+    for side, side_snap, twin_active, tw_left in (
+        ("P1", p1, field.get("tailwindP1"), field.get("tailwindP1TurnsLeft")),
+        ("P2", p2, field.get("tailwindP2"), field.get("tailwindP2TurnsLeft")),
+    ):
+        sc = side_snap.get("sideConditions") or {}
+        sc_parts: list[str] = []
+        if twin_active:
+            sc_parts.append(f"Tailwind{_maybe_turns_left(tw_left)}")
+        for sid, info in sc.items():
+            info = info or {}
+            level = info.get("level")
+            tl = info.get("turnsLeft")
+            label = sid
+            if level is not None:
+                label += f" L{level}"
+            sc_parts.append(f"{label}{_maybe_turns_left(tl)}")
+        if sc_parts:
+            lines.append(f"{side} side:       " + ", ".join(sc_parts))
+
+    # Volatiles (only on-active mons, only when present).
+    vol_parts: list[str] = []
+    for side_label, side_snap in (("P1", p1), ("P2", p2)):
+        for active in side_snap.get("active") or []:
+            if not active:
+                continue
+            vols = active.get("volatiles") or {}
+            slot = active.get("slot", "?")
+            label = f"{side_label}[{slot}] {active.get('species', '?')}"
+            for vname, vinfo in vols.items():
+                vinfo = vinfo or {}
+                if vname == "substitute":
+                    hp = vinfo.get("hp")
+                    vol_parts.append(f"{label} Substitute" + (f" ({hp} HP)" if hp is not None else ""))
+                elif vname == "encoredInto":
+                    vol_parts.append(f"{label} Encore-locked into {vinfo}")
+                elif vname == "disabled":
+                    vol_parts.append(f"{label} Disabled: {vinfo}")
+                elif vname == "taunt":
+                    vol_parts.append(f"{label} Taunt{_maybe_turns_left(vinfo.get('turnsLeft'))}")
+                elif vname == "healBlock":
+                    vol_parts.append(f"{label} Heal Block{_maybe_turns_left(vinfo.get('turnsLeft'))}")
+                elif vname == "perishCount":
+                    vol_parts.append(f"{label} Perish {vinfo}")
+                elif vname == "confusion":
+                    vol_parts.append(f"{label} confused{_maybe_turns_left(vinfo.get('turnsLeft'))}")
+                elif vname == "leechSeed":
+                    vol_parts.append(f"{label} Leech-Seeded")
+                else:
+                    vol_parts.append(f"{label} {vname}")
+            # Choice lock surfaced separately — see Choice locks row.
+    if vol_parts:
+        lines.append("Volatiles:     " + "; ".join(vol_parts))
+
+    # Choice locks (only-when-set, on-active).
+    choice_parts: list[str] = []
+    for side_label, side_snap in (("P1", p1), ("P2", p2)):
+        for active in side_snap.get("active") or []:
+            lock = (active or {}).get("choiceLockedInto")
+            if lock:
+                choice_parts.append(
+                    f"{side_label}[{active.get('slot', '?')}] {active.get('species', '?')} locked into {lock}"
+                )
+    if choice_parts:
+        lines.append("Choice locks:  " + "; ".join(choice_parts))
+
+    # Item events (last 3 from history, only if present).
+    item_history: list[str] = []
+    for turn_num, ev in _scan_events(snapshots_so_far, current_idx):
+        if ev.get("type") == "item_event":
+            slot = ev.get("slot", "?")
+            kind = ev.get("kind", "?")
+            item = ev.get("item", "?")
+            sl = _slot_label(slot)
+            if kind == "consumed":
+                item_history.append(f"{sl} {item} consumed (T{turn_num})")
+            elif kind == "knocked_off":
+                item_history.append(f"{sl} {item} Knocked Off (T{turn_num})")
+            elif kind in ("tricked", "stolen", "flung", "incinerated", "popped", "harvested"):
+                item_history.append(f"{sl} {item} {kind} (T{turn_num})")
+    if item_history:
+        # Only show the last 4 to keep the prompt tight.
+        lines.append("Item events:   " + "; ".join(item_history[-4:]))
+
+    return "=== GAME-STATE LEDGER ===\n" + "\n".join(lines)
+
+
+def _format_event_inline(ev: dict[str, Any]) -> str | None:
+    """Render a single TurnEvent as a one-line string. Returns None for events
+    that should be folded into another (e.g. faint events covered by a
+    move's is_ko=True hit)."""
+    t = ev.get("type")
+    if t == "move":
+        attacker_label = _slot_label(ev.get("attacker_slot", "?"))
+        move_name = ev.get("move_name", "?")
+        cv = ev.get("called_via")
+        prefix = f"{attacker_label} "
+        if cv:
+            move_part = f"{cv} → {move_name}"
+        else:
+            move_part = move_name
+        hits = ev.get("hits") or []
+        if not hits:
+            # Status / self-target move (Calm Mind, Protect, Rage Powder, ...).
+            return f"{prefix}{move_part}"
+        # Group hits by outcome for compact display.
+        bits: list[str] = []
+        for h in hits:
+            tgt = _slot_label(h.get("defender_slot", "?"))
+            outcome = h.get("outcome", "?")
+            if outcome == "damage":
+                hp_after = h.get("hp_after_pct")
+                ko = " KO" if h.get("is_ko") else ""
+                crit = " (crit)" if h.get("is_crit") else ""
+                if hp_after is not None:
+                    bits.append(f"{tgt} {hp_after}%{ko}{crit}")
+                else:
+                    bits.append(f"{tgt} damage{ko}{crit}")
+            elif outcome in ("blocked", "immune", "miss", "no_effect", "fail"):
+                cause = h.get("cause")
+                bits.append(f"{tgt} {outcome}" + (f" by {cause}" if cause else ""))
+            else:
+                bits.append(f"{tgt} {outcome}")
+        kind_tag = " (spread)" if len(hits) >= 2 else ""
+        return f"{prefix}{move_part}{kind_tag} → " + ", ".join(bits)
+    if t == "switch":
+        side = ev.get("side", "?").upper()
+        slot = _slot_label(ev.get("slot", "?"))
+        from_sp = ev.get("from_species") or "(empty slot)"
+        to_sp = ev.get("to_species", "?")
+        forced = ev.get("forced_by")
+        forced_part = f" (via {forced})" if forced else ""
+        return f"{side} switched {slot}: {from_sp} → {to_sp}{forced_part}"
+    if t == "tera":
+        side = ev.get("side", "?").upper()
+        return f"{side} Tera'd: {ev.get('species', '?')} → {ev.get('to_type', '?')}"
+    if t == "cant_move":
+        slot = _slot_label(ev.get("slot", "?"))
+        reason = ev.get("reason", "?")
+        attempted = ev.get("attempted_move")
+        att_part = f" (tried {attempted})" if attempted else ""
+        return f"{slot} couldn't move ({reason}){att_part}"
+    if t == "item_event":
+        slot = _slot_label(ev.get("slot", "?"))
+        return f"{slot} {ev.get('kind', '?')} {ev.get('item', '?')}"
+    if t == "faint":
+        # Faints are usually folded into the KO'd move event. If the faint
+        # is from end-of-turn residual damage (Life Orb / weather / status),
+        # render it as its own line so the cause is at least visible.
+        slot = _slot_label(ev.get("slot", "?"))
+        return f"{slot} {ev.get('species', '?')} fainted"
+    return None
+
+
+def format_turn_by_turn(
+    snapshots_so_far: list[dict[str, Any]],
+    current_idx: int,
+    *,
+    game_index: int = 0,
+) -> str:
+    """=== TURN-BY-TURN (game N) ===  block.
+
+    One block per prior turn in this game. Renders every event inline.
+    No length cap (per design — sequence-aware reasoning is the point).
+    """
+    lines: list[str] = [f"=== TURN-BY-TURN (game {game_index + 1}) ==="]
+    if current_idx == 0:
+        lines.append("(no prior turns this game)")
+        return "\n".join(lines)
+    any_content = False
+    for i in range(min(current_idx, len(snapshots_so_far))):
+        s = snapshots_so_far[i]
+        turn_num = s.get("turn", i + 1)
+        events = s.get("events") or []
+        if not events:
+            continue
+        # Drop faint events that already collapse into an `is_ko` damage hit
+        # in the same turn (avoid duplicate "Rillaboom fainted" lines).
+        ko_slots: set[str] = set()
+        for ev in events:
+            if ev.get("type") == "move":
+                for h in ev.get("hits") or []:
+                    if h.get("is_ko"):
+                        ko_slots.add(h.get("defender_slot", ""))
+        rendered_first = False
+        for ev in events:
+            if ev.get("type") == "faint" and _slot_label(ev.get("slot", ""))[:5].lower() in {
+                "p1[a]", "p1[b]", "p2[a]", "p2[b]"
+            }:
+                # Suppress if the matching slot was KO'd by a damage event already.
+                if ev.get("slot") in ko_slots:
+                    continue
+            line = _format_event_inline(ev)
+            if not line:
+                continue
+            prefix = f"T{turn_num}: " if not rendered_first else "    "
+            lines.append(prefix + line)
+            rendered_first = True
+        if rendered_first:
+            any_content = True
+    if not any_content:
+        lines.append("(no actionable events recorded)")
+    return "\n".join(lines)
+
+
+def format_series_state(
+    prior_games: list[dict[str, Any]],
+    *,
+    current_game_index: int,
+    total_games_in_series: int,
+) -> str:
+    """=== SERIES STATE (Bo3, game N of M) ===  block. Bo3-only."""
+    if current_game_index == 0 or not prior_games:
+        return ""
+    lines: list[str] = [
+        f"=== SERIES STATE (Bo3, game {current_game_index + 1} of {total_games_in_series}) ==="
+    ]
+    for gi, g in enumerate(prior_games):
+        snaps = g.get("snapshots") or []
+        if not snaps:
+            continue
+        last = snaps[-1]
+        winner = g.get("winner")
+        we_won = winner == "p1"
+        turns = len(snaps)
+        winner_label = "we won" if we_won else ("opp won" if winner == "p2" else "tied/aborted")
+        lines.append(f"Game {gi + 1} ({winner_label}, {turns} turns):")
+
+        # Brought rosters: union of all-time-seen actives + bench across that game.
+        def _brought(side_snap_seq: list[dict[str, Any]], side: str) -> list[str]:
+            seen_order: list[str] = []
+            seen: set[str] = set()
+            for s in side_snap_seq:
+                for p in (s.get(side, {}).get("active") or []):
+                    sp = p.get("species")
+                    if sp and sp not in seen:
+                        seen.add(sp); seen_order.append(sp)
+                for b in (s.get(side, {}).get("bench") or []):
+                    sp = b.get("species")
+                    if sp and sp not in seen:
+                        seen.add(sp); seen_order.append(sp)
+            return seen_order
+        p1_brought = _brought(snaps, "p1")
+        p2_brought = _brought(snaps, "p2")
+        if p1_brought:
+            lines.append(f"  We brought:  {', '.join(p1_brought)}")
+        if p2_brought:
+            lines.append(f"  Opp brought: {', '.join(p2_brought)}")
+
+        # Tera (last snapshot's stickied teraUsed has the resolution).
+        for side_label, side in (("Our Tera:   ", "p1"), ("Opp Tera:   ", "p2")):
+            tu = (last.get(side) or {}).get("teraUsed")
+            if tu:
+                lines.append(f"  {side_label}{tu['species']} → {tu['teraType']} on T{tu['onTurn']}")
+
+        # Notable: heuristic 1-2 lines.
+        notable: list[str] = []
+        # Choice lock surfaced.
+        for s in snaps:
+            for p in (s.get("p2", {}).get("active") or []):
+                lock = (p or {}).get("choiceLockedInto")
+                if lock and not any("locked into" in n for n in notable):
+                    notable.append(f"Opp {p.get('species', '?')} locked into {lock}")
+                    break
+        # Pseudo-weather setup (Trick Room).
+        for s in snaps:
+            pw = (s.get("field", {}) or {}).get("pseudoWeather") or {}
+            for pwid in pw:
+                if "trickroom" in pwid.lower() and not any("Trick Room" in n for n in notable):
+                    notable.append("Opp set Trick Room")
+                    break
+        if notable:
+            lines.append(f"  Notable:     {'; '.join(notable[:2])}")
+    return "\n".join(lines)
+
+
 def format_user_prompt(
     snapshot: dict[str, Any],
     threat_matrix_text: str,
     *,
     p1_inferred_block: str = "",
+    snapshots_so_far: list[dict[str, Any]] | None = None,
+    current_idx: int = 0,
+    prior_games: list[dict[str, Any]] | None = None,
+    game_index: int = 0,
+    total_games_in_series: int = 1,
+    match_format: str = "bo1",
 ) -> str:
+    """Compose the user prompt for one turn.
+
+    Includes (in order): board state header, current actives + benches,
+    GAME-STATE LEDGER, TURN-BY-TURN (this game), SERIES STATE (Bo3 only,
+    game_index > 0), YOUR SPREADS (inferred), and the threat matrix block.
+    """
     f = snapshot.get("field", {})
     field_parts = []
     if f.get("weather"):
@@ -420,7 +852,20 @@ def format_user_prompt(
     p1_bench = ", ".join(_summarize_bench(b) for b in p1.get("bench", [])) or "(none)"
     p2_bench = ", ".join(_summarize_bench(b) for b in p2.get("bench", [])) or "(none)"
 
+    # New historical context blocks.
+    snaps = snapshots_so_far or []
+    ledger_block = format_game_state_ledger(snapshot, snaps, current_idx)
+    rollup_block = format_turn_by_turn(snaps, current_idx, game_index=game_index)
+    series_block = ""
+    if match_format == "bo3" and prior_games:
+        series_block = format_series_state(
+            prior_games,
+            current_game_index=game_index,
+            total_games_in_series=total_games_in_series,
+        )
+
     spreads_block = (p1_inferred_block + "\n\n") if p1_inferred_block else ""
+    series_block_part = (series_block + "\n\n") if series_block else ""
 
     return (
         f"=== TURN {snapshot.get('turn', '?')} ===\n"
@@ -429,6 +874,9 @@ def format_user_prompt(
         f"YOUR (P1) BENCH: {p1_bench}\n\n"
         f"OPP (P2) ACTIVE:\n{p2_active_lines}\n"
         f"OPP (P2) BENCH: {p2_bench}\n\n"
+        f"{ledger_block}\n\n"
+        f"{rollup_block}\n\n"
+        f"{series_block_part}"
         f"{spreads_block}"
         f"{threat_matrix_text}"
     )
@@ -563,18 +1011,18 @@ async def process_match(
         for i in range(len(snapshots) - 1):
             snap_pre = snapshots[i]
             snap_post = snapshots[i + 1]
-            action_log = snap_pre.get("actionLog") or []
+            events_stream = snap_pre.get("events") or []
             turn = int(snap_pre.get("turn", 0))
             key = (match_id, game_idx, turn)
             if key in seen_keys:
                 stats["already_done"] += 1
                 continue
 
-            human_action_dict = extract_p1_actions(snap_pre, snap_post, action_log)
+            human_action_dict = extract_p1_actions(snap_pre, snap_post, events_stream)
             if human_action_dict is None:
                 stats["skipped_ambiguous"] += 1
                 await _safe_update_knowledge(
-                    snap_pre, snap_post, action_log, p1_knowledge, p2_knowledge,
+                    snap_pre, snap_post, events_stream, p1_knowledge, p2_knowledge,
                     session=aiohttp_session, base_url=calc_base_url,
                 )
                 continue
@@ -590,13 +1038,23 @@ async def process_match(
                 stats["skipped_threat_matrix_error"] += 1
                 _log_error(f"[{match_id} g{game_idx} t{turn}] threat_matrix failed: {e}")
                 await _safe_update_knowledge(
-                    snap_pre, snap_post, action_log, p1_knowledge, p2_knowledge,
+                    snap_pre, snap_post, events_stream, p1_knowledge, p2_knowledge,
                     session=aiohttp_session, base_url=calc_base_url,
                 )
                 continue
 
             p1_inferred = format_p1_inferred_spreads_block(snap_pre, p1_knowledge)
-            user_prompt = format_user_prompt(snap_pre, tm_text, p1_inferred_block=p1_inferred)
+            user_prompt = format_user_prompt(
+                snap_pre,
+                tm_text,
+                p1_inferred_block=p1_inferred,
+                snapshots_so_far=snapshots,
+                current_idx=i,
+                prior_games=games[:game_idx],
+                game_index=game_idx,
+                total_games_in_series=len(games),
+                match_format=match_format,
+            )
             human_action = {
                 "slot_1": human_action_dict.get("a", _slot_action("pass")),
                 "slot_2": human_action_dict.get("b", _slot_action("pass")),
@@ -641,7 +1099,7 @@ async def process_match(
                 stats["written"] += 1
 
             await _safe_update_knowledge(
-                snap_pre, snap_post, action_log, p1_knowledge, p2_knowledge,
+                snap_pre, snap_post, events_stream, p1_knowledge, p2_knowledge,
                 session=aiohttp_session, base_url=calc_base_url,
             )
 
@@ -649,15 +1107,19 @@ async def process_match(
 
 
 async def _safe_update_knowledge(
-    snap_pre, snap_post, action_log, p1_knowledge, p2_knowledge, *, session, base_url
+    snap_pre, snap_post, events_stream, p1_knowledge, p2_knowledge, *, session, base_url
 ):
-    try:
-        events = [damage_inferencer.DamageEvent(**e) for e in action_log]
-    except (TypeError, KeyError):
+    """Filter the new TurnEvent stream for damage observations and feed
+    them to the binary-search inferencer. Drops Metronome / Copycat /
+    Sketch / Snatch / Me First / Dancer / Instruct call-throughs (those
+    can hit moves not in the user's actual kit) but keeps Sleep Talk
+    (calls own moves only)."""
+    damage_events = damage_inferencer.events_to_damage_events(events_stream)
+    if not damage_events:
         return
     try:
         await damage_inferencer.update_knowledge(
-            snap_pre, snap_post, events, p1_knowledge, p2_knowledge,
+            snap_pre, snap_post, damage_events, p1_knowledge, p2_knowledge,
             session=session, base_url=base_url,
         )
     except Exception as e:

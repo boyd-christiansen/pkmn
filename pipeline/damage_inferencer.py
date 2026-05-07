@@ -274,6 +274,54 @@ def _filter_action_log(events: list[DamageEvent]) -> list[DamageEvent]:
     ]
 
 
+# Move callers we keep when filtering events for damage inference. Sleep
+# Talk only ever calls own moves, so its damage observations are still
+# valid attribution. Metronome / Copycat / Sketch / Snatch / Me First /
+# Dancer / Instruct can call moves the user doesn't own — calc-bound
+# updates against those would corrupt EV inference.
+_DAMAGE_INFERENCE_CALLERS_OK: frozenset[str | None] = frozenset({None, "Sleep Talk"})
+
+
+def events_to_damage_events(events: list[dict[str, Any]]) -> list[DamageEvent]:
+    """Convert new-schema TurnEvent stream → list[DamageEvent].
+
+    Filters:
+      - type == "move"
+      - called_via in {None, "Sleep Talk"}  (own moves only)
+      - hit.outcome == "damage"             (drop misses / blocks / immunes / fails)
+      - hit has hp_before_pct & hp_after_pct (well-formed)
+
+    A single move event with multiple damage hits expands to one
+    DamageEvent per hit. The downstream `_filter_action_log` then drops
+    any (attacker, move, defender) triple that appears multiple times,
+    which catches Triple Axel / Bullet Seed / Population Bomb
+    multi-hits (today's calc can't model `hits` properly).
+    """
+    out: list[DamageEvent] = []
+    for ev in events:
+        if not isinstance(ev, dict) or ev.get("type") != "move":
+            continue
+        if ev.get("called_via") not in _DAMAGE_INFERENCE_CALLERS_OK:
+            continue
+        attacker_slot = ev.get("attacker_slot", "")
+        move_name = ev.get("move_name", "")
+        for hit in ev.get("hits") or []:
+            if hit.get("outcome") != "damage":
+                continue
+            if "hp_before_pct" not in hit or "hp_after_pct" not in hit:
+                continue
+            out.append(DamageEvent(
+                attacker_slot=attacker_slot,
+                defender_slot=hit.get("defender_slot", ""),
+                move_name=move_name,
+                hp_before_pct=float(hit["hp_before_pct"]),
+                hp_after_pct=float(hit["hp_after_pct"]),
+                is_crit=bool(hit.get("is_crit", False)),
+                is_ko=bool(hit.get("is_ko", False)),
+            ))
+    return out
+
+
 def _apply_total_ev_constraint(entry: dict[str, dict[str, int]]) -> None:
     """Tighten max_evs using the 508-total constraint.
 
