@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>pkmn SFT inspector</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header>
+    <h1>pkmn SFT inspector</h1>
+    <nav class="tabs">
+      <button class="tab active" data-tab="browse">Browse</button>
+      <button class="tab" data-tab="compare">Compare</button>
+    </nav>
+    <span class="status" id="status">loading…</span>
+  </header>
+
+  <!-- ============================================================ -->
+  <!-- BROWSE TAB                                                   -->
+  <!-- ============================================================ -->
+  <main id="tab-browse" class="tab-pane active">
+    <aside class="sidebar" id="file-sidebar">
+      <div class="sidebar-section">
+        <h3>Current</h3>
+        <ul id="files-current"></ul>
+      </div>
+      <div class="sidebar-section">
+        <h3 class="collapsible collapsed" data-target="files-legacy">Legacy</h3>
+        <ul id="files-legacy" class="hidden"></ul>
+      </div>
+    </aside>
+
+    <section class="rows-pane" id="rows-pane">
+      <div class="pane-header" id="rows-header">
+        <span class="placeholder">pick a file to see its rows →</span>
+      </div>
+      <ul class="row-list" id="row-list"></ul>
+    </section>
+
+    <section class="detail-pane" id="detail-pane">
+      <div class="pane-header" id="detail-header">
+        <span class="placeholder">pick a row to see its details →</span>
+      </div>
+      <div class="detail-content" id="detail-content"></div>
+    </section>
+  </main>
+
+  <!-- ============================================================ -->
+  <!-- COMPARE TAB                                                  -->
+  <!-- ============================================================ -->
+  <main id="tab-compare" class="tab-pane">
+    <div class="compare-controls">
+      <p>Pin a row from the Browse tab using the <strong>📌 pin</strong> button.
+         Pinned rows show side-by-side here.</p>
+      <button id="clear-pinned">Clear pinned rows</button>
+    </div>
+    <div class="compare-grid">
+      <div class="compare-slot" id="compare-slot-A"><div class="placeholder">slot A — empty</div></div>
+      <div class="compare-slot" id="compare-slot-B"><div class="placeholder">slot B — empty</div></div>
+    </div>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

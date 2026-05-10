@@ -1,0 +1,16 @@
+[project]
+name = "pkmn-inspector"
+version = "0.1.0"
+description = "Local read-only web UI for inspecting SFT prompts, model responses, and source data."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["server", "data_loader", "prompt_parser", "pipeline_bridge"]
