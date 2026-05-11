@@ -480,7 +480,7 @@ raw replay JSON
 | `teacher/anthropic.py` | Anthropic adapter; default model `claude-sonnet-4-6`. Same tool-loop semantics. |
 | `teacher/google.py` | Google adapter; default model `gemini-3.1-pro-preview`. Same tool-loop semantics. |
 | `team_reconstruction.py` / `action_extraction.py` / `prompt_formatting.py` | Helper modules split out of the orchestrator so `master_pipeline.py` stays focused on CLI + per-match async loop. `bakeoff.py` imports from these directly rather than from `master_pipeline`. |
-| `bakeoff.py` | Head-to-head bake-off runner. Reports per-provider cost, tool-call rate, CoT length, action-match rate. |
+| `bakeoff.py` | Head-to-head bake-off runner. `--limit N` covers the first N matches in one invocation with one combined summary; `--match-id <substring>` for a single-match smoke run. Reports per-provider cost, tool-call rate, CoT length, action-match rate. Output is one `bakeoff_<provider>.jsonl` per provider, append-mode, resumable on rerun (skips rows already keyed by `(match_id, game_index, turn)`). |
 | `master_pipeline.py` | Working. `flip_match_to_winner` makes every SFT example come from the series winner's perspective; inferred-spread block (one-sided constraints) in user prompt; per-format system prompt branch; three new historical-context blocks (`GAME-STATE LEDGER` with Cumulative damage row, `TURN-BY-TURN`, `SERIES STATE` with full prior-game rollups); explicit empty-slot annotation for last-Pokémon scenarios; perspective-aware bench rendering (P1: full brought-set, P2: chronological via `seenSpecies`); `--provider {openai,anthropic,google}` flag. `--dry-run` exercises orchestration without LLM cost. |
 
 ## Planned follow-up workstreams (TODO)

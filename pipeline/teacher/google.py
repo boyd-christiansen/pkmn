@@ -37,15 +37,85 @@ DEFAULT_MODEL_GOOGLE = os.environ.get("TEACHER_MODEL_GOOGLE", "gemini-3.1-pro-pr
 
 
 def _to_function_declaration(openai_tool: dict[str, Any]) -> dict[str, Any]:
-    """OpenAI function-tool schema → Gemini FunctionDeclaration dict."""
+    """OpenAI function-tool schema → Gemini FunctionDeclaration dict.
+
+    Translates JSON Schema 2020-12 (OpenAI's input format) into the
+    OpenAPI 3.0 dialect that `google-genai`'s `Tool` accepts. Two
+    transforms matter:
+
+    1. Nullable types: `"type": ["string", "null"]` →
+       `"type": "string", "nullable": true`. Gemini's schema only allows
+       a single string for `type` and uses a separate boolean for
+       null-allowance.
+    2. Drop `additionalProperties` and other JSON-Schema-only keywords
+       Gemini's pydantic validator doesn't recognize.
+    """
     fn = openai_tool["function"]
-    # Gemini requires OpenAPI 3.0 schema; OpenAI's JSON Schema is compatible
-    # for our purposes. Strip $schema-level metadata if present.
     return {
         "name": fn["name"],
         "description": fn.get("description", ""),
-        "parameters": fn["parameters"],
+        "parameters": _translate_schema(fn["parameters"]),
     }
+
+
+# JSON-Schema keywords we silently drop when translating to Gemini's
+# OpenAPI 3.0 dialect. They're either unsupported or interpreted
+# differently — better to omit than to fail validation.
+_DROP_KEYWORDS = frozenset({
+    "$schema",
+    "additionalProperties",
+    "examples",
+    "definitions",
+})
+
+
+def _translate_schema(node: Any) -> Any:
+    """Recursively walk an OpenAPI/JSON-Schema tree, translating
+    nullable-array types, filtering empty enum values, and stripping
+    unsupported keywords.
+    """
+    if isinstance(node, list):
+        return [_translate_schema(x) for x in node]
+    if not isinstance(node, dict):
+        return node
+    out: dict[str, Any] = {}
+    for k, v in node.items():
+        if k in _DROP_KEYWORDS:
+            continue
+        if k == "type" and isinstance(v, list):
+            # JSON Schema 2020-12 nullable array → OpenAPI 3.0 type+nullable.
+            non_null = [t for t in v if t != "null"]
+            has_null = "null" in v
+            if len(non_null) == 1:
+                out["type"] = non_null[0]
+                if has_null:
+                    out["nullable"] = True
+            elif not non_null:
+                # `["null"]` alone — pretend it's a nullable string.
+                out["type"] = "string"
+                out["nullable"] = True
+            else:
+                # Multiple non-null types — Gemini doesn't support oneOf
+                # cleanly. Fall back to the first non-null type and mark
+                # nullable; downstream we'd need a richer translator if
+                # this ever becomes a real case.
+                out["type"] = non_null[0]
+                out["nullable"] = has_null
+        elif k == "enum" and isinstance(v, list):
+            # Gemini rejects empty-string enum values. Filter them out;
+            # the model can express "no value" by omitting the field
+            # entirely. (This matters for our `status` field whose
+            # original enum is ["", "brn", "par", "psn", "tox", "slp",
+            # "frz"] — the "" entry meant "no status applied", which
+            # for Gemini we drop and let the field be implicitly absent.)
+            filtered = [x for x in v if x != ""]
+            if filtered:
+                out["enum"] = filtered
+            # If filtering empties out the enum entirely, drop it; the
+            # field's `type` constraint still applies.
+        else:
+            out[k] = _translate_schema(v)
+    return out
 
 
 class GoogleProvider(TeacherProvider):

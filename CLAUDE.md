@@ -200,7 +200,7 @@ regression we saw on the first real run.
 Pick a provider via `master_pipeline.py --provider {openai,anthropic,google}`
 (default: `openai`). Override the model id with `--model gpt-5.5-pro` etc.
 
-For a head-to-head comparison: `python bakeoff.py --providers openai,anthropic,google`
+For a head-to-head comparison: `python bakeoff.py --providers openai,anthropic,google --limit 5`
 runs the same match through each provider and reports per-row cost,
 tool-call rate, CoT length, action-match rate, and wall-clock.
 
