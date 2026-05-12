@@ -581,14 +581,19 @@ def estimate_cost_usd(provider: str, model: str, in_tokens: int, out_tokens: int
 # (bakeoff.py, master_pipeline.py) call `detect_oracle_leak()` before saving;
 # any positive hit drops the row and bumps a `skipped_leak` counter.
 
-# TODO(model-judge-validator): the regex below catches obvious phrases
-# ("oracle", "expert's decision", "correct play") but misses subtler
-# meta-references ("clearly the right move", "the data points to", etc.).
-# A second-pass validator using a cheap model (e.g. gpt-5.5-mini) to score
-# each CoT pass/fail would catch more. Cost: ~$0.005/row. Wire as a
-# post-filter that returns the same `str | None` contract as
-# `detect_oracle_leak` so it slots into the existing retry-loop call sites
-# without changing them.
+# The regex below was tightened in 2026-05 after a v3-bake-off audit found
+# Anthropic produced "the target action" / "the target field" / "training
+# section" in ~32% of saved CoTs — strong meta-references that the
+# original regex missed because it only looked for "is" / "says" verbs
+# after "the target". OpenAI and Google produced 0 such references on the
+# same prompts, so the tightening is anthropic-specific in practice.
+#
+# The model-judge validator long-planned to catch the regex's misses
+# ("clearly the right move", "the data points to") shipped in plan v4 as
+# `teacher/judge.py`. The regex below is now the first-line filter; the
+# judge is the second-line filter that runs once per match (one API call
+# covering every turn at $0.0015/match). Both filters share the same
+# `extract_pre_tool_thought` helper.
 
 _LEAK_PATTERNS = re.compile(
     r"\b("
@@ -597,12 +602,37 @@ _LEAK_PATTERNS = re.compile(
     r"ground[- ]truth|"
     r"correct\s+(?:answer|decision|play|action)|"
     r"the\s+answer\s+(?:is|was)|"
-    r"the\s+target\s+(?:is|says)|"
+    r"the\s+target\s+(?:is|says|action|field|move|choice)|"
+    r"training[- ](?:mode|section|target|example)|"
     r"i\s+know\s+the\s+(?:answer|correct)|"
     r"given\s+the\s+answer"
     r")\b",
     re.IGNORECASE,
 )
+
+
+def extract_pre_tool_thought(messages: list[dict[str, Any]]) -> str | None:
+    """Pull the `pre_tool_thought` string out of a saved OpenAI-format
+    conversation.
+
+    Walks the saved messages, finds the `submit_decision` tool call (there
+    is at most one — the model commits exactly once), and returns the
+    `pre_tool_thought` argument verbatim. Returns None if no submit call
+    is found or the arguments fail to parse.
+
+    Shared by `detect_oracle_leak` (regex filter) and the model-judge
+    validator in `teacher/judge.py` — both need the same CoT extraction.
+    """
+    for m in messages:
+        for tc in (m.get("tool_calls") or []):
+            if (tc.get("function") or {}).get("name") != "submit_decision":
+                continue
+            try:
+                args = json.loads(tc["function"]["arguments"])
+            except (KeyError, TypeError, json.JSONDecodeError):
+                continue
+            return (args or {}).get("pre_tool_thought") or None
+    return None
 
 
 def detect_oracle_leak(messages: list[dict[str, Any]]) -> str | None:
@@ -616,19 +646,11 @@ def detect_oracle_leak(messages: list[dict[str, Any]]) -> str | None:
     produce text between tool calls) are ignored because those don't end up
     in the trained CoT.
     """
-    for m in messages:
-        for tc in (m.get("tool_calls") or []):
-            if (tc.get("function") or {}).get("name") != "submit_decision":
-                continue
-            try:
-                args = json.loads(tc["function"]["arguments"])
-            except (KeyError, TypeError, json.JSONDecodeError):
-                continue
-            cot = (args or {}).get("pre_tool_thought") or ""
-            match = _LEAK_PATTERNS.search(cot)
-            if match:
-                return match.group(0)
-    return None
+    cot = extract_pre_tool_thought(messages)
+    if not cot:
+        return None
+    match = _LEAK_PATTERNS.search(cot)
+    return match.group(0) if match else None
 
 
 class TeacherProvider(ABC):

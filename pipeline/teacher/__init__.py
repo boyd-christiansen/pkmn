@@ -39,12 +39,30 @@ from .base import (
     _call_calc,
     detect_oracle_leak,
     estimate_cost_usd,
+    extract_pre_tool_thought,
     render_system_prompt,
     render_system_prompt_bo3,
     synthesize_turn,
 )
 from .anthropic import DEFAULT_MODEL_ANTHROPIC, AnthropicProvider
+from .batch_openai import (
+    DEFAULT_MAX_CYCLE_WAIT_SECONDS,
+    DEFAULT_POLL_INTERVAL_SECONDS,
+    MAX_REQUESTS_PER_BATCH,
+    BatchOpenAIProvider,
+    BatchPollStatus,
+    BatchTeacherProvider,
+)
 from .google import DEFAULT_MODEL_GOOGLE, GoogleProvider
+from .judge import (
+    DEFAULT_JUDGE_MODEL,
+    DEFAULT_JUDGE_RETRIES,
+    DEFAULT_JUDGE_TIMEOUT,
+    JUDGE_SYSTEM_PROMPT,
+    JUDGE_USER_TEMPLATE,
+    JudgeResult,
+    judge_match_cots,
+)
 from .openai import OpenAIProvider
 
 __all__ = [
@@ -67,6 +85,7 @@ __all__ = [
     "_call_calc",
     "detect_oracle_leak",
     "estimate_cost_usd",
+    "extract_pre_tool_thought",
     "render_system_prompt",
     "render_system_prompt_bo3",
     "synthesize_turn",
@@ -76,4 +95,19 @@ __all__ = [
     "GoogleProvider",
     "DEFAULT_MODEL_GOOGLE",
     "OpenAIProvider",
+    # Judge (plan v4)
+    "DEFAULT_JUDGE_MODEL",
+    "DEFAULT_JUDGE_RETRIES",
+    "DEFAULT_JUDGE_TIMEOUT",
+    "JUDGE_SYSTEM_PROMPT",
+    "JUDGE_USER_TEMPLATE",
+    "JudgeResult",
+    "judge_match_cots",
+    # Batch (plan v4)
+    "BatchOpenAIProvider",
+    "BatchPollStatus",
+    "BatchTeacherProvider",
+    "DEFAULT_MAX_CYCLE_WAIT_SECONDS",
+    "DEFAULT_POLL_INTERVAL_SECONDS",
+    "MAX_REQUESTS_PER_BATCH",
 ]

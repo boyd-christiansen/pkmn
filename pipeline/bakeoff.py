@@ -450,21 +450,26 @@ def _print_summary(
 ) -> None:
     click.echo(f"\n=== bake-off summary ({n_matches} match{'es' if n_matches != 1 else ''}) ===")
     click.echo(
-        f"{'provider':12s} {'saved':>5s} {'leaks':>5s} {'match%':>7s} "
+        f"{'provider':12s} {'saved':>5s} {'dropped':>7s} {'retries':>7s} {'match%':>7s} "
         f"{'calc/turn':>10s} {'$/row':>8s} {'avg cot':>8s} {'wall':>7s}"
     )
     for p in providers:
         s = provider_state[p.name]
         saved = len(s["rows"])
         attempted = int(s["totals"]["turns_attempted"])
-        leaks = int(s["totals"]["skipped_leak"])
+        # `dropped` = turns whose CoT leaked the oracle past every retry.
+        # `retries` = total leak-induced retries spent recovering a turn.
+        # Together they're the two outcomes of the retry loop: success-after-
+        # retry vs. give-up-after-K-retries.
+        dropped = int(s["totals"].get("skipped_persistent_leak", 0))
+        retries = int(s["totals"].get("leak_retry", 0))
         match_rate = (s["totals"]["actions_matched"] / attempted * 100) if attempted else 0.0
         calc_per = (s["totals"]["calc_calls"] / attempted) if attempted else 0.0
         cost_per = (s["totals"]["cost_usd"] / saved) if saved else 0.0
         avg_cot = int(s["totals"]["cot_chars_total"] // saved) if saved else 0
         wall = s["totals"]["elapsed_seconds"]
         click.echo(
-            f"{p.name:12s} {saved:5d} {leaks:5d} {match_rate:6.1f}% "
+            f"{p.name:12s} {saved:5d} {dropped:7d} {retries:7d} {match_rate:6.1f}% "
             f"{calc_per:10.2f} ${cost_per:7.4f} {avg_cot:8d} {wall:6.1f}s"
         )
         click.echo(f"  → {output_paths[p.name]}  ({saved} rows added this run)")
