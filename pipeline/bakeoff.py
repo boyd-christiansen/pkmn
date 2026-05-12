@@ -48,7 +48,7 @@ from action_extraction import (
     slot_action,
 )
 from prompt_formatting import (
-    format_p1_inferred_spreads_block,
+    format_p1_known_spreads_block,
     format_p1_team_block,
     format_user_prompt,
 )
@@ -59,8 +59,10 @@ from team_reconstruction import (
     team_sheets_for_match,
 )
 from teacher import (
+    DEFAULT_LEAK_RETRIES,
     ProviderResult,
     TeacherProvider,
+    detect_oracle_leak,
     render_system_prompt,
     render_system_prompt_bo3,
 )
@@ -219,6 +221,7 @@ async def _bakeoff_one_match(
     calc_base_url: str,
     format_id: str,
     aiohttp_session: aiohttp.ClientSession,
+    leak_retries: int = DEFAULT_LEAK_RETRIES,
 ) -> None:
     """Run every turn through every provider for ONE match. Mutates
     `provider_state` (totals + rows) and appends to per-provider output
@@ -236,10 +239,19 @@ async def _bakeoff_one_match(
     team_sheets = meta["team_sheets"]
     bo1_system_prompt = meta["bo1_system_prompt"]
 
-    # Reset per-match KnowledgeStates while preserving rolling totals.
+    # Compute match-final P1 bounds ONCE for this match — shared across
+    # all providers since it's an offline inferencer pass, not a per-
+    # provider observation. Each provider then gets a fresh running p1/p2
+    # state for the chronological inference that drives the threat
+    # matrix's OPP side.
+    p1_final, _ = await damage_inferencer.infer_match_final_bounds(
+        games, init["p1_species"], init["p2_species"],
+        session=aiohttp_session, base_url=calc_base_url,
+    )
     for p in providers:
-        provider_state[p.name]["p1_knowledge"] = damage_inferencer.init_knowledge(init["p1_species"])
-        provider_state[p.name]["p2_knowledge"] = damage_inferencer.init_knowledge(init["p2_species"])
+        provider_state[p.name]["p1_running"] = damage_inferencer.init_knowledge(init["p1_species"])
+        provider_state[p.name]["p2_running"] = damage_inferencer.init_knowledge(init["p2_species"])
+        provider_state[p.name]["p1_final"] = p1_final  # match-final, shared
 
     match_id = match_record.get("match_id", "unknown")
     click.echo(f"\n=== match {match_id} ({match_format}, {len(games)} game(s)) ===")
@@ -265,16 +277,18 @@ async def _bakeoff_one_match(
 
             human_action_dict = extract_p1_actions(snap_pre, snap_post, events_stream)
             if human_action_dict is None:
-                # Always advance knowledge even on skipped turns so the
-                # next turn's threat matrix isn't stale.
+                # Always advance the running KnowledgeStates even on
+                # skipped turns so the next turn's threat matrix isn't
+                # stale. Only the running states change here — p1_final
+                # is a match-level constant.
                 damage_events = damage_inferencer.events_to_damage_events(events_stream)
                 if damage_events:
                     for p in providers:
                         try:
                             await damage_inferencer.update_knowledge(
                                 snap_pre, snap_post, damage_events,
-                                provider_state[p.name]["p1_knowledge"],
-                                provider_state[p.name]["p2_knowledge"],
+                                provider_state[p.name]["p1_running"],
+                                provider_state[p.name]["p2_running"],
                                 session=aiohttp_session, base_url=calc_base_url,
                             )
                         except Exception:
@@ -298,9 +312,12 @@ async def _bakeoff_one_match(
                     continue
 
                 try:
+                    # Asymmetric threat matrix: P1 uses match-final bounds
+                    # (we know our team), P2 uses chronological running
+                    # bounds (we learn about opp turn by turn).
                     tm_text = await threat_matrix.generate_threat_matrix(
                         snap_pre, "p1",
-                        state["p1_knowledge"], state["p2_knowledge"],
+                        state["p1_final"], state["p2_running"],
                         format_id=format_id,
                         session=aiohttp_session,
                         base_url=calc_base_url,
@@ -309,10 +326,11 @@ async def _bakeoff_one_match(
                     click.echo(f"  {p.name:10s} threat_matrix failed: {e}")
                     continue
 
-                inferred = format_p1_inferred_spreads_block(snap_pre, state["p1_knowledge"])
+                # YOUR SPREADS uses match-final P1 bounds.
+                spreads = format_p1_known_spreads_block(snap_pre, state["p1_final"])
                 user_prompt = format_user_prompt(
                     snap_pre, tm_text,
-                    p1_inferred_block=inferred,
+                    p1_inferred_block=spreads,
                     snapshots_so_far=snapshots,
                     current_idx=i,
                     prior_games=games[:game_idx],
@@ -321,13 +339,42 @@ async def _bakeoff_one_match(
                     match_format=match_format,
                 )
 
-                res: ProviderResult = await p.synthesize_turn(
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    human_action=human_action,
-                    calc_url=f"{calc_base_url}/calc",
-                    aiohttp_session=aiohttp_session,
-                )
+                # Leak-retry loop. With `leak_retries=0` (smoke default),
+                # this collapses to a single call as before — useful for
+                # measuring raw leak frequency.
+                attempts = 0
+                res: ProviderResult | None = None
+                row_dropped = False
+                while True:
+                    res = await p.synthesize_turn(
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        human_action=human_action,
+                        calc_url=f"{calc_base_url}/calc",
+                        aiohttp_session=aiohttp_session,
+                    )
+                    if res.messages is None:
+                        break  # API error — counted below, no retry
+                    leak = detect_oracle_leak(res.messages)
+                    if not leak:
+                        break
+                    if attempts >= leak_retries:
+                        # Out of retries — drop the row.
+                        state["totals"]["skipped_persistent_leak"] += 1
+                        click.echo(
+                            f"  {p.name:10s} [DROPPED after {attempts+1} attempt(s) — "
+                            f"persistent leak phrase {leak!r}]",
+                            err=True,
+                        )
+                        row_dropped = True
+                        break
+                    attempts += 1
+                    state["totals"]["leak_retry"] += 1
+                    click.echo(
+                        f"  {p.name:10s} leak retry {attempts}/{leak_retries} — "
+                        f"phrase {leak!r}",
+                        err=True,
+                    )
 
                 submit_args = _extract_submit_args(res.messages)
                 action = (submit_args or {}).get("action")
@@ -358,7 +405,7 @@ async def _bakeoff_one_match(
                     f"cot={cot_chars:4d}ch  match={action_match}{err_str}"
                 )
 
-                if res.messages is not None:
+                if res.messages is not None and not row_dropped:
                     row = {
                         "match_id": match_id,
                         "game_index": game_idx,
@@ -372,15 +419,17 @@ async def _bakeoff_one_match(
                         f.write(json.dumps(row) + "\n")
                     seen_keys[p.name].add(key)
 
-            # Update knowledge for all providers using the actual events.
+            # Update each provider's running KnowledgeStates from the
+            # actual events. p1_final is a match-level constant and
+            # doesn't change here.
             damage_events = damage_inferencer.events_to_damage_events(events_stream)
             if damage_events:
                 for p in providers:
                     try:
                         await damage_inferencer.update_knowledge(
                             snap_pre, snap_post, damage_events,
-                            provider_state[p.name]["p1_knowledge"],
-                            provider_state[p.name]["p2_knowledge"],
+                            provider_state[p.name]["p1_running"],
+                            provider_state[p.name]["p2_running"],
                             session=aiohttp_session, base_url=calc_base_url,
                         )
                     except Exception:
@@ -401,23 +450,24 @@ def _print_summary(
 ) -> None:
     click.echo(f"\n=== bake-off summary ({n_matches} match{'es' if n_matches != 1 else ''}) ===")
     click.echo(
-        f"{'provider':12s} {'rows':>5s} {'match%':>7s} {'calc/turn':>10s} "
-        f"{'$/row':>8s} {'avg cot':>8s} {'wall':>7s}"
+        f"{'provider':12s} {'saved':>5s} {'leaks':>5s} {'match%':>7s} "
+        f"{'calc/turn':>10s} {'$/row':>8s} {'avg cot':>8s} {'wall':>7s}"
     )
     for p in providers:
         s = provider_state[p.name]
-        rows = int(s["totals"]["turns_succeeded"])
+        saved = len(s["rows"])
         attempted = int(s["totals"]["turns_attempted"])
+        leaks = int(s["totals"]["skipped_leak"])
         match_rate = (s["totals"]["actions_matched"] / attempted * 100) if attempted else 0.0
         calc_per = (s["totals"]["calc_calls"] / attempted) if attempted else 0.0
-        cost_per = (s["totals"]["cost_usd"] / rows) if rows else 0.0
-        avg_cot = int(s["totals"]["cot_chars_total"] // rows) if rows else 0
+        cost_per = (s["totals"]["cost_usd"] / saved) if saved else 0.0
+        avg_cot = int(s["totals"]["cot_chars_total"] // saved) if saved else 0
         wall = s["totals"]["elapsed_seconds"]
         click.echo(
-            f"{p.name:12s} {rows:5d} {match_rate:6.1f}% {calc_per:10.2f} "
-            f"${cost_per:7.4f} {avg_cot:8d} {wall:6.1f}s"
+            f"{p.name:12s} {saved:5d} {leaks:5d} {match_rate:6.1f}% "
+            f"{calc_per:10.2f} ${cost_per:7.4f} {avg_cot:8d} {wall:6.1f}s"
         )
-        click.echo(f"  → {output_paths[p.name]}  ({len(s['rows'])} rows added this run)")
+        click.echo(f"  → {output_paths[p.name]}  ({saved} rows added this run)")
 
 
 # =============================================================================
@@ -426,14 +476,20 @@ def _print_summary(
 
 
 @click.command()
-@click.option("--input", "input_path",
+@click.option("--input", "input_paths",
               type=click.Path(exists=True, dir_okay=False, path_type=Path),
-              default=str(DEFAULT_BO3_INPUT),
-              show_default=True)
+              multiple=True,
+              default=(str(DEFAULT_BO3_INPUT),),
+              show_default=True,
+              help="Match-records JSONL. Pass --input multiple times to include several files "
+                   "(e.g. one Bo3 + one Bo1) in the same bake-off run.")
 @click.option("--match-id", default=None,
-              help="Match-id substring to select. Single-match mode (mutually exclusive with --limit).")
+              help="Match-id substring to select from the FIRST --input file. Single-match mode "
+                   "(mutually exclusive with --limit). Use this when you want to compare on one "
+                   "specific match.")
 @click.option("--limit", type=int, default=None,
-              help="Run on the first N matches in --input. Default: 1 (single-match smoke run).")
+              help="Per-input: run on the first N matches of EACH --input file. Default behavior "
+                   "(neither --limit nor --match-id): one match per input file.")
 @click.option("--providers", "providers_csv", default="openai,anthropic,google", show_default=True,
               help="Comma-separated subset of {openai,anthropic,google} to run.")
 @click.option("--output-dir",
@@ -442,11 +498,23 @@ def _print_summary(
               show_default=True)
 @click.option("--calc-base-url", default=DEFAULT_CALC_BASE_URL, show_default=True)
 @click.option("--format-id", default=None,
-              help="Override the format_id derived from input filename.")
-def cli(input_path, match_id, limit, providers_csv, output_dir, calc_base_url, format_id):
-    """Run a head-to-head bake-off across frontier teacher models on N matches."""
+              help="Override the format_id derived from input filename. If using multiple --input, "
+                   "this override applies to ALL inputs (rare; usually let the per-file default apply).")
+@click.option("--leak-retries", type=int, default=DEFAULT_LEAK_RETRIES, show_default=True,
+              help="Retries per turn when the teacher's CoT contains a ground-truth-leak phrase. "
+                   "Default 0 for bake-off (measure raw leak frequency). Master_pipeline defaults to 3 in production.")
+def cli(input_paths, match_id, limit, providers_csv, output_dir, calc_base_url, format_id, leak_retries):
+    """Run a head-to-head bake-off across frontier teacher models.
+
+    Pass one or more `--input` JSONL files. The bake-off picks matches
+    from each (one match per file by default, or first N matches per
+    file via --limit, or a specific match via --match-id) and runs every
+    selected provider through every turn. One combined summary at the end.
+    """
     if match_id and limit is not None:
         raise click.UsageError("--match-id and --limit are mutually exclusive.")
+    if match_id and len(input_paths) > 1:
+        raise click.UsageError("--match-id only works with a single --input file.")
 
     selected = {p.strip() for p in providers_csv.split(",") if p.strip()}
     providers = _build_providers(selected)
@@ -454,54 +522,66 @@ def cli(input_path, match_id, limit, providers_csv, output_dir, calc_base_url, f
         click.echo("FATAL: no providers available (no API keys set)", err=True)
         sys.exit(1)
 
-    records = []
-    with input_path.open() as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            records.append(json.loads(line))
-
-    if not records:
-        click.echo(f"FATAL: no records in {input_path}", err=True)
-        sys.exit(1)
-
-    if match_id:
-        # Single-match by substring match.
-        matched = [r for r in records if match_id in r["match_id"]]
-        if not matched:
-            click.echo(f"FATAL: no record matched id substring {match_id!r}", err=True)
+    # Build target list across all --input files. Each element is
+    # (match_record, format_id) — the format_id is per-file so that
+    # Bo3 and Bo1 inputs get different canonical_priors lookups.
+    target_records: list[tuple[dict[str, Any], str]] = []
+    for ipath in input_paths:
+        ipath = Path(ipath)
+        records = []
+        with ipath.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                records.append(json.loads(line))
+        if not records:
+            click.echo(f"FATAL: no records in {ipath}", err=True)
             sys.exit(1)
-        target_records = matched[:1]
-    else:
-        # Default: limit=1 (single-match smoke run); otherwise take first N.
-        n = limit if limit is not None else 1
-        target_records = records[:n]
 
-    derived_format = format_id or ("gen9vgc2026regibo3" if "bo3" in input_path.stem else "gen9vgc2026regi")
+        # Derive per-file format_id (overridable).
+        derived_format = (
+            format_id
+            or ("gen9vgc2026regibo3" if "bo3" in ipath.stem else "gen9vgc2026regi")
+        )
 
-    asyncio.run(_run(target_records, providers, Path(output_dir), calc_base_url, derived_format))
+        if match_id:
+            matched = [r for r in records if match_id in r["match_id"]]
+            if not matched:
+                click.echo(f"FATAL: no record matched id substring {match_id!r} in {ipath}", err=True)
+                sys.exit(1)
+            for r in matched[:1]:
+                target_records.append((r, derived_format))
+        else:
+            n = limit if limit is not None else 1
+            for r in records[:n]:
+                target_records.append((r, derived_format))
+
+    asyncio.run(_run(target_records, providers, Path(output_dir), calc_base_url, leak_retries))
 
 
 async def _run(
-    target_records: list[dict[str, Any]],
+    target_records: list[tuple[dict[str, Any], str]],
     providers: list[TeacherProvider],
     output_dir: Path,
     calc_base_url: str,
-    format_id: str,
+    leak_retries: int,
 ) -> None:
     timeout = aiohttp.ClientTimeout(total=180, connect=10)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Per-provider state — totals accumulate across all matches; KnowledgeStates
-    # are reset per match by `_bakeoff_one_match`.
+    # Per-provider state — totals accumulate across all matches;
+    # `p1_final` / `p1_running` / `p2_running` are reset per match in
+    # `_bakeoff_one_match` (p1_final is computed there too — a match-
+    # level constant once per match).
     provider_state: dict[str, dict[str, Any]] = {}
     output_paths: dict[str, Path] = {}
     seen_keys: dict[str, set[tuple[str, int, int]]] = {}
     for p in providers:
         provider_state[p.name] = {
-            "p1_knowledge": {},  # (re)initialized per match
-            "p2_knowledge": {},
+            "p1_final": {},     # match-final P1 bounds, set per match
+            "p1_running": {},   # chronological P1 (diagnostics-only)
+            "p2_running": {},   # chronological P2 (drives matrix's opp side)
             "rows": [],
             "totals": defaultdict(float),
         }
@@ -528,15 +608,16 @@ async def _run(
                 f"  Start it with:  cd calc_microservice && npm run dev"
             )
 
-        for record in target_records:
+        for record, fmt_id in target_records:
             await _bakeoff_one_match(
                 record, providers,
                 provider_state=provider_state,
                 output_paths=output_paths,
                 seen_keys=seen_keys,
                 calc_base_url=calc_base_url,
-                format_id=format_id,
+                format_id=fmt_id,
                 aiohttp_session=session,
+                leak_retries=leak_retries,
             )
 
     _print_summary(

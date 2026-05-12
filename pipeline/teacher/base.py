@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
@@ -40,7 +41,35 @@ from openai import AsyncOpenAI
 
 DEFAULT_MODEL = os.environ.get("TEACHER_MODEL", "gpt-5.5")
 DEFAULT_CALC_URL = "http://localhost:3000/calc"
-MAX_TOOL_ITERATIONS = 8  # need ≥3 (calc → result → submit), buffer for alternatives
+MAX_TOOL_ITERATIONS = 10  # soft ceiling; the forcing function below should
+                          # keep us well below this in practice. If we hit it
+                          # something is wrong (model degenerated into a loop).
+
+# Cap cumulative `calculate_damage` calls per turn. Once a model has issued
+# this many calc calls, the next iteration's tool_choice forces
+# `submit_decision` instead of leaving the choice open. Empirically:
+# OpenAI uses 1–3 calc calls, Anthropic 2–4, Google 8–11; this cap lets all
+# three have headroom while preventing Google's calc-walking degenerate
+# pattern from hitting MAX_TOOL_ITERATIONS. Applied uniformly to all
+# providers so we get a uniform upper bound regardless of model behavior.
+MAX_CALC_CALLS_BEFORE_FORCE_SUBMIT = 5
+
+# Default leak-retry budgets surfaced via CLI flags on each orchestrator.
+# A leak is detected when the saved CoT contains meta-references to the
+# ground-truth target (e.g. "the oracle", "the correct play"). On a hit
+# we retry the same turn with a fresh API call; after this many retries
+# without success, we drop the turn and count it as `skipped_persistent_leak`.
+DEFAULT_LEAK_RETRIES = 0       # smoke / bakeoff default — measure raw leak rate
+PRODUCTION_LEAK_RETRIES = 3    # master_pipeline default — recover from leaks
+
+# Two-tier wall-clock timeouts. The provider SDKs have their own internal
+# retry/backoff loops; without explicit `asyncio.wait_for` wrappers a hung
+# connection can pin a turn for hours (we hit this empirically: a single
+# Anthropic call hung the bake-off for ~2h before discovery). These are
+# defense-in-depth — the SDKs should usually respect their own timeouts,
+# but these guarantee we never spin forever.
+PER_CALL_TIMEOUT = 120     # seconds for a single LLM API request
+PER_TURN_TIMEOUT = 300     # seconds for one full synthesize_turn() tool loop
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +250,16 @@ def _species_key(s: str) -> str:
 # approach has the teacher cherry-picking weak alternatives because it knows
 # the answer; a proper search would surface alternatives that genuinely
 # competed with the chosen play.
-_SHARED_RULES_TAIL = """2. The Tool Rule: You have two tools. `calculate_damage` verifies any specific damage hypothetical — switch outcomes, future-turn ranges, opposing Tera predictions, +1/+2 boosted scenarios. `submit_decision` is how you commit your final play; call it exactly once when ready. **You MUST call `calculate_damage` at least once before calling `submit_decision`.** The pre-computed threat matrix already covers current matchup damage cells — don't re-calc those; use the tool for hypotheticals only.
+_SHARED_RULES_TAIL = """2. The Tool Rule: You have two tools.
+
+   • `calculate_damage` is a precision instrument for hypotheticals the threat matrix doesn't cover. The matrix already enumerates every active-vs-active damage cell for the current turn — DO NOT re-calc those. Use the tool only for:
+     - Switch-ins from your bench ("if I bring Calyrex in, what does Lunala do to it?")
+     - Backline matchups ("how much does opp's Miraidon OHKO us for when they come in?")
+     - Future-state ("at +2 SpA after Calm Mind, does Tera Starstorm OHKO Lunala?")
+     - Tera predictions ("if opp Tera's their Flutter Mane to Fairy, does Dazzling Gleam KO me?")
+     If the matrix already answers your question, commit via `submit_decision` immediately — there is no per-turn minimum.
+
+   • `submit_decision` is how you commit your final play. Call it exactly once when ready. You may call `submit_decision` as your first tool call if the matrix is sufficient.
 
 3. The Threat-Matrix Rule: Each line shows an Absolute damage envelope (provable from observed play). When the canonical meta spread is consistent with the inferred bounds, a Probable envelope is also shown; when it's contradicted, only Absolute is shown tagged `(off-meta)`.
 
@@ -266,7 +304,23 @@ CRITICAL RULES:
 
 SYNTHESIS_GROUND_TRUTH_SUFFIX = """
 
-=== EXPERT'S DECISION (oracle truth — articulate the chain of reasoning that justifies exactly this play) ===
+=== TRAINING-MODE TARGET (visible during synthesis only; stripped before saving) ===
+
+The action below is the one your `submit_decision` must commit to.
+
+In `pre_tool_thought`, produce the chain of reasoning that arrives at this
+action — phrased as a first-person, real-time analysis of the board state +
+threat matrix + your own calc-tool results. Reason from the data; do not
+reason from the target.
+
+CRITICAL — your reasoning must NEVER reference the existence of this section,
+the target, or the fact that you know the correct action. Banned phrases
+include (non-exhaustive): "the oracle", "the expert", "the expert's decision",
+"the answer is", "the correct play is", "the target says", "ground truth",
+"I know the correct action", "given the answer", or any similar
+meta-reference. The trained model only sees the board state — your CoT must
+read as if you arrived at this play independently from the same inputs.
+
 {ground_truth_json}
 """
 
@@ -511,6 +565,70 @@ def estimate_cost_usd(provider: str, model: str, in_tokens: int, out_tokens: int
     table = PRICE_PER_M_TOKENS.get(provider, {})
     in_p, out_p = table.get(model, (0.0, 0.0))
     return (in_tokens * in_p + out_tokens * out_p) / 1_000_000.0
+
+
+# =============================================================================
+# Oracle-leak detection (training-data hygiene)
+# =============================================================================
+#
+# When the model writes "the oracle agrees" or "the expert's decision is X" in
+# its CoT, that's a leak from the SYNTHESIS_GROUND_TRUTH_SUFFIX into the saved
+# training data. A student trained on those rows would learn to look for an
+# oracle/expert/correct-answer phrase, not how to reason from board state.
+#
+# The rewritten suffix now bans these phrases explicitly, but this filter is
+# the belt-and-suspenders catch for stragglers. Both orchestrators
+# (bakeoff.py, master_pipeline.py) call `detect_oracle_leak()` before saving;
+# any positive hit drops the row and bumps a `skipped_leak` counter.
+
+# TODO(model-judge-validator): the regex below catches obvious phrases
+# ("oracle", "expert's decision", "correct play") but misses subtler
+# meta-references ("clearly the right move", "the data points to", etc.).
+# A second-pass validator using a cheap model (e.g. gpt-5.5-mini) to score
+# each CoT pass/fail would catch more. Cost: ~$0.005/row. Wire as a
+# post-filter that returns the same `str | None` contract as
+# `detect_oracle_leak` so it slots into the existing retry-loop call sites
+# without changing them.
+
+_LEAK_PATTERNS = re.compile(
+    r"\b("
+    r"oracle|"
+    r"expert['’]?s?\s+(?:decision|answer|target|truth)|"
+    r"ground[- ]truth|"
+    r"correct\s+(?:answer|decision|play|action)|"
+    r"the\s+answer\s+(?:is|was)|"
+    r"the\s+target\s+(?:is|says)|"
+    r"i\s+know\s+the\s+(?:answer|correct)|"
+    r"given\s+the\s+answer"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def detect_oracle_leak(messages: list[dict[str, Any]]) -> str | None:
+    """Scan `submit_decision.pre_tool_thought` for ground-truth-leak phrases.
+
+    Returns the first matched phrase (for logging) or None if clean. Callers
+    drop the row on a non-None return and log via their own stats counter.
+
+    Only inspects the final `submit_decision` tool call's arguments — leaks
+    in intermediate assistant text (rare; OpenAI/Anthropic don't typically
+    produce text between tool calls) are ignored because those don't end up
+    in the trained CoT.
+    """
+    for m in messages:
+        for tc in (m.get("tool_calls") or []):
+            if (tc.get("function") or {}).get("name") != "submit_decision":
+                continue
+            try:
+                args = json.loads(tc["function"]["arguments"])
+            except (KeyError, TypeError, json.JSONDecodeError):
+                continue
+            cot = (args or {}).get("pre_tool_thought") or ""
+            match = _LEAK_PATTERNS.search(cot)
+            if match:
+                return match.group(0)
+    return None
 
 
 class TeacherProvider(ABC):

@@ -375,6 +375,60 @@ async def update_knowledge(
     return p1_knowledge, p2_knowledge
 
 
+async def infer_match_final_bounds(
+    games: list[dict[str, Any]],
+    p1_species: list[str],
+    p2_species: list[str],
+    *,
+    session: aiohttp.ClientSession | None = None,
+    base_url: str = DEFAULT_CALC_BASE_URL,
+    fuzzy_hp_pct: float = FUZZY_HP_TOLERANCE,
+) -> tuple[KnowledgeState, KnowledgeState]:
+    """Run the inferencer across every turn of every game in the match.
+
+    Used to compute "match-final" bounds for P1 — the tightest knowledge
+    the inferencer can extract from observing the complete match. These
+    bounds approximate "the spread the player actually built and knew at
+    deploy time" (which is what we'll have access to in production).
+
+    Implementation: just init both KnowledgeStates and walk every
+    `(snapshot_pre, snapshot_post, events)` triple in turn order across
+    all games, calling `update_knowledge` exactly as the per-turn loop
+    in master_pipeline does. Pure offline batch — no row writes, no
+    prompt rendering, no model calls.
+
+    Returns `(p1_final_bounds, p2_final_bounds)`. Callers typically only
+    use the P1 result (for the YOUR SPREADS prompt block + the matrix's
+    P1 side). The P2 result is returned for completeness; it represents
+    "what an outside observer would learn about P2 by end-of-match", and
+    isn't currently surfaced — the matrix's P2 side uses the running
+    chronological state to preserve the proper observational asymmetry.
+    """
+    p1 = init_knowledge(p1_species)
+    p2 = init_knowledge(p2_species)
+
+    own_session = session is None
+    if own_session:
+        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
+    try:
+        for game in games:
+            snaps = game.get("snapshots") or []
+            for i in range(len(snaps) - 1):
+                snap_pre, snap_post = snaps[i], snaps[i + 1]
+                events_stream = snap_pre.get("events") or []
+                damage_events = events_to_damage_events(events_stream)
+                if not damage_events:
+                    continue
+                await update_knowledge(
+                    snap_pre, snap_post, damage_events, p1, p2,
+                    session=session, base_url=base_url, fuzzy_hp_pct=fuzzy_hp_pct,
+                )
+    finally:
+        if own_session:
+            await session.close()
+    return p1, p2
+
+
 async def _process_event(
     event: DamageEvent,
     snapshot_pre: dict[str, Any],

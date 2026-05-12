@@ -45,7 +45,7 @@ from action_extraction import (
     slot_action,
 )
 from prompt_formatting import (
-    format_p1_inferred_spreads_block,
+    format_p1_known_spreads_block,
     format_p1_team_block,
     format_user_prompt,
 )
@@ -55,7 +55,13 @@ from team_reconstruction import (
     reconstruct_p2_species,
     team_sheets_for_match,
 )
-from teacher import TeacherProvider, render_system_prompt, render_system_prompt_bo3
+from teacher import (
+    PRODUCTION_LEAK_RETRIES,
+    TeacherProvider,
+    detect_oracle_leak,
+    render_system_prompt,
+    render_system_prompt_bo3,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PIPELINE_DIR = Path(__file__).resolve().parent
@@ -152,6 +158,7 @@ async def process_match(
     seen_keys: set[tuple[str, int, int]],
     dry_run: bool,
     model: str,
+    leak_retries: int = PRODUCTION_LEAK_RETRIES,
 ) -> dict[str, int]:
     # Series-winner-as-P1: every SFT example is generated from the perspective
     # of the player who won the series. P2-won matches are relabeled in full.
@@ -175,8 +182,21 @@ async def process_match(
         p1_species_universe = list(p1_team_recon.keys())
         p2_species_universe = reconstruct_p2_species(games)
 
-    p1_knowledge = damage_inferencer.init_knowledge(p1_species_universe)
-    p2_knowledge = damage_inferencer.init_knowledge(p2_species_universe)
+    # Two parallel KnowledgeStates for P1 + one for P2:
+    #   p1_running  — fed turn-by-turn; kept for diagnostics + the inspector.
+    #                 NOT used in prompts (the player knows their own team).
+    #   p1_final    — computed once below from the full match; surfaces as
+    #                 the YOUR SPREADS block AND drives the matrix's P1 side.
+    #                 Approximates "the exact spread the player built".
+    #   p2_running  — fed turn-by-turn; drives the matrix's P2 side.
+    #                 Models the observational asymmetry — we learn about
+    #                 the opponent through play.
+    p1_running = damage_inferencer.init_knowledge(p1_species_universe)
+    p2_running = damage_inferencer.init_knowledge(p2_species_universe)
+    p1_final, _ = await damage_inferencer.infer_match_final_bounds(
+        games, p1_species_universe, p2_species_universe,
+        session=aiohttp_session, base_url=calc_base_url,
+    )
 
     # Bo1 system prompt is stable across all turns of the match.
     bo1_system_prompt = (
@@ -216,14 +236,17 @@ async def process_match(
             if human_action_dict is None:
                 stats["skipped_ambiguous"] += 1
                 await _safe_update_knowledge(
-                    snap_pre, snap_post, events_stream, p1_knowledge, p2_knowledge,
+                    snap_pre, snap_post, events_stream, p1_running, p2_running,
                     session=aiohttp_session, base_url=calc_base_url,
                 )
                 continue
 
             try:
+                # Threat matrix gets the asymmetric (p1_final, p2_running) pair:
+                # tight bounds for our side (we know our team), loose
+                # chronological bounds for the opponent (we learn over time).
                 tm_text = await threat_matrix.generate_threat_matrix(
-                    snap_pre, "p1", p1_knowledge, p2_knowledge,
+                    snap_pre, "p1", p1_final, p2_running,
                     format_id=format_id,
                     session=aiohttp_session,
                     base_url=calc_base_url,
@@ -232,16 +255,18 @@ async def process_match(
                 stats["skipped_threat_matrix_error"] += 1
                 _log_error(f"[{match_id} g{game_idx} t{turn}] threat_matrix failed: {e}")
                 await _safe_update_knowledge(
-                    snap_pre, snap_post, events_stream, p1_knowledge, p2_knowledge,
+                    snap_pre, snap_post, events_stream, p1_running, p2_running,
                     session=aiohttp_session, base_url=calc_base_url,
                 )
                 continue
 
-            p1_inferred = format_p1_inferred_spreads_block(snap_pre, p1_knowledge)
+            # YOUR SPREADS surfaces match-final P1 bounds (the player's
+            # own-team knowledge stand-in).
+            p1_spreads = format_p1_known_spreads_block(snap_pre, p1_final)
             user_prompt = format_user_prompt(
                 snap_pre,
                 tm_text,
-                p1_inferred_block=p1_inferred,
+                p1_inferred_block=p1_spreads,
                 snapshots_so_far=snapshots,
                 current_idx=i,
                 prior_games=games[:game_idx],
@@ -254,31 +279,58 @@ async def process_match(
                 "slot_2": human_action_dict.get("b", slot_action("pass")),
             }
 
-            messages: list[dict[str, Any]] | None
+            messages: list[dict[str, Any]] | None = None
             if dry_run:
                 messages = _dry_run_messages(system_prompt, user_prompt, human_action)
             else:
                 if teacher is None:
                     raise RuntimeError("Teacher provider missing in non-dry-run mode")
-                try:
-                    res = await teacher.synthesize_turn(
-                        system_prompt=system_prompt,
-                        user_prompt=user_prompt,
-                        human_action=human_action,
-                        calc_url=f"{calc_base_url}/calc",
-                        aiohttp_session=aiohttp_session,
-                    )
-                    messages = res.messages
-                    if res.error and not messages:
-                        _log_error(f"[{match_id} g{game_idx} t{turn}] teacher LLM: {res.error}")
+                # Leak-retry loop: synthesize, check for ground-truth leakage,
+                # retry up to `leak_retries` times on a hit.
+                attempts = 0
+                while True:
+                    try:
+                        res = await teacher.synthesize_turn(
+                            system_prompt=system_prompt,
+                            user_prompt=user_prompt,
+                            human_action=human_action,
+                            calc_url=f"{calc_base_url}/calc",
+                            aiohttp_session=aiohttp_session,
+                        )
+                        messages = res.messages
+                    except Exception as e:
                         stats["skipped_llm_error"] += 1
-                except Exception as e:
-                    stats["skipped_llm_error"] += 1
-                    _log_error(f"[{match_id} g{game_idx} t{turn}] teacher LLM failed: {e}")
-                    messages = None
+                        _log_error(f"[{match_id} g{game_idx} t{turn}] teacher LLM failed: {e}")
+                        messages = None
+                        break
+                    if messages is None:
+                        if res.error:
+                            _log_error(f"[{match_id} g{game_idx} t{turn}] teacher LLM: {res.error}")
+                        stats["skipped_llm_error"] += 1
+                        break
+                    leak = detect_oracle_leak(messages)
+                    if not leak:
+                        break
+                    if attempts >= leak_retries:
+                        stats["skipped_persistent_leak"] += 1
+                        _log_error(
+                            f"[{match_id} g{game_idx} t{turn}] persistent leak after "
+                            f"{attempts+1} attempt(s) — phrase {leak!r}; dropping row"
+                        )
+                        messages = None
+                        break
+                    attempts += 1
+                    stats["leak_retry"] += 1
+                    _log_error(
+                        f"[{match_id} g{game_idx} t{turn}] leak retry {attempts}/"
+                        f"{leak_retries} — phrase {leak!r}"
+                    )
 
             if messages is None:
-                stats["skipped_llm_failed"] += 1
+                # API error, persistent leak, or dry-run-with-no-teacher.
+                # Either way, no row gets written; stats already counted.
+                if not dry_run:
+                    stats.setdefault("skipped_llm_failed", 0)
             else:
                 async with file_lock:
                     with output_path.open("a") as f:
@@ -293,7 +345,7 @@ async def process_match(
                 stats["written"] += 1
 
             await _safe_update_knowledge(
-                snap_pre, snap_post, events_stream, p1_knowledge, p2_knowledge,
+                snap_pre, snap_post, events_stream, p1_running, p2_running,
                 session=aiohttp_session, base_url=calc_base_url,
             )
 
@@ -381,6 +433,7 @@ async def run(
     dry_run: bool,
     model: str | None,
     provider: str,
+    leak_retries: int = PRODUCTION_LEAK_RETRIES,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     timeout = aiohttp.ClientTimeout(total=180, connect=10)
@@ -419,6 +472,7 @@ async def run(
                     seen_keys=seen_keys,
                     dry_run=dry_run,
                     model=model,
+                    leak_retries=leak_retries,
                 )
 
         results = await tqdm.gather(*(worker(r) for r in records), desc="matches", unit="match")
@@ -470,12 +524,18 @@ async def run(
     default=None,
     help="Override the default model id for the chosen provider.",
 )
-def cli(input_path, output_path, calc_base_url, format_id, limit, concurrency, dry_run, provider, model):
+@click.option(
+    "--leak-retries", type=int, default=PRODUCTION_LEAK_RETRIES, show_default=True,
+    help="Retries per turn when the teacher's CoT contains a ground-truth-leak phrase. "
+         "0 = drop on first hit (smoke / measurement). Default in production: 3.",
+)
+def cli(input_path, output_path, calc_base_url, format_id, limit, concurrency, dry_run,
+        provider, model, leak_retries):
     """Generate the SFT training JSONL from parsed replay data."""
     resolved_format = _resolve_format_id(input_path, format_id)
     click.echo(
         f"using format_id={resolved_format}  dry_run={dry_run}  "
-        f"provider={provider}  model={model or '(default)'}"
+        f"provider={provider}  model={model or '(default)'}  leak_retries={leak_retries}"
     )
     asyncio.run(
         run(
@@ -488,6 +548,7 @@ def cli(input_path, output_path, calc_base_url, format_id, limit, concurrency, d
             dry_run=dry_run,
             model=model,
             provider=provider,
+            leak_retries=leak_retries,
         )
     )
 

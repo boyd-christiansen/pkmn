@@ -115,7 +115,24 @@ def _format_actives_with_empty_slots(side_snap: dict[str, Any]) -> str:
 
 
 # =============================================================================
-# YOUR SPREADS — inferred per-stat EV constraints
+# YOUR SPREADS — per-stat EV info for the player's own team
+# =============================================================================
+#
+# Semantically this block surfaces "what the player knows about their own
+# Pokémon's spreads". At deploy time that's exact values from the
+# team-builder JSON; during training synthesis it's the tightest bounds
+# the inferencer can extract from observing the *complete* match (see
+# `damage_inferencer.infer_match_final_bounds`). Either way, the model
+# should treat the block as known/given — the section is deliberately NOT
+# labelled "(inferred)" to avoid prompting the model to second-guess
+# numbers it would in fact have at deploy.
+#
+# Risk acknowledged: stats with no observations (e.g. SpD of a Pokémon
+# that never took special damage in this match) render as `?`. The model
+# could theoretically learn "if SpD is `?`, the mon never took spdamage"
+# — implicit signal leak. Mitigated by not explaining derivation in the
+# prompt. TODO: substitute canonical priors for fully-open stats so the
+# block looks the same whether observation was sparse or rich.
 # =============================================================================
 
 
@@ -124,22 +141,28 @@ _FULLY_OPEN_MIN = 0
 _FULLY_OPEN_MAX = 252
 
 
-def format_p1_inferred_spreads_block(
+def format_p1_known_spreads_block(
     snapshot: dict[str, Any],
     p1_knowledge: dict[str, dict[str, dict[str, int]]],
 ) -> str:
-    """Render `=== YOUR SPREADS (inferred) ===` block.
+    """Render `=== YOUR SPREADS ===` block (no "(inferred)" tag).
 
     For each active P1 mon, show every stat whose bound has been tightened
     on either side beyond the fully-open `[0, 252]` defaults. Stats with
     no constraint render as `?`. If the upper bound is tightened only,
     show as `≤ N`; lower bound only, `≥ N`; both, the explicit range.
     Pinned to a single value when min == max.
+
+    The caller should pass the **match-final** P1 KnowledgeState (from
+    `damage_inferencer.infer_match_final_bounds`), NOT the running
+    chronological state. This block represents "what the player knows
+    about their own team" — knowledge they had at deploy time, not
+    knowledge that accrues turn by turn.
     """
     actives = (snapshot.get("p1") or {}).get("active") or []
     if not actives:
         return ""
-    lines: list[str] = ["=== YOUR SPREADS (inferred) ==="]
+    lines: list[str] = ["=== YOUR SPREADS ==="]
     for p in actives:
         species = p.get("species") or "?"
         key = _species_key(species)
