@@ -7,20 +7,31 @@ conversational training data.
 pipeline/
 ├── replay_parser.py          # raw replay JSONs → per-turn snapshot JSONL
 ├── canonical_priors.py       # Smogon chaos data lookup (no network)
-├── damage_inferencer.py      # binary-search EV bound inference
+├── damage_inferencer.py      # binary-search EV bound inference +
+│                             #   infer_match_final_bounds (match-final pass)
 ├── threat_matrix.py          # dual-track damage envelope per turn
 ├── team_reconstruction.py    # P1 team / brought-set / sheet helpers
 ├── action_extraction.py      # winner-flip + extract_p1_actions
 ├── prompt_formatting.py      # 8-section user-prompt composer
-├── master_pipeline.py        # CLI orchestrator (the only file allowed
-│                             #   to import from every other module here)
+├── master_pipeline.py        # CLI orchestrator with --mode {sync,batch,hybrid}
+│                             #   dispatcher (the only file allowed to import
+│                             #   from every other module here)
+├── batch_runner.py           # Plan v4: batch-mode state machine + shared
+│                             #   _prepare_match_turns helper. Per-cycle
+│                             #   submissions across all matches; resume via
+│                             #   batch_state/{match_id}.json
 ├── bakeoff.py                # head-to-head provider runner
 └── teacher/                  # provider-agnostic teacher LLM
     ├── __init__.py           # re-exports for `from teacher import ...`
-    ├── base.py               # TeacherProvider ABC, schemas, prompts
-    ├── openai.py             # OpenAI adapter
+    ├── base.py               # TeacherProvider ABC, schemas, prompts,
+    │                         #   detect_oracle_leak + extract_pre_tool_thought
+    ├── openai.py             # OpenAI adapter (production default)
     ├── anthropic.py          # Anthropic adapter
-    └── google.py             # Google adapter
+    ├── google.py             # Google adapter
+    ├── judge.py              # Plan v4: judge_match_cots — match-level
+    │                         #   model-judge validator for CoT hygiene
+    └── batch_openai.py       # Plan v4: BatchTeacherProvider ABC +
+                              #   BatchOpenAIProvider (OpenAI Batch API)
 ```
 
 ## Setup
@@ -277,12 +288,17 @@ JUSTIFYING a known human play. The model has only one output channel
 
 - **Layout:** `teacher/base.py` carries the `TeacherProvider` ABC, the
   `calculate_damage` and `submit_decision` tool schemas, the system-
-  prompt templates, the cost-table, and a shared `_call_calc` helper.
-  Concrete adapters in `teacher/openai.py`, `teacher/anthropic.py`,
+  prompt templates, the cost-table, the regex `detect_oracle_leak` +
+  shared `extract_pre_tool_thought` helper, and the shared `_call_calc`
+  helper. Concrete adapters in `teacher/openai.py`, `teacher/anthropic.py`,
   `teacher/google.py` each implement `synthesize_turn` against their
-  SDK's tool-call format. `teacher/__init__.py` re-exports the public
-  surface so call sites use `from teacher import TeacherProvider,
-  OpenAIProvider`.
+  SDK's tool-call format. `teacher/judge.py` carries the match-level
+  model-judge validator (Plan v4). `teacher/batch_openai.py` carries
+  the `BatchTeacherProvider` ABC + `BatchOpenAIProvider` for the
+  OpenAI Batch API (Plan v4). `teacher/__init__.py` re-exports the
+  entire public surface so call sites use `from teacher import
+  TeacherProvider, OpenAIProvider, judge_match_cots,
+  BatchOpenAIProvider, ...`.
 - **API:** `await provider.synthesize_turn(system_prompt, user_prompt,
   human_action, ...)` → `ProviderResult` with `.messages: list[dict]
   | None`, `.iterations`, `.input_tokens`, `.output_tokens`,
@@ -298,23 +314,196 @@ JUSTIFYING a known human play. The model has only one output channel
   calls — so it can't bypass `calculate_damage` by emitting a direct
   structured response (this fixed an earlier zero-tool-call regression).
 - **Ground-truth handling:** during the API call, the user message has the
-  human's play appended as an `=== EXPERT'S DECISION ===` suffix. The
-  returned messages have that suffix **stripped** — saved SFT examples
-  show only board state + threat matrix.
-- **Tool loop:** up to 6 iterations (`MAX_TOOL_ITERATIONS`). Each iteration:
-  call OpenAI, append assistant message, execute any `calculate_damage`
-  tool calls via `aiohttp` to `/calc`, append tool messages, loop. Returns
-  on a no-tool-call response (final answer) or `None` on iteration cap.
+  human's play appended as a `=== TRAINING-MODE TARGET ===` suffix
+  (rewritten in Plan v3 from `=== EXPERT'S DECISION ===` to discourage
+  meta-leaks). The returned messages have that suffix **stripped** —
+  saved SFT examples show only board state + threat matrix.
+- **Tool loop:** up to 10 iterations (`MAX_TOOL_ITERATIONS`) with a
+  5-call upper cap (`MAX_CALC_CALLS_BEFORE_FORCE_SUBMIT`) — past 5 calc
+  calls, `tool_choice` forces `submit_decision`. No per-turn minimum on
+  calc calls (Plan v3 dropped the iter-0 forced calc; the rewritten
+  Tool Rule directs calc at hypotheticals the matrix doesn't cover).
+  Per-call timeout 120s + per-turn ceiling 300s via `asyncio.wait_for`.
+- **Leak filtering (Plan v3 + v4).** Two stages:
+  1. **Regex.** `detect_oracle_leak(messages)` matches "oracle",
+     "ground-truth", "the target {is,says,action,field}", "training
+     {mode,section,target,example}", etc. — patterns we've observed in
+     real bake-off rows. Called by `master_pipeline._synthesize_with_leak_retry`
+     on every synthesis; retries up to `--leak-retries` times.
+  2. **Model judge.** After all of a match's turns synthesize,
+     `judge_match_cots` (gpt-5.5) sees every CoT in one call and
+     returns turn indices to retry. Catches softer phrasings the regex
+     misses ("clearly the right move", "the data points to"). Bake-off
+     audit showed OpenAI + Google produce 0 such near-misses; Anthropic
+     produced them in 32% of saved rows — motivating the judge layer.
 - **Critical Rules in the system prompt** include the **Masking Rule**
   verbatim from the project spec: `[UNREVEALED_MOVE]` slots are presumed
   suboptimal and not to be reasoned about.
-- **Touches:** OpenAI Chat Completions API + `/calc` (tool execution).
-  No replay parsing, no inference, no canonical-priors imports.
+- **Touches:** OpenAI / Anthropic / Google Chat APIs + `/calc` (tool
+  execution). No replay parsing, no inference, no canonical-priors imports.
+
+### `teacher/judge.py` *(implemented — Plan v4)*
+
+Match-level CoT hygiene validator. After all of a match's turns are
+synthesized (sync or batch), the orchestrator submits every turn's
+`pre_tool_thought` to a cheap OpenAI model in **one** call and gets back
+turn indices to retry.
+
+- **API:** `await judge_match_cots(turn_records, *, client,
+  model=DEFAULT_JUDGE_MODEL) -> JudgeResult`. `turn_records[i]` is a
+  dict with `match_id`, `game_idx`, `turn`, `pre_tool_thought` — the
+  `turn_idx` field is the 0-based position into the list, which is what
+  the judge references in its response. `JudgeResult.flagged_turn_indices`
+  is a `list[int]` (empty = clean match); `JudgeResult.reasons[idx]` is
+  a short quote-from-CoT explaining each flag.
+- **Why match-level not per-row.** Amortizes a fixed system prompt
+  across N turns. One call for an 8-turn match costs ~$0.014 with
+  gpt-5.5 (~$0.0015 with gpt-5.5-mini when access opens up) versus
+  ~$0.04 if we judged each row separately. Also lets the judge see
+  cross-turn patterns ("multiple consecutive turns reference the
+  training framing").
+- **Default model:** `gpt-5.5` (the bake-off-winning teacher model).
+  Plan v4 spec'd `gpt-5.5-mini` for the cost win, but the project's
+  account doesn't currently have access; falls back to gpt-5.5 with a
+  note in the module to set `JUDGE_MODEL=gpt-5.5-mini` once available.
+- **Structured output.** The judge call uses
+  `response_format=json_schema` with a strict schema requiring
+  `{flagged_turns: [{turn_idx, reason}]}`. No partial parses, no
+  recovery — if the SDK returns malformed JSON we **fail open**
+  (return all rows as if the judge passed) rather than risk losing a
+  whole match.
+- **Truncation policy.** CoTs longer than 6000ch are truncated with a
+  visible marker before going into the judge prompt — keeps judge cost
+  predictable regardless of how chatty the teacher got.
+- **Prompt design.** `JUDGE_SYSTEM_PROMPT` includes 4 positive examples
+  (must flag: "Looking at the target action...", "The training section
+  indicates...", etc.) and 3 negative examples (must NOT flag: real
+  competent VGC reasoning even when confident). Tuned against actual
+  bake-off rows.
+- **Touches:** OpenAI Chat Completions API only. No `/calc`, no
+  inference, no other teacher provider imports.
+
+### `teacher/batch_openai.py` *(implemented — Plan v4)*
+
+OpenAI Batch API plumbing. Used by `batch_runner.py` to issue one batch
+cycle per tool-loop iteration across all in-flight matches at once.
+
+- **`BatchTeacherProvider` ABC:** four methods — `build_request`,
+  `submit_batch`, `poll`, `fetch_results` (plus `cancel`). Provider-
+  agnostic in spirit; OpenAI is the only concrete adapter in v1.
+- **`BatchOpenAIProvider`:**
+  - `build_request(custom_id, api_messages, tool_choice) -> dict` —
+    renders one JSONL line of the batch upload, mirroring exactly
+    what `OpenAIProvider._do_turn` sends synchronously (same tools,
+    `parallel_tool_calls=False`, omitted `max_tokens` /
+    `temperature` because gpt-5.5 rejects those).
+  - `submit_batch(requests) -> batch_id` — uploads the JSONL via
+    `client.files.create(..., purpose="batch")` and creates the
+    batch with `completion_window="24h"`. Returns the batch id.
+  - `poll(batch_id) -> BatchPollStatus` — single status tick.
+  - `poll_until_done(batch_id, *, poll_interval_seconds,
+    max_wait_seconds)` — convenience wrapper; terminates on
+    `completed | failed | expired | cancelled`.
+  - `fetch_results(batch_id) -> dict[custom_id, response]` —
+    downloads the output file and parses it into a dict keyed by
+    `custom_id`. Each value mirrors the shape of a sync chat-completions
+    response so the orchestrator's response-handler stays symmetric
+    with the sync path.
+- **Custom ID encoding.** `"{match_id}::g{game}::t{turn}::iter{cycle}"`.
+  The cycle component matters because a single (match, game, turn)
+  WorkItem produces multiple batch requests across its tool-loop
+  lifetime — one per iter.
+- **Architectural constraint (documented in module header).** Batch API
+  can't span tool-loop iterations within a single line. So each tool-
+  loop iter becomes its own batch cycle; all turns at iter=K bundle
+  into one upload; calc microservice calls run synchronously between
+  cycles. This is why `batch_runner.py` is a per-cycle state machine.
+- **Touches:** OpenAI Files API + Batch API. No `/calc`, no `submit_batch`-
+  to-`fetch_results` state on this side (state lives in `batch_runner`).
+
+### `batch_runner.py` *(implemented — Plan v4)*
+
+Sibling of `master_pipeline.py`. Owns the per-iteration batch state
+machine. Reuses every leaf module from `pipeline/` directly (same
+`damage_inferencer`, `threat_matrix`, `prompt_formatting`, etc.) and the
+new `teacher/judge.py` + `teacher/batch_openai.py`.
+
+- **Shared prep:** `_prepare_match_turns(match_record, *, format_id,
+  calc_base_url, aiohttp_session, seen_keys) -> tuple[list[TurnPrep],
+  stats_dict]`. Pure-compute half of the old `process_match` —
+  knowledge state seeding, `infer_match_final_bounds`, per-turn threat
+  matrix + prompt formatting + ground-truth injection. No LLM calls.
+  Used by both sync mode (`master_pipeline.process_match`) and batch
+  mode. Yields a `TurnPrep` per identifiable turn (`match_id`,
+  `game_idx`, `turn`, `format_id`, `system_prompt`, `user_prompt`
+  (plain), `human_action`, `api_messages` (with ground-truth suffix
+  ready to send)).
+- **`BatchWorkItem`:** the mutable state of one turn across the state
+  machine's lifetime. Serializable to JSON for resume. Status
+  transitions: `pending → submitted → {pending, committed, failed}`;
+  terminal states `committed → {leak_persistent, judge_flagged_persistent,
+  written}`. Carries an `active_batch_id` breadcrumb — non-None while
+  the item is waiting on a batch response, so `--resume` can find the
+  right batch to re-poll on restart.
+- **State persistence:** one JSON file per match in `batch_state/
+  {match_id}.json` with the full WorkItem list + the match's
+  `format_id`. Atomic via `tmp + rename`. A separate global index
+  isn't needed in v1 — recovery scans every state file.
+- **`run_batch_for_matches(matches, ...)`** — the orchestrator entry
+  point:
+  1. **Prep.** For each match, either restore from
+     `batch_state/{match_id}.json` (if `--resume`) or call
+     `_prepare_match_turns` and write the initial state file.
+  2. **Resume preamble.** Drain any in-flight batches from a prior
+     crash via `_resume_inflight_batches`: group items with
+     `status="submitted"` by `active_batch_id`, re-poll each batch,
+     fetch results, apply to the items.
+  3. **Cycle loop** (up to `MAX_TOOL_ITERATIONS` cycles).
+     - Collect items with `status="pending"` and `iter == cycle`.
+     - One batch upload per cycle covering every in-flight match.
+     - Submit → persist `active_batch_id` per item → poll → fetch
+       → apply (`_apply_batch_response`: append assistant msg, run
+       sync `/calc` for any calc tool calls, advance iter or commit).
+     - Persist after each cycle.
+  4. **Regex leak filter.** `detect_oracle_leak` on every committed
+     item; drops `leak_persistent` status.
+  5. **Match-level judge** (when `--use-judge`, default on). Calls
+     `_run_judge_with_retries` from `master_pipeline` — the same
+     helper sync mode uses. Judge re-synthesis falls back to the
+     sync teacher (batch latency is too high to be useful for
+     retry).
+  6. **Atomic per-match write.** Each match's surviving rows go to
+     the SFT JSONL under `file_lock`; items mark `written`.
+- **Touches:** OpenAI Batch API (via `BatchOpenAIProvider`) + `/calc`
+  (between cycles, sync) + OpenAI Chat Completions (for the judge +
+  judge re-synthesis fallback).
 
 ### `master_pipeline.py` *(implemented)*
 
 Orchestrator. Walks `parsed_data/{bo1,bo3}.jsonl`, generates one SFT example
 per identifiable turn, writes to `parsed_data/sft_training_data.jsonl`.
+
+**`--mode {sync,batch,hybrid}` dispatcher (Plan v4).** The top-level CLI
+flag picks one of three execution strategies:
+
+- **`sync`** *(default)* — per-turn `synthesize_turn()` inline; one match
+  at a time (up to `--concurrency`); per-match buffered write so judge
+  can run before commit.
+- **`batch`** — dispatches to `batch_runner.run_batch_for_matches`. One
+  OpenAI Batch cycle per tool-loop iteration; all in-flight turns
+  bundle into one batch upload; per-match resume state in
+  `batch_state/{match_id}.json`. OpenAI-only in v1.
+- **`hybrid`** — runs the first `--hybrid-sync-n` matches sync as a
+  quality gate. If `match_rate ≥ --hybrid-min-match-rate` AND
+  `leak_rate ≤ --hybrid-max-leak-rate` after the sync portion, the
+  remaining matches go through batch. Otherwise the run halts before
+  submitting any batch upload — surfaces quality regressions before
+  committing thousands of dollars.
+
+All three modes share the same `_prepare_match_turns` (from
+`batch_runner.py`), the same regex leak filter (`detect_oracle_leak`),
+the same match-level judge (`_run_judge_with_retries`), and the same
+per-match atomic write to JSONL under `file_lock`.
 
 **Series-winner-as-P1.** Every saved SFT example is generated from the
 perspective of the player who won the series (Bo3: 2 of 3 games; Bo1:
@@ -332,16 +521,33 @@ losing patterns at the same Elo. Including some intra-series losses
 series-winner sometimes drops a game to RNG / matchup, and that
 reasoning is still high-quality.
 
-**Inferred P1 spreads in the user prompt.** Each turn's user prompt
-includes a `=== YOUR SPREADS (inferred) ===` block listing every
-tightened EV bound for each active P1 mon. The render uses one-sided
-constraints — `Stat ≤N` when only the upper bound has narrowed,
-`Stat ≥N` when only the lower bound has narrowed, the explicit range
-when both, or `Stat N` when pinned to a single value. Fully-open
-stats roll up into a trailing `, others ?`. The Spread Rule in the
-system prompt tells the model how to reason from ranges (worst case
-for survival checks, best case for offensive checks) and
-acknowledges that exact values may also be presented at deploy time.
+**Match-final P1 spreads in the user prompt (Plan v3).** Each turn's
+user prompt includes a `=== YOUR SPREADS ===` block listing every
+tightened EV bound for each active P1 mon. Computed once per match via
+`damage_inferencer.infer_match_final_bounds` — the tightest bounds the
+inferencer can extract from the **entire** match's events. The player
+knew their own spreads from day one, and the match-final bound is the
+closest approximation available at training time. (At deploy time the
+operator surfaces exact spreads from the team-builder JSON.) The render
+uses one-sided constraints — `Stat ≤N` when only the upper bound has
+narrowed, `Stat ≥N` when only the lower bound has narrowed, the
+explicit range when both, or `Stat N` when pinned to a single value.
+Fully-open stats roll up into a trailing `, others ?`. The Spread Rule
+in the system prompt tells the model how to reason from ranges (worst
+case for survival checks, best case for offensive checks).
+
+**Asymmetric threat matrix (Plan v3).** The threat matrix gets the
+`(p1_final, p2_running)` pair: match-final-tight P1 bounds (we know
+our own team), chronological-loose P2 bounds (we learn about the
+opponent through play). Models the realistic information asymmetry —
+our damage ranges tighter on our side, wider on theirs.
+
+**Per-match buffered write (Plan v4).** Turns synthesize into a
+`match_buffer` list in memory. After the per-turn loop completes,
+`_run_judge_with_retries` runs the match-level judge; flagged turns
+re-synthesize through the sync teacher (regardless of `--mode`); after
+exhausting `--judge-retries`, only the still-flagged turns drop. The
+rest of the match commits atomically to the SFT JSONL.
 
 - **`reconstruct_p1_team(games)`** — forward-scan over every snapshot in
   the match (across all Bo3 games), aggregating revealed `item`, `ability`,
@@ -421,25 +627,57 @@ cd pipeline
 # Smoke test (no API key needed):
 .venv/bin/python master_pipeline.py --limit 1 --dry-run
 
-# Real run on a single Bo3 match (OpenAI default, gpt-5.5):
+# Real run on a single Bo3 match (OpenAI default, gpt-5.5, judge on):
 OPENAI_API_KEY=sk-... .venv/bin/python master_pipeline.py --limit 1
 
-# Pick a different provider:
+# Production: hybrid mode — first 50 sync as quality gate, rest via Batch:
+OPENAI_API_KEY=sk-... .venv/bin/python master_pipeline.py \
+    --mode hybrid --hybrid-sync-n 50
+
+# Pure batch mode (OpenAI-only in v1); resume in-flight batches:
+OPENAI_API_KEY=sk-... .venv/bin/python master_pipeline.py \
+    --mode batch --resume
+
+# Pick a different provider (sync only for non-OpenAI in v1):
 ANTHROPIC_API_KEY=sk-... .venv/bin/python master_pipeline.py \
     --provider anthropic --limit 1
 ```
 
+##### Synthesis flags
+
 | Flag | Default | Notes |
 |---|---|---|
 | `--input` | `parsed_data/bo3.jsonl` | Match-records JSONL from replay_parser. |
-| `--output` | `parsed_data/sft_training_data.jsonl` | Append-only JSONL. |
+| `--output` | `parsed_data/sft_training_data.jsonl` | Append-only JSONL; per-match atomic commit. |
 | `--calc-base-url` | `http://localhost:3000` | |
 | `--format-id` | auto from filename | Drives chaos-priors lookup. |
 | `--limit` | none | Process first N matches (test batch). |
-| `--concurrency` | `1` | Keep low to respect provider rate limits. |
-| `--dry-run` | off | Skip the LLM call entirely. |
-| `--provider` | `openai` | Choice of `openai` / `anthropic` / `google`. |
+| `--concurrency` | `1` | Sync mode: max matches in flight. Keep low for rate limits. |
+| `--dry-run` | off | Skip the LLM call entirely. Works in sync and batch modes. |
+| `--provider` | `openai` | Choice of `openai` / `anthropic` / `google`. Batch mode requires `openai`. |
 | `--model` | per-provider default | OpenAI: `gpt-5.5`. Anthropic: `claude-sonnet-4-6`. Google: `gemini-3.1-pro-preview`. Override with `TEACHER_MODEL_{OPENAI,ANTHROPIC,GOOGLE}` env vars. |
+| `--leak-retries` | `3` | Regex-leak retries per turn before the row drops. `0` for smoke / measurement runs. |
+
+##### Judge flags (Plan v4)
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--use-judge / --no-judge` | `--use-judge` | Toggle the per-match model-judge validator. Requires `OPENAI_API_KEY` regardless of teacher provider. |
+| `--judge-model` | `gpt-5.5` | Model used for the judge call. Set `JUDGE_MODEL=gpt-5.5-mini` in env for the cost win once mini access opens up. |
+| `--judge-retries` | `2` | Re-synthesis passes after the judge flags a turn. On exhaustion, drops only flagged turns. |
+
+##### Batch / hybrid flags (Plan v4)
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--mode` | `sync` | One of `sync` / `batch` / `hybrid`. |
+| `--state-dir` | `pipeline/batch_state/` | Where per-match `{match_id}.json` resume files live. |
+| `--poll-interval-seconds` | `60` | Batch status-poll cadence. |
+| `--max-cycle-wait-seconds` | `86400` | Per-cycle SLA. Batch API guarantees 24h. |
+| `--resume` | off | Re-use prior state files; re-poll in-flight batches before entering the cycle loop. |
+| `--hybrid-sync-n` | `50` | Hybrid: matches to run sync as a quality gate. |
+| `--hybrid-min-match-rate` | `0.95` | Hybrid halt threshold: minimum `written / attempted` ratio. |
+| `--hybrid-max-leak-rate` | `0.02` | Hybrid halt threshold: maximum `dropped / attempted` ratio. |
 
 ### Orchestrator data flow
 
@@ -447,24 +685,42 @@ ANTHROPIC_API_KEY=sk-... .venv/bin/python master_pipeline.py \
 raw replay JSON
     → replay_parser  →  per-turn snapshots (with TurnEvent[] events stream)
     │
-    │  per match: K1, K2 = init_knowledge(p1_team), init_knowledge(p2_team)
-    │             (full open bounds — canonical priors live in Probable track only)
+    │  per match (sync mode — sketch; batch_runner mirrors but with a per-iter
+    │  state machine across all matches in flight):
     │
-    │  for each turn in order:
-    │    → master_pipeline.extract_p1_actions(snap_pre, snap_post, events)
-    │      (the human's ground-truth play; skip turn if ambiguous)
-    │    → threat_matrix.generate(snap_pre, "p1", K1, K2, format_id=…)
-    │      (dual-track Absolute + Probable; off-meta lines drop Probable)
-    │    → format_user_prompt(snap_pre, ..., snapshots_so_far, current_idx,
-    │                         prior_games, game_index, match_format)
-    │      (composes board state + GAME-STATE LEDGER + TURN-BY-TURN +
-    │       SERIES STATE + YOUR SPREADS + threat matrix)
-    │    → teacher_llm.synthesize_turn(system, user, human_action)
-    │      (tool-call loop, returns OpenAI fine-tuning messages)
-    │    → write JSONL row
-    │    → damage_events = events_to_damage_events(events)  # filter callers + outcomes
-    │    → damage_inferencer.update_knowledge(snap_pre, snap_post, damage_events, K1, K2)
-    │      (tightens both KnowledgeStates atomically + 508-EV constraint)
+    │    p1_running = init_knowledge(p1_team)    # chronological (diagnostics only)
+    │    p2_running = init_knowledge(p2_team)    # chronological (drives matrix p2)
+    │    p1_final, _ = await infer_match_final_bounds(games, ...)
+    │      (one full-match offline pass — match-final P1 bounds, surfaced in
+    │       YOUR SPREADS at every turn AND drives matrix p1 side)
+    │
+    │    for each turn in order:
+    │      → action_extraction.extract_p1_actions(snap_pre, snap_post, events)
+    │        (the human's ground-truth play; skip turn if ambiguous)
+    │      → threat_matrix.generate(snap_pre, "p1", p1_final, p2_running, ...)
+    │        (dual-track Absolute + Probable; asymmetric pair gives realistic
+    │         tightness on our side, looseness on theirs; off-meta lines drop Probable)
+    │      → prompt_formatting.format_user_prompt(snap_pre, ..., snapshots_so_far,
+    │                            current_idx, prior_games, game_index, match_format)
+    │        (composes board state + GAME-STATE LEDGER + TURN-BY-TURN +
+    │         SERIES STATE + YOUR SPREADS [match-final P1] + threat matrix)
+    │      → master_pipeline._synthesize_with_leak_retry(teacher, ...)
+    │        (tool-call loop + regex leak filter + retry up to --leak-retries)
+    │      → buffer the row + the (system_prompt, user_prompt, human_action) ctx
+    │      → damage_events = events_to_damage_events(events)
+    │      → damage_inferencer.update_knowledge(snap_pre, snap_post, damage_events,
+    │                                            p1_running, p2_running)
+    │        (tightens both KnowledgeStates atomically + 508-EV constraint —
+    │         p2_running is what next turn's matrix reads; p1_running is just
+    │         diagnostics now since p1_final supplanted it)
+    │
+    │    # End of per-turn loop — match still in memory, nothing on disk yet:
+    │
+    │    → master_pipeline._run_judge_with_retries(match_buffer, turn_contexts, ...)
+    │      (one judge call across all CoTs; flagged turns re-synthesize via the
+    │       sync teacher; after --judge-retries, drops only flagged turns)
+    │
+    │    → atomic per-match write of surviving rows under file_lock
 ```
 
 ## Status
@@ -473,32 +729,38 @@ raw replay JSON
 |---|---|
 | `replay_parser.py` | Working. Run `python replay_parser.py --help`. Captures per-turn `events` (TurnEvent[]) from `/parse_log` into the JSONL. |
 | `canonical_priors.py` | Working. Library + bootstrap CLI. Reads Smogon Chaos JSON when present; falls back to curated table → heuristic. |
-| `damage_inferencer.py` | Working. Dual-state, two-way binary search, atomic apply, 508-EV constraint pass, crit-aware via `/calc isCrit`, multi-hit filter, `events_to_damage_events()` filter for non-own-move callers (Metronome / Copycat / Sketch / Snatch / Me First / Dancer / Instruct / Mirror Move / Assist / Nature Power excluded; Sleep Talk allowed). |
-| `threat_matrix.py` | Working. Dual-track Absolute + Probable output. When canonical priors are ≥40-EV-clipped by the inferred bounds, the Probable column is dropped and the line tagged `(off-meta)`. Optional `format_id` drives Smogon-backed priors. |
-| `teacher/base.py` | Provider-agnostic core: `TeacherProvider` ABC, schemas (incl. `submit_decision` tool), prompt templates (6 rules: Masking/OTS, Tool, Threat-Matrix, Spread, Alternatives, Output), ground-truth stripping. Present-tense system prompts. `# TODO(rlhf-followup)` flags the prompt-driven alternative evaluation as temporary. |
-| `teacher/openai.py` | OpenAI adapter; default model `gpt-5.5`. Forces `calculate_damage` on iter 0, `tool_choice=required` thereafter. Default provider. |
-| `teacher/anthropic.py` | Anthropic adapter; default model `claude-sonnet-4-6`. Same tool-loop semantics. |
-| `teacher/google.py` | Google adapter; default model `gemini-3.1-pro-preview`. Same tool-loop semantics. |
-| `team_reconstruction.py` / `action_extraction.py` / `prompt_formatting.py` | Helper modules split out of the orchestrator so `master_pipeline.py` stays focused on CLI + per-match async loop. `bakeoff.py` imports from these directly rather than from `master_pipeline`. |
-| `bakeoff.py` | Head-to-head bake-off runner. `--limit N` covers the first N matches in one invocation with one combined summary; `--match-id <substring>` for a single-match smoke run. Reports per-provider cost, tool-call rate, CoT length, action-match rate. Output is one `bakeoff_<provider>.jsonl` per provider, append-mode, resumable on rerun (skips rows already keyed by `(match_id, game_index, turn)`). |
-| `master_pipeline.py` | Working. `flip_match_to_winner` makes every SFT example come from the series winner's perspective; inferred-spread block (one-sided constraints) in user prompt; per-format system prompt branch; three new historical-context blocks (`GAME-STATE LEDGER` with Cumulative damage row, `TURN-BY-TURN`, `SERIES STATE` with full prior-game rollups); explicit empty-slot annotation for last-Pokémon scenarios; perspective-aware bench rendering (P1: full brought-set, P2: chronological via `seenSpecies`); `--provider {openai,anthropic,google}` flag. `--dry-run` exercises orchestration without LLM cost. |
+| `damage_inferencer.py` | Working. Dual-state, two-way binary search, atomic apply, 508-EV constraint pass, crit-aware via `/calc isCrit`, multi-hit filter, `events_to_damage_events()` filter for non-own-move callers (Metronome / Copycat / Sketch / Snatch / Me First / Dancer / Instruct / Mirror Move / Assist / Nature Power excluded; Sleep Talk allowed). Plus `infer_match_final_bounds()` for the match-final P1 spreads. |
+| `threat_matrix.py` | Working. Dual-track Absolute + Probable output, driven by the asymmetric `(p1_final, p2_running)` knowledge pair. When canonical priors are ≥40-EV-clipped by the inferred bounds, the Probable column is dropped and the line tagged `(off-meta)`. Optional `format_id` drives Smogon-backed priors. |
+| `teacher/base.py` | Provider-agnostic core: `TeacherProvider` ABC, schemas (incl. `submit_decision` tool), prompt templates (6 rules: Masking/OTS, Tool, Threat-Matrix, Spread, Alternatives, Output), ground-truth stripping, `detect_oracle_leak` regex + `extract_pre_tool_thought` helper. Present-tense system prompts. Plan v3 Tool Rule directs calc at hypotheticals the matrix doesn't cover (no per-turn minimum). `# TODO(rlhf-followup)` flags the prompt-driven alternative evaluation as temporary. |
+| `teacher/openai.py` | OpenAI adapter; default model `gpt-5.5`. Per-call timeout 120s, per-turn ceiling 300s. **Bake-off winner** — production default. |
+| `teacher/anthropic.py` | Anthropic adapter; default model `claude-sonnet-4-6`. Same tool-loop semantics. Bake-off result: 32% near-miss meta-leak rate; not used in production. |
+| `teacher/google.py` | Google adapter; default model `gemini-3.1-pro-preview`. Same tool-loop semantics. Bake-off result: clean (0% leak) but slower wall-clock; viable cost-sensitive alternative to OpenAI. |
+| `teacher/judge.py` | Plan v4. `judge_match_cots(turn_records, ...) -> JudgeResult` — one gpt-5.5 call per match scoring every CoT for meta-leaks. Structured-output schema; fail-open on judge errors. Default model gpt-5.5 (~$0.014/match); switch to gpt-5.5-mini once available via `JUDGE_MODEL` env var. |
+| `teacher/batch_openai.py` | Plan v4. `BatchTeacherProvider` ABC + `BatchOpenAIProvider`. `build_request` / `submit_batch` / `poll` / `fetch_results` / `cancel`. OpenAI Batch API: 50% off both input and output, 24h SLA, ~10K-line cap per batch. v1 OpenAI-only; Anthropic / Google batch adapters TODO. |
+| `team_reconstruction.py` / `action_extraction.py` / `prompt_formatting.py` | Helper modules split out of the orchestrator so `master_pipeline.py` stays focused on CLI + per-match async loop. `bakeoff.py` and `batch_runner.py` import from these directly rather than from `master_pipeline`. `prompt_formatting.format_p1_known_spreads_block` is the renamed/repurposed Plan v3 YOUR SPREADS renderer. |
+| `bakeoff.py` | Head-to-head bake-off runner. `--limit N` covers the first N matches in one invocation with one combined summary; `--match-id <substring>` for a single-match smoke run. Reports per-provider cost, tool-call rate, CoT length, action-match rate. Output is one `bakeoff_<provider>.jsonl` per provider, append-mode, resumable on rerun (skips rows already keyed by `(match_id, game_index, turn)`). May 2026 result: OpenAI gpt-5.5 won. |
+| `batch_runner.py` | Plan v4. `_prepare_match_turns` (shared sync/batch prep) + `BatchWorkItem` dataclass + `run_batch_for_matches` (per-cycle state machine) + `_resume_inflight_batches` (drain in-flight batches on `--resume`). Per-match state in `batch_state/{match_id}.json`. v1 OpenAI-only. |
+| `master_pipeline.py` | Working. CLI orchestrator with `--mode {sync,batch,hybrid}` dispatcher. `flip_match_to_winner` makes every SFT example come from the series winner's perspective; match-final P1 spreads in user prompt; asymmetric threat matrix; per-format system prompt branch; three historical-context blocks (`GAME-STATE LEDGER`, `TURN-BY-TURN`, `SERIES STATE`); explicit empty-slot annotation; perspective-aware bench rendering. Per-match buffered write + judge integration (Plan v4). `--provider {openai,anthropic,google}` flag (batch is OpenAI-only). `--dry-run` exercises orchestration without LLM cost. |
 
 ## Planned follow-up workstreams (TODO)
 
-- **`batch_orchestrator.py` — multi-batch tool-use loop** *(next up after
-  the bake-off picks a winner)*. New sibling of `master_pipeline.py` that
-  parallelises N turns' tool loops by submitting each loop iteration as
-  one batch via OpenAI Batch / Anthropic Message Batches / Vertex batch
-  prediction. ~50% cost reduction on the full-corpus run (~$1,150 saved
-  on ~$2,300). `master_pipeline.py` would gain a
-  `--mode {sync,batch,hybrid}` flag — hybrid runs the first ~1K matches
-  sync to validate quality, then batches the rest.
+- **Anthropic / Google batch adapters.** v1 of `--mode batch` is OpenAI-
+  only. `BatchTeacherProvider` (the ABC in `teacher/batch_openai.py`)
+  is the abstraction; siblings `teacher/batch_anthropic.py` (Message
+  Batches) and `teacher/batch_google.py` (Vertex batch prediction)
+  would slot in mechanically once those providers move into production
+  rotation.
 - **Token-efficient series-state summarizer.** `format_series_state`
   currently inlines the full prior-game rollup verbatim, which is
   high-fidelity but verbose. A learned (or careful rule-based)
   summarizer that distills "what mattered for THIS turn's decision"
   would conserve attention without losing decision-relevant signal.
   Tracked as `# TODO(token-efficient-series-summary)` in the function.
+- **Canonical-prior substitution in YOUR SPREADS.** Plan v3 acknowledged
+  an implicit leak: mons that never took damage render as `(no
+  observations yet)`. Substituting the canonical spread for fully-open
+  stats would mask this without changing the prompt shape at deploy.
+  Flagged in `prompt_formatting.format_p1_known_spreads_block`.
 - **Selection-model SFT corpus** — separate dataset for the team-preview
   4-of-6 pick decision. Walks the same parsed replays, extracts P1's
   brought set per game, generates one selection example per game with

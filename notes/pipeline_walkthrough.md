@@ -25,10 +25,16 @@ calc_microservice/  ──►  per-turn snapshots + events stream (Node side)
       │
       │  read JSONL, run inference + LLM
       ▼
-pipeline/master_pipeline.py
-      │  per turn:  threat matrix  →  teacher LLM  →  knowledge update
+pipeline/master_pipeline.py   (--mode sync | batch | hybrid)
+      │
+      │  per match:
+      │    • prep:   match-final P1 bounds  →  threat matrix  →  prompts
+      │    • synth:  teacher LLM (sync per-turn  OR  batch state machine)
+      │    • judge:  one judge call per match  →  retry flagged turns
+      │    • commit: per-match atomic write of surviving rows
       ▼
 sft_training_data.jsonl   ──►  one fine-tuning row per turn
+                              (per-match atomic commit)
 ```
 
 Two languages, four components, one direction of data flow. Everything
@@ -361,9 +367,38 @@ why our calc payloads on Bo3 turn 1 are immediately tighter — the
 defender's item is locked in even before Sitrus activates). The spread
 math stays unchanged.
 
-**P1's bounds get surfaced to the LLM.** The same KnowledgeState that
-drives the Absolute track also feeds a `=== YOUR SPREADS (inferred) ===`
-block in the user prompt — per-stat ranges for each active P1 Pokémon.
+**Three KnowledgeStates per match (Plan v3 asymmetry).** A subtle but
+important refinement: we maintain THREE states, not two:
+
+- `p2_running` — chronological, what the player has learned about
+  the opponent through play so far.
+- `p1_final` — computed **once per match** via
+  `damage_inferencer.infer_match_final_bounds(games, ...)`, which runs
+  the inferencer across every turn of every game in the match offline
+  and returns the tightest bounds derivable from the *entire* match.
+- `p1_running` — also chronological for P1, but unused in prompts; kept
+  only for diagnostics and the inspector.
+
+The match-final P1 state is the key insight: **the player knew their
+own spread from day one.** At deploy time we'll present exact values
+from the team-builder JSON. At training time, the closest available
+approximation is "what the inferencer could prove by looking at the
+whole match" — tighter than turn-by-turn inference would give us, and
+more honest about what the player knew.
+
+This produces an **asymmetric threat matrix**: the matrix calls in
+plan v3 are now `generate_threat_matrix(snap_pre, "p1", p1_final,
+p2_running, ...)`. Our damage ranges are tight on the P1 side (we
+know our team's spreads); the opponent's damage ranges stay
+chronologically loose (we genuinely don't know their EVs until we
+observe them). Realism, not artificial uncertainty.
+
+**P1's match-final bounds get surfaced to the LLM.** The same
+`p1_final` that drives the matrix's P1 side also feeds a `=== YOUR
+SPREADS ===` block in the user prompt — per-stat ranges for each
+active P1 Pokémon. (The tag dropped its `(inferred)` qualifier in
+Plan v3 because at deploy time this is exact knowledge, not
+inferred.)
 
 The render uses **one-sided constraints** rather than masking everything
 that hasn't narrowed below an arbitrary width:
@@ -375,18 +410,26 @@ that hasn't narrowed below an arbitrary width:
 - Fully open `[0, 252]` → not shown; trailing `, others ?` summarizes them
 - Mon with no observations yet → `(no observations yet)`
 
-Concrete example after a 3-game match: `Kingambit: HP ≤91, Def ≤99,
-others ?`. This surfaces real signal that earlier renders (which
-required a tight two-sided range) hid: every binary search produces a
-one-sided bound, and one-sided bounds *are* useful — "Kingambit has
-at most 91 HP EVs" tells the model to assume the worst case for its
-own offense, even if the lower bound is still 0.
+Concrete example from a real bake-off Bo3:
+`Calyrex-Ice: Hp ≥244, Atk ≤8, Def 28–36, Spa ≤8, Spd 228–236, Spe ≤8`
+— a classic specially-defensive Calyrex build pinned tight by the
+match-final pass. Because this is match-final not per-turn, the same
+mon shows **identical numbers** at every turn of the same match (we
+verified this property explicitly in the bake-off).
 
 The system prompt's *Spread Rule* tells the model how to use the
 ranges: worst-case for survival checks, best-case for offensive
 checks. At deploy time the operator can present exact spreads from a
 team-builder JSON instead of inferred ranges; the trained model is
 robust to either form.
+
+**Acknowledged implicit leak.** Mons that never took damage in the
+match render as `(no observations yet)`. A student model could in
+principle learn "if Kingambit shows '(no observations yet)' in YOUR
+SPREADS, then Kingambit never took damage in this match." Plan v3
+flagged this as accepted risk; a follow-up workstream
+(canonical-prior substitution for fully-open stats) would mask the
+signal at the cost of slightly fictional spreads in some cases.
 
 ### Step 6 — Threat matrix: dual-track damage envelope
 
@@ -598,11 +641,21 @@ only on rule 1):
 
 1. **Masking Rule** (Bo1) / **OTS Rule** (Bo3) — what's known about
    the team sheet.
-2. **Tool Rule** — `calculate_damage` is for *hypotheticals the threat
-   matrix doesn't cover* (switch outcomes, future-turn calcs, opposing
-   Tera predictions). The model **must** call it at least once before
-   committing via `submit_decision`; the matrix cells themselves are
-   pre-computed and shouldn't be re-calc'd.
+2. **Tool Rule** *(rewritten in Plan v3 — no per-turn minimum)* —
+   `calculate_damage` is a precision instrument for **hypotheticals
+   the threat matrix doesn't already cover**:
+   - Switch-ins from the bench ("if I bring Calyrex in, what does
+     Lunala do?")
+   - Backline matchups
+   - Future-state ("at +2 SpA after Calm Mind…")
+   - Tera predictions
+   The matrix already enumerates every active-vs-active damage cell
+   for the current turn, so re-calc'ing those is forbidden. The model
+   **may** commit via `submit_decision` immediately if the matrix
+   suffices. The earlier "must call calculate_damage at least once"
+   minimum was dropped — it was creating redundant calc calls.
+   `MAX_CALC_CALLS_BEFORE_FORCE_SUBMIT = 5` is the upper cap; past 5
+   calc calls the next iteration forces `submit_decision`.
 3. **Threat-Matrix Rule** — each line shows Absolute (provable) and,
    when not contradicted, Probable (meta). Off-meta lines tagged
    `(off-meta)` show only Absolute.
@@ -637,16 +690,34 @@ tool loop.
 
 **Two things to notice:**
 
-1. **The `=== EXPERT'S DECISION ===` suffix is stripped before saving.**
-   The trained model never sees the ground truth in its prompt. It learns
-   to produce the same chain of reasoning *without* the cheat — that's the
-   whole SFT magic.
+1. **The `=== TRAINING-MODE TARGET ===` suffix is stripped before
+   saving.** The trained model never sees the ground truth in its
+   prompt. It learns to produce the same chain of reasoning *without*
+   the cheat — that's the whole SFT magic. (Originally tagged
+   `=== EXPERT'S DECISION ===`; Plan v3 rewrote it to lean less
+   into "expert" framing, which the model was repeating back in
+   CoT.)
 
 2. **The `calculate_damage` tool is the critical-call escape hatch.** The
    teacher LLM can verify any specific claim ("does Tera-Fairy Calyrex
    actually OHKO Rillaboom with this build?") before committing. The
    calc service handles `isCrit`, `isTera`, `boosts`, `status`, weather,
    terrain — all the volatile state the LLM might want to vary.
+
+3. **Two-stage leak filter (Plan v3 regex + Plan v4 judge).** Even
+   with the rewritten suffix and the present-tense system prompt,
+   models occasionally produce CoTs that reference the training
+   framing. The orchestrator runs every CoT through two filters:
+   - **Regex** (`detect_oracle_leak`): fast first pass on the saved
+     `pre_tool_thought`. Catches "oracle", "ground-truth", "the
+     target {is,says,action,field}", "training {mode,section,target,
+     example}". Tightened in May 2026 after a bake-off audit found
+     Anthropic produced "the target action" / "training section" in
+     32% of saved rows.
+   - **Model judge** (`teacher/judge.py`): runs once per match after
+     all turns synthesize. Catches the long tail — "clearly the right
+     move", "the data points to X" — phrases too varied for a regex.
+   See **Step 11** below for the judge mechanics.
 
 #### The user prompt's structure (eight sections)
 
@@ -685,17 +756,28 @@ matrix + accumulated KnowledgeStates. In order of appearance:
    marker — distilling priors via a learned summarizer would
    conserve attention, but until that's built, raw is the right
    move.
-7. **`=== YOUR SPREADS (inferred) ===`** — per-active P1 mon, every
-   tightened EV bound (one-sided constraints surface real signal that
-   earlier render thresholds hid).
+7. **`=== YOUR SPREADS ===`** — per-active P1 mon, every tightened EV
+   bound (one-sided constraints surface real signal that earlier
+   render thresholds hid). Plan v3 changed this from per-turn
+   chronological bounds to **match-final** bounds (the inferencer
+   runs across the whole match once at the start). At deploy time
+   the operator surfaces exact spreads from team-builder JSON here.
 8. **`=== THREAT MATRIX (turn N, us=p1) ===`** — dual-track damage
-   envelope from `threat_matrix.py`.
+   envelope from `threat_matrix.py`. Plan v3 drove this with the
+   **asymmetric** `(p1_final, p2_running)` knowledge pair: tight on
+   our side, chronologically loose on the opponent's.
 
 The total prompt is ~2,500–4,500 tokens depending on game length.
 
-### Step 10 — Write the SFT JSONL row, update knowledge, repeat
+### Step 10 — Buffer the row, update knowledge, repeat (then commit the whole match)
 
-Each successful turn writes one row in OpenAI fine-tuning JSONL format:
+Plan v4 changed the write semantics. Each successful turn used to write
+one row to the JSONL immediately. Now turns **buffer in memory** per
+match; the orchestrator commits the entire match atomically after the
+match-level judge runs (Step 11). One match either lands complete or
+doesn't show up at all — no half-written matches mid-crash.
+
+The row shape itself is unchanged: OpenAI fine-tuning JSONL.
 
 ```json
 {
@@ -797,37 +879,171 @@ decisive hypotheticals.
   available) or the mon couldn't act (sleep / paralysis / flinch /
   disable). Real Pokémon mechanics, not a "do nothing" option.
 
-**After the row is written**, we filter the same `events` stream
+**After the row is buffered**, we filter the same `events` stream
 through `damage_inferencer.events_to_damage_events()` (keeping only
 `type=="move"` events with `called_via in {null, "Sleep Talk"}` and
 `hits[i].outcome == "damage"`) and feed those into
-`damage_inferencer.update_knowledge` — tightening both KnowledgeStates
-so the *next* turn's threat matrix and `YOUR SPREADS` block are
-sharper. Bo3 series compound this: by turn 3 the inferencer has
+`damage_inferencer.update_knowledge` — tightening `p2_running` so the
+*next* turn's threat matrix is sharper on the P2 side. (`p1_final` was
+computed once at the start of the match; it doesn't need turn-by-turn
+updates.) Bo3 series compound this: by turn 3 the inferencer has
 already proven Miraidon's HP EVs are at most 35.
 
 The whole loop is **resumable**. `(match_id, game_index, turn)` keys
 already in the output JSONL are skipped on rerun — useful when the
-OpenAI run 429s and we need to pick up where we left off.
+OpenAI run 429s and we need to pick up where we left off. Per-match
+atomic write means even mid-run crashes don't leave partial matches.
+
+### Step 11 — Match-level model judge (Plan v4)
+
+The regex leak filter is fast but narrow. The May 2026 bake-off audit
+turned up a long tail of softer phrasings the regex doesn't catch
+("clearly the right move", "the data points to X", "looking at the
+training section") that a model can spot easily. So before the
+buffered match writes, the orchestrator runs **one** call to a cheap
+OpenAI model with every CoT from that match:
+
+```python
+turn_records = [
+    {"turn_idx": i, "match_id": "...", "game_idx": ..., "turn": ...,
+     "pre_tool_thought": <the assistant's commit CoT>}
+    for i, r in enumerate(match_buffer)
+]
+jr = await judge_match_cots(turn_records, client=judge_client)
+# jr.flagged_turn_indices  →  [3, 7]   (e.g.)
+# jr.reasons               →  {3: '"Looking at the training section..."',
+#                              7: '"Clearly the right move is..."'}
+```
+
+The judge call uses OpenAI's structured-output schema (
+`{flagged_turns: [{turn_idx, reason}]}`), so its response is
+deterministic JSON — no partial parses, no regex on the response.
+
+If any turns are flagged, the orchestrator **re-synthesizes** them
+through the same sync teacher (even in `--mode batch` — batch
+latency is too high for retry). Up to `--judge-retries` passes
+(default 2). After exhaustion, only the still-flagged turns drop;
+the rest of the match writes cleanly.
+
+**Why per-match, not per-row.** Amortizes the system prompt across N
+turns. An 8-turn match costs ~$0.014 with `gpt-5.5` (~$0.0015 with
+`gpt-5.5-mini` when access opens up) versus ~$0.04 if we judged each
+row separately. Also lets the judge spot cross-turn patterns —
+multiple consecutive references to the training framing are a
+stronger signal than each in isolation.
+
+**Why match-level fits buffered-write naturally.** The judge needs
+every CoT in memory anyway. Buffering per match for atomic write
+puts them right there. Per-turn write + per-row judge would have
+needed a separate buffer-then-delete dance.
+
+**Fail-open.** If the judge call errors (network, rate limit,
+schema mismatch), we write the match as if the judge passed. Better
+to ship a few possibly-leaky rows than drop a whole match for an
+infrastructure hiccup. The regex filter is still the first line of
+defense; the judge is the long-tail catch.
+
+**Sample output** (real fixture from the smoke test):
+
+```
+calling judge (gpt-5.5)...
+  flagged: [1, 2]
+  reasons: {1: '"Looking at the training section, the target action is..."',
+            2: '"Clearly the right move here is Protect on both slots."'}
+  cost: $0.00729  (994 input / 116 output)
+```
+
+Turn 0 (a clean, fully-derived "Calyrex outspeeds and OHKOs after
+Tera…") was correctly spared.
+
+### Step 12 — Batch mode + hybrid (Plan v4)
+
+The bake-off picked OpenAI as the production teacher. At full corpus
+scale (~13K matches × ~5 turns × ~70% extractable ≈ 50k SFT rows ≈
+$2.3K sync), submitting via the OpenAI Batch API saves ~50% on both
+input and output tokens — meaningful at this volume.
+
+**The catch:** OpenAI Batch requires each request line to be a single
+self-contained API call. Our teacher LLM tool loop is N sequential
+calls (call calc, get result, decide, call calc again or commit). The
+Batch API can't represent that loop inside one line.
+
+**Solution: one batch cycle per tool-loop iteration.** All in-flight
+turns at `iter=K` bundle into one batch upload. After that batch
+completes, the orchestrator processes responses sequentially — running
+any `calculate_damage` tool calls synchronously against the local calc
+microservice — and advances each turn's `iter` counter. Turns that
+called `submit_decision` are done; turns that need another calc round
+go back into the next cycle's batch.
+
+```
+cycle 0:  [all 8 turns at iter=0]  →  one Batch upload, ~30min–3h
+            ↓ poll until completed → fetch → apply per turn
+            • run calc for any calc tool calls (sync)
+            • mark done | advance to iter=1
+
+cycle 1:  [3 turns still pending]  →  one Batch upload
+            ↓
+cycle 2:  [1 turn still pending]   →  one Batch upload
+            ↓
+[regex leak filter + match-level judge as in Step 11]
+[atomic per-match write]
+```
+
+In smoke testing, an 8-turn Bo3 match completed in 2-3 cycles, each
+cycle <2 minutes wall-clock. A corpus-scale run will land closer to
+the documented 1–3h p50 per cycle.
+
+**Per-match state files.** `pipeline/batch_state/{match_id}.json`
+carries every `BatchWorkItem` (turn) — `api_messages` history,
+`iter`, `calc_calls`, `status` (`pending | submitted | committed | failed
+| leak_persistent | judge_flagged_persistent | written`), and an
+**`active_batch_id` breadcrumb** that points at whichever batch the
+item is currently waiting on. `--resume` reads every state file,
+drains in-flight batches via `_resume_inflight_batches`, then
+re-enters the cycle loop with everything back in known state.
+Verified in unit tests across four scenarios: orphan items (no
+breadcrumb), poll failure, missing custom_id in fetch results, clean
+recovery.
+
+**`--mode hybrid`** is the recommended production strategy.
+
+1. First `--hybrid-sync-n` matches (default 50) run **sync** with the
+   judge ON. The orchestrator computes match-rate (`written / attempted`)
+   and leak-rate (`dropped / attempted`).
+2. If `match_rate ≥ --hybrid-min-match-rate` (default 0.95) AND
+   `leak_rate ≤ --hybrid-max-leak-rate` (default 0.02), the rest of the
+   corpus goes through batch.
+3. If either threshold fails: the run **halts** before submitting any
+   batch upload. Surfaces a regressed prompt or a busted model version
+   loudly instead of silently shipping thousands of dollars to a
+   broken run.
+
+The sync portion serves as a quality gate AND a sanity check on the
+model's current behavior. The batch portion gets the cost win on the
+bulk of the corpus.
 
 ---
 
 ## Where we are, what's next
 
-**Current state:** end-to-end pipeline works in both `--dry-run` mode
-and live with provider adapters for OpenAI, Anthropic, and Google
-(`teacher/openai.py` / `teacher/anthropic.py` / `teacher/google.py`,
-all re-exported via `teacher/__init__.py`).
-One match through the orchestrator produces 8–10 SFT rows covering
-damage moves, switches, status moves, and spread moves with
-correctly-extracted ground-truth labels and the new historical-context
-prompt structure.
+**Current state:** end-to-end pipeline works in `--dry-run`, sync,
+batch, and hybrid modes. Live with provider adapters for OpenAI
+(production default), Anthropic, and Google (`teacher/openai.py` /
+`teacher/anthropic.py` / `teacher/google.py`, all re-exported via
+`teacher/__init__.py`). One match through the orchestrator in sync
+mode produces 8–10 SFT rows covering damage moves, switches, status
+moves, and spread moves with correctly-extracted ground-truth labels,
+match-final P1 spreads, an asymmetric threat matrix, and the
+historical-context prompt structure. A model-judge call confirms CoT
+hygiene before per-match atomic commit.
 
 **Rough scale:** 13,919 matches × ~5 turns/match × ~70% extractable ≈
 **~50k SFT examples** at full corpus scale. At gpt-5.5 pricing the
-synchronous run is roughly $2K–$3K. The deferred batch orchestrator
-(OpenAI Batch / Anthropic Message Batches / Vertex batch) would
-roughly halve that.
+sync run is roughly $2K–$3K. Plan v4's `--mode batch` halves that
+via the OpenAI Batch API (50% off both input and output tokens;
+~$1.15K saved on full corpus). The judge layer adds ~$5–40 across
+the corpus depending on whether mini access is available.
 
 **What's landed beyond the original walkthrough:**
 
@@ -842,19 +1058,35 @@ roughly halve that.
   added to NON_OWN_CALLERS).
 - Choice-lock detection working (uses OTS-resolved item, normalizes
   move ID → display name via the dex).
-- `bakeoff.py` for head-to-head provider comparison.
-- One-sided EV constraint rendering in the YOUR SPREADS block.
+- `bakeoff.py` for head-to-head provider comparison — **resolved**:
+  OpenAI gpt-5.5 won (100% match rate, 0% leak, $0.07/row). Google
+  also clean and cheaper. Anthropic produced 32% near-miss meta-leak
+  rate — informed the regex tightening and motivated the judge layer.
+- **Plan v3 (post-bake-off):** rewrote Tool Rule, dropped per-turn
+  calc minimum, switched YOUR SPREADS to match-final bounds, made
+  the threat matrix asymmetric `(p1_final, p2_running)`, added the
+  `=== TRAINING-MODE TARGET ===` framing for the ground-truth suffix,
+  added regex leak retry with `--leak-retries`.
+- **Plan v4:** match-level model-judge validator
+  (`teacher/judge.py`) + `--mode {sync,batch,hybrid}` dispatcher with
+  OpenAI Batch API orchestration (`batch_runner.py` +
+  `teacher/batch_openai.py`) + per-match atomic write + resume
+  support via `active_batch_id` breadcrumbs in
+  `batch_state/{match_id}.json`.
 
 **What we still want:**
 
-1. **Bake-off** to pick a teacher LLM provider on the production
-   prompt.
-2. **`batch_orchestrator.py`** — coordinated multi-batch tool-use
-   loop (~50% off via batch APIs, $1K+ savings on full corpus).
-3. **Real run on the first 1 match → 10 → 100 → full**, with
-   spot-checks on CoT quality at each step.
-4. **A holdout eval set** — withhold a few hundred matches, measure
+1. **Real corpus run** in hybrid mode — 50 matches sync as gate, then
+   batch the rest. Spot-checks on CoT quality at each step.
+2. **A holdout eval set** — withhold a few hundred matches, measure
    whether the trained model's plays match the human's labels.
+3. **Anthropic / Google batch adapters** — `BatchTeacherProvider`
+   abstraction is in place; siblings `batch_anthropic.py` /
+   `batch_google.py` slot in mechanically when those providers
+   move into production rotation.
+4. **Canonical-prior substitution in YOUR SPREADS** — mask the
+   implicit "this mon never took damage" leak from
+   `(no observations yet)` rendering.
 5. **A separate selection-model SFT corpus** — the team-preview
    4-of-6 pick is a different decision (matchup theory, no tactical
    state) and deserves its own model.

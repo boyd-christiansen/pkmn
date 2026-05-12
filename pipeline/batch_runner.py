@@ -10,9 +10,10 @@ non-sync portion). Reuses:
      format_p1_team_block}` for prompt assembly.
   • `teacher.batch_openai.BatchOpenAIProvider` for the SDK plumbing.
   • `teacher.{detect_oracle_leak, judge_match_cots, ...}` for filters.
-  • `master_pipeline._synthesize_with_leak_retry` for the sync fallback
-     used when the judge needs to re-synthesize a flagged turn (batch
-     latency is too high for retries).
+  • `master_pipeline._run_judge_with_retries` (imported lazily inside
+     `run_batch_for_matches` to avoid a circular import) for the
+     post-batch judge pass. Judge re-synthesis falls back to the SYNC
+     teacher — batch latency is too high to be useful for retries.
 
 The state machine runs ONE batch cycle per tool-loop iteration. All
 WorkItems at iter=K bundle into one batch submission; on completion,
@@ -24,14 +25,19 @@ Shape of the state file per match (`{state_dir}/{match_id}.json`):
     {
       "match_id": "...",
       "format_id": "gen9vgc2026regibo3",
-      "items": [WorkItem JSON dicts...],
-      "active_batches": [{"batch_id":..., "cycle":..., "items":[...]}, ...],
+      "items": [BatchWorkItem JSON dicts — see BatchWorkItem.to_dict()],
+      "active_batches": [],   # currently unused; reserved for v2 cross-cycle
+                              # bookkeeping. Per-item `active_batch_id` is the
+                              # actual resume breadcrumb.
       "last_updated": "2026-05-12T17:22:13Z"
     }
 
-Resumability: on startup, load all state files; for any item with
-`status="submitted"`, look up its active batch and resume polling.
-The orchestrator never re-submits already-submitted work.
+Resumability: on startup, `--resume` loads every state file; for each
+item with `status="submitted"`, the `active_batch_id` breadcrumb points
+at the batch the item was waiting on. `_resume_inflight_batches`
+groups items by batch_id, re-polls each, fetches results, and applies
+them BEFORE entering the normal cycle loop — so the cycle loop sees
+items in known {pending, committed, failed} states only.
 """
 from __future__ import annotations
 

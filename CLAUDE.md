@@ -12,7 +12,7 @@ Reg I doubles). Four self-contained components under one umbrella:
 |---|---|---|
 | `data_scraper/` | Python | Pulls top-500 ladder users + replays from Pokémon Showdown. |
 | `calc_microservice/` | Node + TS | HTTP wrapper for `@smogon/calc`, `@pkmn/client`, `@pkmn/dex` (3 endpoints). |
-| `pipeline/` | Python | Atomic modules + a `teacher/` sub-package. Orchestrator is `master_pipeline.py`, which writes the SFT JSONL. See `pipeline/README.md` for the full file map. |
+| `pipeline/` | Python | Atomic modules + a `teacher/` sub-package + a `batch_runner.py` sibling for batched runs. Orchestrator is `master_pipeline.py` (`--mode {sync,batch,hybrid}`), which writes the SFT JSONL. See `pipeline/README.md` for the full file map. |
 | `notes/` | — | Free-form planning notes. |
 
 The SFT generation pipeline is **complete end-to-end**. Status of each piece
@@ -53,6 +53,10 @@ cd pipeline && .venv/bin/python replay_parser.py
 cd pipeline && .venv/bin/python master_pipeline.py
 # Smoke-test without the LLM call:
 cd pipeline && .venv/bin/python master_pipeline.py --limit 1 --dry-run
+# Production: hybrid mode — first 50 sync as quality gate, rest via OpenAI Batch (~50% cheaper):
+cd pipeline && .venv/bin/python master_pipeline.py --mode hybrid --hybrid-sync-n 50
+# Batch mode is OpenAI-only in v1; resume in-flight batches with --resume:
+cd pipeline && .venv/bin/python master_pipeline.py --mode batch --resume
 ```
 
 ## Conventions
@@ -83,7 +87,15 @@ data_scraper/data/replays/{format_id}/{replay_id}.json
 pipeline/parsed_data/{bo1,bo3}.jsonl    # per-turn snapshots + events stream
     │
     ▼ (master_pipeline → threat_matrix → /calc, teacher_llm → OpenAI)
+    │   per match:
+    │     • sync mode:  per-turn synthesize_turn() inline
+    │     • batch mode: batch_runner state-machine, one batch cycle per
+    │                   tool-loop iter across all matches at once
+    │     • hybrid:     first N sync as quality gate, rest via batch
+    │   all paths buffer per-match → judge_match_cots → write atomically
+    ▼
 pipeline/parsed_data/sft_training_data.jsonl   # one fine-tuning example per turn
+                                              # (per-match atomic commit)
 ```
 
 ## Known artifacts on disk (gitignored)
@@ -95,7 +107,12 @@ pipeline/parsed_data/sft_training_data.jsonl   # one fine-tuning example per tur
   (TurnEvent discriminated union: move / switch / cant_move / tera / faint /
   item_event).
 - `pipeline/parsed_data/sft_training_data.jsonl` — final SFT dataset
-  (append-only, resumable).
+  (append-only, resumable; per-match atomic commit so a match either
+  shows up complete or not at all).
+- `pipeline/batch_state/{match_id}.json` — per-match resume state for
+  `--mode batch` / `--mode hybrid`. Holds every WorkItem's
+  `api_messages`, `iter`, `status`, and `active_batch_id`. Safe to delete
+  between runs; the orchestrator rebuilds from `parsed_data/` if missing.
 
 ## Common gotchas
 
@@ -179,6 +196,30 @@ pipeline/parsed_data/sft_training_data.jsonl   # one fine-tuning example per tur
   which 4 they will bring" / "you'll learn that as the battle
   unfolds." Don't reintroduce past-tense framing when editing
   templates in `teacher/base.py`.
+- **Per-match atomic commit.** Plan v4 changed the write path: turns
+  are buffered in memory per match, then committed atomically as a
+  batch after the judge runs. Crash mid-match → nothing for that
+  match lands on disk; re-run the match cleanly. Don't expect a
+  partial-match JSONL.
+- **Two-stage leak filter.** Every CoT runs through both the regex
+  (`detect_oracle_leak`) and the model judge (`judge_match_cots`,
+  one call per match). The regex is the first line; the judge is the
+  long-tail catch. With `--leak-retries 3 --judge-retries 2`
+  (production defaults), persistent leaks drop only the offending
+  turn — the rest of the match still writes.
+- **Judge always uses OpenAI.** Even if the teacher is anthropic or
+  google, the judge spins up its own `AsyncOpenAI` client. The
+  `OPENAI_API_KEY` is required whenever `--use-judge` is on (default).
+  Pass `--no-judge` if you only want the regex filter.
+- **`--mode batch` is OpenAI-only in v1.** Anthropic Message Batches
+  and Vertex Batch are on the roadmap but not implemented; the CLI
+  rejects `--provider {anthropic,google}` with `--mode batch`.
+- **Batch latency is unpredictable.** OpenAI's SLA is 24h per cycle.
+  Empirically the smoke-test runs we did completed cycles in <2min,
+  but a corpus-scale run may see the documented 1–3h band. Plan for
+  hours of wall-clock when sizing batches. Use `--resume` to pick up
+  in-flight batches after a crash; per-item `active_batch_id`
+  breadcrumbs in `batch_state/{match_id}.json` route the recovery.
 
 ## Provider-agnostic teacher LLM
 
@@ -191,18 +232,81 @@ so callers write `from teacher import TeacherProvider, OpenAIProvider`:
 - `teacher/anthropic.py` — `claude-sonnet-4-6` (default) / `claude-opus-4-7` / `claude-haiku-4-5` etc. via the Anthropic SDK.
 - `teacher/google.py` — `gemini-3.1-pro-preview` (default) / `gemini-3.1-flash-preview` etc. via the `google-genai` SDK.
 
-Each adapter implements the same `submit_decision`-tool architecture:
-the model **must** call `calculate_damage` at least once before calling
-`submit_decision` to commit. There is no `response_format` — tool calls
-are the only output channel, which is what fixed the zero-tool-call
-regression we saw on the first real run.
+Each adapter has the same shape: two tools (`calculate_damage`,
+`submit_decision`); `submit_decision` is the only structured-output
+channel (no `response_format`); per-call and per-turn timeouts via
+`asyncio.wait_for`. The Tool Rule (plan v3) directs `calculate_damage`
+toward hypotheticals the threat matrix doesn't already cover — there
+is no per-turn minimum.
 
 Pick a provider via `master_pipeline.py --provider {openai,anthropic,google}`
-(default: `openai`). Override the model id with `--model gpt-5.5-pro` etc.
+(default: `openai` — the bake-off winner; see below). Override the model
+id with `--model gpt-5.5-pro` etc.
 
 For a head-to-head comparison: `python bakeoff.py --providers openai,anthropic,google --limit 5`
 runs the same match through each provider and reports per-row cost,
 tool-call rate, CoT length, action-match rate, and wall-clock.
+
+### Bake-off result (May 2026)
+
+| Provider | Match% | Leak rate | $/row | Avg CoT | Notes |
+|---|---|---|---|---|---|
+| **OpenAI gpt-5.5** | **100.0%** | **0%** | $0.07 | 902ch | Concise, consistent. **Production default.** |
+| Google gemini-3.1-pro | 100.0% | 0% | $0.04 | 1027ch | Cheapest; slower wall-clock. |
+| Anthropic claude-sonnet-4-6 | 61.3% | 32% near-miss | $0.09 | 4004ch | Verbose; systematic meta-references in CoT ("the target action" / "training section"). Not used in production. |
+
+Anthropic's near-miss leaks ("the target action", "training section"
+substrings) motivated plan v4's two-stage leak filter — the regex
+tightened to catch those, and a model-judge layer catches softer
+meta-references. See "Plan v4: judge + batch" below.
+
+## Plan v4: judge + batch
+
+Two follow-up workstreams shipped on top of the bake-off:
+
+### 1. Match-level model-judge validator
+
+`pipeline/teacher/judge.py` exposes `judge_match_cots(turn_records,
+*, client, model=DEFAULT_JUDGE_MODEL) -> JudgeResult`. After every
+match's turns are synthesized (sync OR batch), the orchestrator
+buffers them, submits all of the match's `pre_tool_thought` CoTs to
+the judge in **one** call, and the judge returns
+`{flagged_turn_indices, reasons}`. Flagged turns are re-synthesized
+via the sync teacher (even in batch mode — batch latency is too high
+for retry); after `judge_retries` exhausted (default 2), only the
+still-flagged turns get dropped — the rest of the match writes.
+
+CLI: `--use-judge / --no-judge`, `--judge-model`, `--judge-retries`.
+
+Cost: one judge call per match. Spec'd at gpt-5.5-mini (~$0.0015 /
+match), defaulting to gpt-5.5 (~$0.014 / match) until mini access
+opens up. Both negligible against the per-row synthesis cost.
+
+### 2. Batch mode + `--mode {sync,batch,hybrid}`
+
+`pipeline/teacher/batch_openai.py` is the SDK plumbing
+(`BatchOpenAIProvider`); `pipeline/batch_runner.py` is the state
+machine — one OpenAI Batch cycle per tool-loop iteration, with all
+in-flight turns at iter=K bundled into one batch upload, calc
+microservice calls run synchronously between cycles. Per-match
+state files in `pipeline/batch_state/{match_id}.json` make runs
+resumable mid-cycle via `--resume` (each item carries an
+`active_batch_id` breadcrumb so we can re-poll the right batch).
+
+Hybrid mode runs the first N matches sync as a quality gate. If
+`match_rate < min_match_rate` (default 0.95) OR `leak_rate >
+max_leak_rate` (default 0.02), the run halts before submitting the
+batch portion — better to fail loudly than silently commit thousands
+of dollars to a regressed prompt.
+
+Batch is OpenAI-only in v1. Anthropic Message Batches and Vertex Batch
+adapters are next; the abstraction (`BatchTeacherProvider` ABC) is
+already in place.
+
+CLI: `--mode {sync,batch,hybrid}`, `--hybrid-sync-n`,
+`--hybrid-min-match-rate`, `--hybrid-max-leak-rate`,
+`--state-dir`, `--poll-interval-seconds`, `--max-cycle-wait-seconds`,
+`--resume`.
 
 ### Environment variables
 
@@ -234,27 +338,19 @@ Optional env-var overrides:
 TEACHER_MODEL_OPENAI=gpt-5.5-pro
 TEACHER_MODEL_ANTHROPIC=claude-opus-4-7
 TEACHER_MODEL_GOOGLE=gemini-3.1-flash-preview
+JUDGE_MODEL=gpt-5.5-mini       # plan v4: judge defaults to gpt-5.5; set to mini if you have access
 ```
 
-Cost-table placeholders are in `teacher_llm.PRICE_PER_M_TOKENS` — confirm
+Cost-table placeholders are in `teacher.base.PRICE_PER_M_TOKENS` — confirm
 against the provider's pricing page before scaling to the full corpus.
 
 ## Planned follow-up workstreams (not built yet)
 
-- **`batch_orchestrator.py` — coordinated multi-batch tool-use loop.**
-  *Next up after the bake-off picks a winner.* New sibling of
-  `master_pipeline.py`; owns a poll-and-resume state machine that runs N
-  turns through their tool loops in parallel by submitting each tool-loop
-  iteration as one batch (OpenAI Batch API / Anthropic Message Batches /
-  Vertex batch prediction — all ~50% off sync prices). Per-turn state
-  persisted to disk so runs can resume mid-batch-cycle. Each provider
-  gets a `BatchTeacherProvider` extension (`OpenAIBatchProvider`, etc.)
-  exposing `submit_batch` / `await_batch`. `master_pipeline.py` would
-  gain a `--mode {sync,batch,hybrid}` flag — hybrid runs the first
-  ~1K matches sync to validate quality, then migrates the rest to
-  batch for the cost win. Estimated savings on full corpus: ~$1,150
-  of ~$2,300. Estimated wall-clock: 3 batch cycles × 30min–12h ≈
-  2h–36h.
+- **Anthropic / Google batch adapters.** v1 of batch is OpenAI-only.
+  `BatchTeacherProvider` is the abstraction (`pipeline/teacher/
+  batch_openai.py`); siblings `batch_anthropic.py` / `batch_google.py`
+  would slot in mechanically. Useful once those providers move into
+  production rotation.
 - **Token-efficient series-state summarizer.** Today's `format_series_state`
   inlines the full turn-by-turn rollup of every prior Bo3 game.
   Distilling those into a "what mattered for THIS turn's decision"
@@ -268,6 +364,9 @@ against the provider's pricing page before scaling to the full corpus.
   current prompt-driven Alternatives Rule (teacher cherry-picks
   alternatives because it already knows the answer) with a proper
   search step. See `# TODO(rlhf-followup)` in `teacher/base.py`.
-- **Migrate `master_pipeline` default provider to the bake-off winner**
-  once empirical results are in. Today's default is `openai/gpt-5.5`;
-  whichever provider wins the bake-off becomes the next default.
+- **Canonical-prior substitution in YOUR SPREADS.** Mons that never
+  took damage in a match render as `(no observations yet)` — implicit
+  signal that the model could exploit. Substituting the canonical
+  spread for fully-open stats would mask this without changing the
+  shape of the prompt at deploy. Flagged in
+  `prompt_formatting.format_p1_known_spreads_block`.

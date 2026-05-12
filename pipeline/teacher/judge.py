@@ -5,15 +5,20 @@ The v3 regex `detect_oracle_leak` catches the strongest phrases
 misses softer meta-references ("clearly the right move", "the data
 points to", first-person-knowledge-as-fact constructions). This module
 adds a second-line filter that submits an entire match's worth of CoTs
-in ONE call to a cheap model (gpt-5.5-mini by default) and gets back a
-list of turn indices to retry.
+in ONE call to OpenAI and gets back a list of turn indices to retry.
+
+Default model is `gpt-5.5` (~$0.014/match in smoke testing); the
+ideal model is `gpt-5.5-mini` (~$0.0015/match — ~10× cheaper) but the
+project account doesn't currently have access. Override via the
+`JUDGE_MODEL` env var or the `--judge-model` CLI flag once mini access
+opens up. See the `DEFAULT_JUDGE_MODEL` block below for the trade-off
+notes.
 
 Why per-match, not per-row:
-  - Amortizes a fixed prompt overhead across N turns.
-  - One call to score 8 turns costs ~$0.0015 vs $0.005 × 8 = $0.04 per
-    row. ~25× cheaper.
-  - The judge sees more context — if multiple turns in a row reference
-    the training framing, that pattern is a stronger signal than each
+  - Amortizes a fixed system prompt across N turns. An 8-turn match
+    judges in one call versus 8 separate calls.
+  - The judge sees more context — multiple consecutive turns
+    referencing the training framing is a stronger signal than each
     in isolation.
 
 The judge is provider-agnostic in spirit but only OpenAI is wired today
@@ -21,11 +26,18 @@ The judge is provider-agnostic in spirit but only OpenAI is wired today
 different judge provider, replace the client kwarg with one of compatible
 shape and adjust the structured-output call path.
 
-Contract callers care about (`master_pipeline._run_judge_with_retries`):
+Contract callers care about (`master_pipeline._run_judge_with_retries`,
+`batch_runner.run_batch_for_matches`):
   - `judge_match_cots(records, ...) -> JudgeResult` with
     `flagged_turn_indices` and `reasons`.
   - `extract_pre_tool_thought(messages) -> str | None` (re-exported from
     `teacher.base`) for parsing saved rows.
+
+Fail-open contract: on any client error / network failure / malformed
+response, the function returns an empty `flagged_turn_indices` and a
+non-None `error`. Callers write all rows as if the judge passed. Better
+to ship a few possibly-leaky rows than drop a whole match to an infra
+hiccup; the regex filter is still the first line of defense.
 """
 from __future__ import annotations
 

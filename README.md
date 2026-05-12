@@ -15,7 +15,7 @@ without touching the others.
 |---|---|---|
 | [`data_scraper/`](data_scraper/) | Python 3.11+ | Pulls top-500 ladder users + all their saved replays from Pokémon Showdown. |
 | [`calc_microservice/`](calc_microservice/) | Node 20+ / TS | HTTP service wrapping `@smogon/calc` (`POST /calc`), `@pkmn/client` + `@pkmn/sets` (`POST /parse_log` — per-turn snapshots, `events` stream, and Bo3 OTS `teamSheets`), and `@pkmn/dex` (`GET /dex/move/:name`). |
-| [`pipeline/`](pipeline/) | Python 3.11+ | Atomic modules that turn raw replays into SFT-ready conversational training data. Inference modules (`replay_parser`, `canonical_priors`, `damage_inferencer`, `threat_matrix`); orchestration helpers split out of the orchestrator (`team_reconstruction`, `action_extraction`, `prompt_formatting`); the orchestrator + CLI (`master_pipeline`); a `teacher/` sub-package holding the `TeacherProvider` ABC plus OpenAI / Anthropic / Google adapters; and a head-to-head `bakeoff` runner. |
+| [`pipeline/`](pipeline/) | Python 3.11+ | Atomic modules that turn raw replays into SFT-ready conversational training data. Inference modules (`replay_parser`, `canonical_priors`, `damage_inferencer`, `threat_matrix`); orchestration helpers split out of the orchestrator (`team_reconstruction`, `action_extraction`, `prompt_formatting`); the orchestrator + CLI (`master_pipeline` with `--mode {sync,batch,hybrid}`); a `teacher/` sub-package holding the `TeacherProvider` ABC plus OpenAI / Anthropic / Google adapters, a `judge.py` model-judge validator, and a `batch_openai.py` Batch API adapter; a `batch_runner.py` sibling implementing the per-cycle state machine for batch mode; and a head-to-head `bakeoff` runner (OpenAI won — see status below). |
 | [`notes/`](notes/) | — | Free-form planning notes (data sourcing options, scope decisions, etc). |
 
 ## Pipeline overview
@@ -41,19 +41,29 @@ Pokémon Showdown
 │         ▼                                                                │
 │  damage_inferencer.py ── /calc, /dex/move ▶  calc_microservice           │
 │         ▲ │   (two-way binary search → tightens                          │
-│         │ │    KnowledgeState (p1) AND KnowledgeState (p2) atomically)   │
+│         │ │    KnowledgeState (p1) AND KnowledgeState (p2) atomically;   │
+│         │ │    `infer_match_final_bounds` runs across the full match     │
+│         │ │    once to surface "match-final P1 bounds" in YOUR SPREADS)  │
 │         │ ▼                                                              │
 │  threat_matrix.py     ── /calc, /dex/move ▶  calc_microservice           │
-│         │   (Absolute envelope from KnowledgeStates +                    │
+│         │   (Absolute envelope from asymmetric (p1_final, p2_running);   │
 │         │    Probable envelope from canonical_priors;                    │
 │         │    when the prior is ≥40-EV-clipped, drop the meta             │
 │         │    column and tag the line `(off-meta)`)                       │
 │         ▼                                                                │
 │  teacher/             ── HTTP ────────────▶  frontier model              │
-│   (base + openai/anthropic/google adapters behind one ABC)               │
+│   (base + openai/anthropic/google adapters behind one ABC;               │
+│    judge.py for match-level CoT validation;                              │
+│    batch_openai.py for OpenAI Batch API submission)                      │
 │         │                                                                │
 │         ▼                                                                │
-│  master_pipeline.py  →  conversational SFT .jsonl                        │
+│  master_pipeline.py   (sync mode)                                        │
+│   batch_runner.py     (batch / hybrid mode — per-iter state machine,     │
+│                        per-match resume state in batch_state/*.json)     │
+│         │                                                                │
+│         ▼  buffer per-match → judge_match_cots → atomic write            │
+│                                                                          │
+│  parsed_data/sft_training_data.jsonl                                     │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -135,36 +145,50 @@ For each turn in each match, the orchestrator chains the library modules:
 1. **`flip_match_to_winner(match)`** — relabel sides so the **series
    winner** is always P1 for the rest of the pipeline. Bo3: 2 of 3
    games. Bo1: per-game winner.
-2. **`master_pipeline.extract_p1_actions(snap_pre, snap_post, events)`** —
+2. **`damage_inferencer.infer_match_final_bounds(games, ...)`** —
+   one pass across the whole match to compute the tightest
+   KnowledgeState the inferencer can extract. Becomes the "match-final
+   P1 bounds" used in YOUR SPREADS at every turn (the player knew
+   their own spread from day one; this approximates that knowledge
+   at training time). Per-turn loop also keeps a chronological
+   `p2_running` state for the opponent side.
+3. **`master_pipeline.extract_p1_actions(snap_pre, snap_post, events)`** —
    reverse-engineer P1's two-slot decision from the `events` stream
    (`move` / `switch` / `cant_move` events; `forced_by` filtering for
    intentional vs forced switches). Skip the turn if ambiguous.
-3. **`threat_matrix.generate_threat_matrix(snap, "p1", K1, K2, format_id=…)`**
-   — dual-track text block: Absolute envelope (from `KnowledgeState`s) +
-   Probable envelope (from canonical priors). When the prior is
-   ≥40-EV-clipped, the meta column is dropped and the line tagged
-   `(off-meta)`.
-4. **`format_user_prompt(...)`** — composes the full user prompt:
+4. **`threat_matrix.generate_threat_matrix(snap, "p1", p1_final, p2_running, format_id=…)`**
+   — dual-track text block: Absolute envelope from the **asymmetric**
+   (match-final-P1, chronological-P2) pair, Probable envelope from
+   canonical priors. When the prior is ≥40-EV-clipped, the meta column
+   is dropped and the line tagged `(off-meta)`.
+5. **`format_user_prompt(...)`** — composes the full user prompt:
    board state, GAME-STATE LEDGER (faints / Tera-used / Cumulative
    damage / volatiles / choice locks), TURN-BY-TURN (full prior
    turns of this game), SERIES STATE (Bo3 game ≥ 2; full inlined
-   prior-game rollups), YOUR SPREADS (one-sided EV constraints), and
-   the threat matrix.
-5. **`teacher.synthesize_turn(system, user, human_action)`** —
-   provider-agnostic tool-use loop (`TeacherProvider` ABC, with
-   OpenAI / Anthropic / Google adapters). The model **must** call
-   `calculate_damage` at least once before committing via the
-   `submit_decision` tool. The LLM sees the human's play as ground
+   prior-game rollups), YOUR SPREADS (match-final P1 bounds via
+   `format_p1_known_spreads_block`), and the threat matrix.
+6. **`teacher.synthesize_turn(system, user, human_action)`** —
+   provider-agnostic tool-use loop (`TeacherProvider` ABC). The
+   model decides whether to call `calculate_damage` for hypotheticals
+   the matrix doesn't cover (no per-turn minimum), then commits via
+   `submit_decision`. The LLM sees the human's play as ground
    truth and writes a Chain-of-Thought that justifies it. Returns
    OpenAI-fine-tuning-format conversation messages (ground-truth
-   stripped before save).
-6. **`events_to_damage_events(events)` →
+   stripped before save). Output is buffered per-match, not written
+   immediately.
+7. **`events_to_damage_events(events)` →
    `damage_inferencer.update_knowledge(snap_pre, snap_post,
-   damage_events, K1, K2)`** — filter the events stream for
-   inference-eligible damage hits (excluding non-own callers like
-   Metronome / Copycat / Mirror Move / etc.; Sleep Talk allowed),
+   damage_events, p1_running, p2_running)`** — filter the events
+   stream for inference-eligible damage hits (excluding non-own callers
+   like Metronome / Copycat / Mirror Move / etc.; Sleep Talk allowed),
    then two-way binary search tightens both `KnowledgeState`s with a
    508-EV constraint pass.
+
+After all of a match's turns synthesize, the orchestrator runs
+**`judge_match_cots(turn_records, ...)`** on the buffered match — one
+gpt-5.5 call per match. Flagged turns are re-synthesized through the
+same teacher; after `--judge-retries` exhausted, the dropped turns are
+discarded and the rest of the match commits atomically to JSONL.
 
 ```bash
 cd pipeline
@@ -172,10 +196,16 @@ cd pipeline
 # Smoke test (no API key needed, exercises everything except the LLM call):
 .venv/bin/python master_pipeline.py --limit 1 --dry-run
 
-# Real run on a single match (OpenAI default):
+# Real run on a single match (sync mode, OpenAI default, judge on):
 OPENAI_API_KEY=sk-... .venv/bin/python master_pipeline.py --limit 1
 
-# Pick a different provider / model:
+# Production: hybrid mode — first 50 sync as quality gate, rest via Batch API:
+.venv/bin/python master_pipeline.py --mode hybrid --hybrid-sync-n 50
+
+# Resume a crashed batch run (re-polls in-flight batches from --state-dir):
+.venv/bin/python master_pipeline.py --mode batch --resume
+
+# Pick a different provider / model (sync only for non-OpenAI providers):
 ANTHROPIC_API_KEY=sk-... .venv/bin/python master_pipeline.py \
     --provider anthropic --model claude-sonnet-4-6 --limit 1
 
@@ -185,7 +215,8 @@ ANTHROPIC_API_KEY=sk-... .venv/bin/python master_pipeline.py \
 
 → writes one fine-tuning row per identifiable turn to
 `pipeline/parsed_data/sft_training_data.jsonl`. Resumable on rerun
-(keyed by `(match_id, game_index, turn)`).
+(keyed by `(match_id, game_index, turn)`). Per-match atomic commit:
+a match either lands complete or not at all.
 
 ## Status
 
@@ -195,10 +226,11 @@ ANTHROPIC_API_KEY=sk-... .venv/bin/python master_pipeline.py \
 | `calc_microservice` | Working. Three endpoints: `POST /calc` (damage math), `POST /parse_log` (Showdown log → turn snapshots), `GET /dex/move/:name` (move metadata). |
 | `pipeline/replay_parser.py` | Working. ETL CLI; captures per-turn `events` (TurnEvent[]) from `/parse_log` straight into `parsed_data/{bo1,bo3}.jsonl`. |
 | `pipeline/canonical_priors.py` | Working. Library + bootstrap CLI. Real Smogon Chaos JSON when cached on disk; curated table + heuristic fallback. |
-| `pipeline/damage_inferencer.py` | Working. Dual-state, two-way binary search, atomic application, 508-EV constraint pass, crit-aware (via `/calc isCrit`), multi-hit filter, `events_to_damage_events()` filter that excludes non-own-move callers (Metronome / Copycat / Sketch / Snatch / Me First / Dancer / Instruct / Mirror Move / Assist / Nature Power; Sleep Talk allowed). |
-| `pipeline/threat_matrix.py` | Working. Dual-track Absolute + Probable output. When canonical priors are ≥40-EV-clipped by the inferred bounds, the Probable column is dropped and the line tagged `(off-meta)`. Optional `format_id` drives chaos-backed priors. |
-| `pipeline/teacher/` (sub-package: `base.py` + `openai.py` / `anthropic.py` / `google.py`, re-exported via `__init__.py`) | Working. Provider-agnostic `TeacherProvider` ABC; tool-use loop with `calculate_damage` + `submit_decision`. The model has only one output channel — tool calls — so it can't bypass the calc tool. Two system-prompt templates: Bo1 CTS (Masking Rule + reconstructed team) vs Bo3 OTS (full sheets + ★ brought-flag). Present-tense framing throughout. |
-| `pipeline/master_pipeline.py` | Working. CLI orchestrator. `flip_match_to_winner` makes every example come from the series winner's perspective. Three historical-context blocks in the user prompt (GAME-STATE LEDGER / TURN-BY-TURN / SERIES STATE). One-sided EV constraint rendering. Empty-slot annotation. Perspective-aware bench gating (P1: full brought-set, P2: chronological via `seenSpecies`). `--provider {openai,anthropic,google}` flag. Resumable. |
-| `pipeline/bakeoff.py` | Working. Runs the same match through multiple providers in lockstep and reports per-row cost, tool-call rate, action-match rate, CoT length, wall-clock. |
+| `pipeline/damage_inferencer.py` | Working. Dual-state, two-way binary search, atomic application, 508-EV constraint pass, crit-aware (via `/calc isCrit`), multi-hit filter, `events_to_damage_events()` filter that excludes non-own-move callers (Metronome / Copycat / Sketch / Snatch / Me First / Dancer / Instruct / Mirror Move / Assist / Nature Power; Sleep Talk allowed). Plus `infer_match_final_bounds()` for the match-final P1 spreads surfaced in YOUR SPREADS. |
+| `pipeline/threat_matrix.py` | Working. Dual-track Absolute + Probable output, driven by the **asymmetric** (match-final-P1, chronological-P2) knowledge pair. When canonical priors are ≥40-EV-clipped by the inferred bounds, the Probable column is dropped and the line tagged `(off-meta)`. Optional `format_id` drives chaos-backed priors. |
+| `pipeline/teacher/` (sub-package: `base.py` + `openai.py` / `anthropic.py` / `google.py` / `judge.py` / `batch_openai.py`, re-exported via `__init__.py`) | Working. Provider-agnostic `TeacherProvider` ABC; tool-use loop with `calculate_damage` + `submit_decision`. The model has only one output channel — tool calls — so it can't bypass the calc tool. Two system-prompt templates: Bo1 CTS (Masking Rule + reconstructed team) vs Bo3 OTS (full sheets + ★ brought-flag). Present-tense framing throughout. Plus `judge.py` (match-level model-judge validator) and `batch_openai.py` (`BatchTeacherProvider` ABC + OpenAI Batch API adapter). |
+| `pipeline/batch_runner.py` | Working. Per-iteration state machine for `--mode batch`: bundles all in-flight turns at iter=K into one batch upload, runs calc microservice calls synchronously between cycles, persists `BatchWorkItem` state in `batch_state/{match_id}.json`. Supports `--resume` via `active_batch_id` breadcrumbs. Also hosts `_prepare_match_turns()`, the shared sync-and-batch prep helper. |
+| `pipeline/master_pipeline.py` | Working. CLI orchestrator with `--mode {sync,batch,hybrid}` dispatcher. `flip_match_to_winner` makes every example come from the series winner's perspective. Three historical-context blocks in the user prompt (GAME-STATE LEDGER / TURN-BY-TURN / SERIES STATE). YOUR SPREADS surfaces match-final P1 bounds (Plan v3). Per-match buffered write + judge integration (Plan v4). Empty-slot annotation. Perspective-aware bench gating. `--provider {openai,anthropic,google}` flag; batch is OpenAI-only in v1. Resumable. |
+| `pipeline/bakeoff.py` | Working. Runs the same match through multiple providers in lockstep and reports per-row cost, tool-call rate, action-match rate, CoT length, wall-clock. **Result (May 2026):** OpenAI gpt-5.5 won — 100% match rate, 0% leak, $0.07/row. Google gemini-3.1-pro also clean. Anthropic claude-sonnet-4-6 produced near-miss meta-leaks in 32% of saved rows (motivated Plan v4's judge layer). |
 
 See each subdirectory's README for setup, contracts, and design notes.
