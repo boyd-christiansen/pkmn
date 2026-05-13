@@ -1074,29 +1074,13 @@ the corpus depending on whether mini access is available.
   support via `active_batch_id` breadcrumbs in
   `batch_state/{match_id}.json`.
 
-**What we still want:**
-
-1. **Real corpus run** in hybrid mode — 50 matches sync as gate, then
-   batch the rest. Spot-checks on CoT quality at each step.
-2. **A holdout eval set** — withhold a few hundred matches, measure
-   whether the trained model's plays match the human's labels.
-3. **Anthropic / Google batch adapters** — `BatchTeacherProvider`
-   abstraction is in place; siblings `batch_anthropic.py` /
-   `batch_google.py` slot in mechanically when those providers
-   move into production rotation.
-4. **Canonical-prior substitution in YOUR SPREADS** — mask the
-   implicit "this mon never took damage" leak from
-   `(no observations yet)` rendering.
-5. **A separate selection-model SFT corpus** — the team-preview
-   4-of-6 pick is a different decision (matchup theory, no tactical
-   state) and deserves its own model.
-6. **Minimax / MCTS distillation for the alternatives loop** —
-   replaces the current prompt-driven Alternatives Rule (which lets
-   the teacher cherry-pick weak alternatives because it knows the
-   answer) with a real search step. Tracked as
-   `# TODO(rlhf-followup)` in `teacher/base.py`.
-7. **RLHF on top** — once SFT gives us a model that can think like a
-   pro, RLHF gives it the chance to outclass one. The SFT corpus
-   we're building here is the floor, not the ceiling.
+**What we still want:** the full list lives in
+[`TODO.md`](TODO.md) — active workstreams (real corpus run on hybrid
+mode, holdout eval, Anthropic/Google batch adapters), the three
+`# TODO(...)` markers in source (`rlhf-followup`, series-state
+summarizer, canonical-prior substitution), Plan v4 follow-ups
+(judge-rate dashboard, regex-filter retirement), long-horizon
+workstreams (selection-model SFT, RLHF), inspector enhancements, and
+further data-sourcing options.
 
 But the floor is the hard part. That's what's done.

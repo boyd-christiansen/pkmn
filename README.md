@@ -15,8 +15,9 @@ without touching the others.
 |---|---|---|
 | [`data_scraper/`](data_scraper/) | Python 3.11+ | Pulls top-500 ladder users + all their saved replays from Pokémon Showdown. |
 | [`calc_microservice/`](calc_microservice/) | Node 20+ / TS | HTTP service wrapping `@smogon/calc` (`POST /calc`), `@pkmn/client` + `@pkmn/sets` (`POST /parse_log` — per-turn snapshots, `events` stream, and Bo3 OTS `teamSheets`), and `@pkmn/dex` (`GET /dex/move/:name`). |
-| [`pipeline/`](pipeline/) | Python 3.11+ | Atomic modules that turn raw replays into SFT-ready conversational training data. Inference modules (`replay_parser`, `canonical_priors`, `damage_inferencer`, `threat_matrix`); orchestration helpers split out of the orchestrator (`team_reconstruction`, `action_extraction`, `prompt_formatting`); the orchestrator + CLI (`master_pipeline` with `--mode {sync,batch,hybrid}`); a `teacher/` sub-package holding the `TeacherProvider` ABC plus OpenAI / Anthropic / Google adapters, a `judge.py` model-judge validator, and a `batch_openai.py` Batch API adapter; a `batch_runner.py` sibling implementing the per-cycle state machine for batch mode; and a head-to-head `bakeoff` runner (OpenAI won — see status below). |
-| [`notes/`](notes/) | — | Free-form planning notes (data sourcing options, scope decisions, etc). |
+| [`pipeline/`](pipeline/) | Python 3.11+ | Atomic modules that turn raw replays into SFT-ready conversational training data. Inference modules (`replay_parser`, `canonical_priors`, `damage_inferencer`, `threat_matrix`); orchestration helpers split out of the orchestrator (`team_reconstruction`, `action_extraction`, `prompt_formatting`); the orchestrator + CLI (`master_pipeline` with `--mode {sync,batch,hybrid}`); a [`teacher/`](pipeline/teacher/README.md) sub-package holding the `TeacherProvider` ABC plus OpenAI / Anthropic / Google adapters, a `judge.py` model-judge validator, and a `batch_openai.py` Batch API adapter; a `batch_runner.py` sibling implementing the per-cycle state machine for batch mode; and a head-to-head `bakeoff` runner (OpenAI won — see status below). |
+| [`inspector/`](inspector/) | Python 3.11+ (FastAPI) | Local read-only web UI for browsing saved SFT rows + their source data. Splits prompts into structured sections, shows the calc-tool loop step-by-step, and cross-references by `(match_id, game_index, turn)` against `pipeline/parsed_data/`. Listens on port 8001 — doesn't talk to the calc service. |
+| [`notes/`](notes/) | — | The project's writing surface. [`pipeline_walkthrough.md`](notes/pipeline_walkthrough.md) is the long-form design doc; [`TODO.md`](notes/TODO.md) is the master tracker for non-shipped work (active workstreams, code-level TODOs, long-horizon plans, data-sourcing options). |
 
 ## Pipeline overview
 
@@ -218,6 +219,26 @@ ANTHROPIC_API_KEY=sk-... .venv/bin/python master_pipeline.py \
 (keyed by `(match_id, game_index, turn)`). Per-match atomic commit:
 a match either lands complete or not at all.
 
+### 6. (Optional) Inspect the generated SFT data
+
+The inspector is a local read-only web UI that browses every JSONL file
+under `pipeline/parsed_data/` — prompts split into structured sections,
+the calc-tool loop laid out step-by-step, and cross-references against
+the underlying parsed match snapshots. Useful for sanity-checking new
+prompt schemas, eyeballing the judge's flagged rows, or comparing two
+rows side-by-side.
+
+```bash
+cd inspector
+python3 -m venv .venv
+.venv/bin/pip install -e .
+./run.sh                          # → http://localhost:8001
+```
+
+The inspector imports nothing from `pipeline/` and never writes back —
+purely a viewer. See [`inspector/README.md`](inspector/README.md) for
+endpoints, schema-awareness notes, and the "what it doesn't do" list.
+
 ## Status
 
 | Component | State |
@@ -232,5 +253,9 @@ a match either lands complete or not at all.
 | `pipeline/batch_runner.py` | Working. Per-iteration state machine for `--mode batch`: bundles all in-flight turns at iter=K into one batch upload, runs calc microservice calls synchronously between cycles, persists `BatchWorkItem` state in `batch_state/{match_id}.json`. Supports `--resume` via `active_batch_id` breadcrumbs. Also hosts `_prepare_match_turns()`, the shared sync-and-batch prep helper. |
 | `pipeline/master_pipeline.py` | Working. CLI orchestrator with `--mode {sync,batch,hybrid}` dispatcher. `flip_match_to_winner` makes every example come from the series winner's perspective. Three historical-context blocks in the user prompt (GAME-STATE LEDGER / TURN-BY-TURN / SERIES STATE). YOUR SPREADS surfaces match-final P1 bounds (Plan v3). Per-match buffered write + judge integration (Plan v4). Empty-slot annotation. Perspective-aware bench gating. `--provider {openai,anthropic,google}` flag; batch is OpenAI-only in v1. Resumable. |
 | `pipeline/bakeoff.py` | Working. Runs the same match through multiple providers in lockstep and reports per-row cost, tool-call rate, action-match rate, CoT length, wall-clock. **Result (May 2026):** OpenAI gpt-5.5 won — 100% match rate, 0% leak, $0.07/row. Google gemini-3.1-pro also clean. Anthropic claude-sonnet-4-6 produced near-miss meta-leaks in 32% of saved rows (motivated Plan v4's judge layer). |
+| `inspector/` | Working. FastAPI + vanilla-JS single-page app on port 8001. Browses every JSONL under `pipeline/parsed_data/`; splits user prompts into 8 logical sections; renders the calc-tool loop step-by-step; pins two rows for side-by-side compare; cross-references rows against the underlying parsed match snapshots. Schema-aware — handles current and legacy prompt formats. Read-only (writes nothing back). |
 
 See each subdirectory's README for setup, contracts, and design notes.
+The [`pipeline/teacher/README.md`](pipeline/teacher/README.md) deep-dives
+the provider-agnostic teacher sub-package; [`notes/TODO.md`](notes/TODO.md)
+tracks everything not yet shipped.

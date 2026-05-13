@@ -96,5 +96,7 @@ opponents in a game appear in each other's replay lists.
 
 ## Other endpoints worth exploring
 
-See [`../notes/for_the_future.md`](../notes/for_the_future.md) for further
-data-sourcing options if the top-500 corpus turns out to be too small.
+See the "Data sourcing" section of [`../notes/TODO.md`](../notes/TODO.md)
+for further data-sourcing options (format-only paginated search,
+WebSocket spectator capture, additional canonical-data endpoints) if
+the top-500 corpus turns out to be too small.

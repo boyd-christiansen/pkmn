@@ -12,11 +12,16 @@ Reg I doubles). Four self-contained components under one umbrella:
 |---|---|---|
 | `data_scraper/` | Python | Pulls top-500 ladder users + replays from Pokémon Showdown. |
 | `calc_microservice/` | Node + TS | HTTP wrapper for `@smogon/calc`, `@pkmn/client`, `@pkmn/dex` (3 endpoints). |
-| `pipeline/` | Python | Atomic modules + a `teacher/` sub-package + a `batch_runner.py` sibling for batched runs. Orchestrator is `master_pipeline.py` (`--mode {sync,batch,hybrid}`), which writes the SFT JSONL. See `pipeline/README.md` for the full file map. |
-| `notes/` | — | Free-form planning notes. |
+| `pipeline/` | Python | Atomic modules + a `teacher/` sub-package (own README) + a `batch_runner.py` sibling for batched runs. Orchestrator is `master_pipeline.py` (`--mode {sync,batch,hybrid}`), which writes the SFT JSONL. See `pipeline/README.md` for the full file map. |
+| `inspector/` | Python (FastAPI) | Local read-only web UI on port 8001 that browses saved SFT rows + cross-references them against parsed-match data. Never writes back into `pipeline/`. |
+| `notes/` | — | Long-form docs. `pipeline_walkthrough.md` is the design narrative; `TODO.md` is the master tracker for non-shipped work. |
 
 The SFT generation pipeline is **complete end-to-end**. Status of each piece
-is tracked in [README.md#status](README.md#status).
+is tracked in [README.md#status](README.md#status). Non-shipped work
+(active workstreams, code-level `# TODO(...)` markers, long-horizon
+plans, deferred items) lives in [`notes/TODO.md`](notes/TODO.md) — the
+single source of truth. **When adding a new TODO anywhere in the
+project, add it there too.**
 
 ## Architecture rules (don't violate without a reason)
 
@@ -223,6 +228,10 @@ pipeline/parsed_data/sft_training_data.jsonl   # one fine-tuning example per tur
 
 ## Provider-agnostic teacher LLM
 
+(Deep dive in [`pipeline/teacher/README.md`](pipeline/teacher/README.md) —
+contract, judge architecture, batch architecture, full bake-off table.
+The summary below covers what you need *while coding*.)
+
 The teacher LLM tool-loop goes through a `TeacherProvider` ABC
 (`pipeline/teacher/base.py`) with three concrete adapters in the
 `pipeline/teacher/` sub-package, all re-exported via `teacher/__init__.py`
@@ -344,29 +353,15 @@ JUDGE_MODEL=gpt-5.5-mini       # plan v4: judge defaults to gpt-5.5; set to mini
 Cost-table placeholders are in `teacher.base.PRICE_PER_M_TOKENS` — confirm
 against the provider's pricing page before scaling to the full corpus.
 
-## Planned follow-up workstreams (not built yet)
+## Where TODOs live
 
-- **Anthropic / Google batch adapters.** v1 of batch is OpenAI-only.
-  `BatchTeacherProvider` is the abstraction (`pipeline/teacher/
-  batch_openai.py`); siblings `batch_anthropic.py` / `batch_google.py`
-  would slot in mechanically. Useful once those providers move into
-  production rotation.
-- **Token-efficient series-state summarizer.** Today's `format_series_state`
-  inlines the full turn-by-turn rollup of every prior Bo3 game.
-  Distilling those into a "what mattered for THIS turn's decision"
-  summary would conserve attention. Tracked as
-  `# TODO(token-efficient-series-summary)` in `master_pipeline.py`.
-- **Selection-model SFT corpus** — separate dataset for the
-  team-preview 4-of-6 pick decision. Sibling module to
-  `master_pipeline.py`. Generates `{full p1, full p2, format_meta} →
-  {brought 4}` examples per game.
-- **Minimax / MCTS distillation for the tool-use loop** — replaces the
-  current prompt-driven Alternatives Rule (teacher cherry-picks
-  alternatives because it already knows the answer) with a proper
-  search step. See `# TODO(rlhf-followup)` in `teacher/base.py`.
-- **Canonical-prior substitution in YOUR SPREADS.** Mons that never
-  took damage in a match render as `(no observations yet)` — implicit
-  signal that the model could exploit. Substituting the canonical
-  spread for fully-open stats would mask this without changing the
-  shape of the prompt at deploy. Flagged in
-  `prompt_formatting.format_p1_known_spreads_block`.
+All non-shipped work lives in [`notes/TODO.md`](notes/TODO.md) — active
+workstreams, the three open `# TODO(...)` markers in source, Plan v4
+follow-ups, long-horizon plans (selection-model SFT, RLHF), inspector
+gaps, and data-sourcing options.
+
+When you spot a new TODO anywhere — code comment, design issue, missing
+feature — add it to `notes/TODO.md`. This file (`CLAUDE.md`) only
+carries the architecture + gotchas you need *while coding*. The
+shipped-state docs (`README.md`, `pipeline/README.md`, the walkthrough)
+describe what's done, not what's planned.

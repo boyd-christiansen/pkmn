@@ -22,6 +22,8 @@ pipeline/
 │                             #   batch_state/{match_id}.json
 ├── bakeoff.py                # head-to-head provider runner
 └── teacher/                  # provider-agnostic teacher LLM
+    │                         # — see teacher/README.md for the deep dive
+    ├── README.md             # contract + adapters + judge + batch + bake-off
     ├── __init__.py           # re-exports for `from teacher import ...`
     ├── base.py               # TeacherProvider ABC, schemas, prompts,
     │                         #   detect_oracle_leak + extract_pre_tool_thought
@@ -742,36 +744,13 @@ raw replay JSON
 | `batch_runner.py` | Plan v4. `_prepare_match_turns` (shared sync/batch prep) + `BatchWorkItem` dataclass + `run_batch_for_matches` (per-cycle state machine) + `_resume_inflight_batches` (drain in-flight batches on `--resume`). Per-match state in `batch_state/{match_id}.json`. v1 OpenAI-only. |
 | `master_pipeline.py` | Working. CLI orchestrator with `--mode {sync,batch,hybrid}` dispatcher. `flip_match_to_winner` makes every SFT example come from the series winner's perspective; match-final P1 spreads in user prompt; asymmetric threat matrix; per-format system prompt branch; three historical-context blocks (`GAME-STATE LEDGER`, `TURN-BY-TURN`, `SERIES STATE`); explicit empty-slot annotation; perspective-aware bench rendering. Per-match buffered write + judge integration (Plan v4). `--provider {openai,anthropic,google}` flag (batch is OpenAI-only). `--dry-run` exercises orchestration without LLM cost. |
 
-## Planned follow-up workstreams (TODO)
+## Planned follow-up workstreams
 
-- **Anthropic / Google batch adapters.** v1 of `--mode batch` is OpenAI-
-  only. `BatchTeacherProvider` (the ABC in `teacher/batch_openai.py`)
-  is the abstraction; siblings `teacher/batch_anthropic.py` (Message
-  Batches) and `teacher/batch_google.py` (Vertex batch prediction)
-  would slot in mechanically once those providers move into production
-  rotation.
-- **Token-efficient series-state summarizer.** `format_series_state`
-  currently inlines the full prior-game rollup verbatim, which is
-  high-fidelity but verbose. A learned (or careful rule-based)
-  summarizer that distills "what mattered for THIS turn's decision"
-  would conserve attention without losing decision-relevant signal.
-  Tracked as `# TODO(token-efficient-series-summary)` in the function.
-- **Canonical-prior substitution in YOUR SPREADS.** Plan v3 acknowledged
-  an implicit leak: mons that never took damage render as `(no
-  observations yet)`. Substituting the canonical spread for fully-open
-  stats would mask this without changing the prompt shape at deploy.
-  Flagged in `prompt_formatting.format_p1_known_spreads_block`.
-- **Selection-model SFT corpus** — separate dataset for the team-preview
-  4-of-6 pick decision. Walks the same parsed replays, extracts P1's
-  brought set per game, generates one selection example per game with
-  `{p1_full_6, p2_full_6, format_meta} → {brought: [4 species]}`. Trains
-  as its own model (no tactical play, no tool calls); deployed before
-  the turn-play model takes over. Lives in a sibling module, not in
-  `master_pipeline.py`.
-- **Minimax / MCTS distillation for the tool-use loop** — replaces the
-  current prompt-driven alternative evaluation (Alternatives Rule in
-  the system prompt) with a proper search step that surfaces
-  genuinely-competitive alternative plays for the teacher to articulate
-  rejection of. The current approach has the teacher cherry-picking
-  weak alternatives because it knows the answer. See the
-  `# TODO(rlhf-followup)` in `teacher/base.py`.
+Tracked in [`../notes/TODO.md`](../notes/TODO.md) — the master tracker
+for all non-shipped work across the project. That includes the three
+`# TODO(...)` markers in this directory (`rlhf-followup` in
+`teacher/base.py`, `token-efficient-series-summary` and the
+canonical-prior substitution note in `prompt_formatting.py`), Plan v4
+follow-ups (Anthropic / Google batch adapters, judge-rate dashboard),
+and long-horizon plans (selection-model SFT corpus, RLHF). Pipeline-
+adjacent additions live there too — don't fork the list here.
