@@ -191,6 +191,17 @@ function renderSftRow(d, contentEl, headerEl) {
   const isPinnedA = state.pinned.A && state.pinned.A.file === d.path && state.pinned.A.idx === d.idx;
   const isPinnedB = state.pinned.B && state.pinned.B.file === d.path && state.pinned.B.idx === d.idx;
 
+  // Dry-run detection: the master_pipeline --dry-run path emits a stub
+  // submit_decision tool call whose ack is `{"status":"decision_committed_dry_run"}`.
+  // Surface this with a prominent badge so the user knows at a glance
+  // they're looking at a preview row (full prompts, placeholder action)
+  // and not a real teacher-LLM-synthesized one.
+  const isDryRun = (d.tool_loop || []).some(e =>
+    e.type === "submit" &&
+    e.ack && typeof e.ack === "object" &&
+    e.ack.status === "decision_committed_dry_run"
+  );
+
   headerEl.innerHTML = `
     <div class="detail-header-bar">
       <strong>${escapeHtml(d.match_id)}</strong>
@@ -198,6 +209,7 @@ function renderSftRow(d, contentEl, headerEl) {
       <span class="kv-pair"><span class="k">turn</span><span class="v">${d.turn}</span></span>
       <span class="kv-pair"><span class="k">format</span><span class="v">${escapeHtml(d.format_id || "")}</span></span>
       <span class="schema-badge ${d.user.parsed.schema}">${d.user.parsed.schema}</span>
+      ${isDryRun ? `<span class="dry-run-badge" title="Preview row — full prompts but no real LLM synthesis. The action card surfaces the human's actual play from the source replay.">DRY RUN</span>` : ""}
       <button class="pin-btn ${isPinnedA ? "pinned" : ""}" data-slot="A">
         ${isPinnedA ? "📌 A pinned" : "📌 pin to slot A"}
       </button>

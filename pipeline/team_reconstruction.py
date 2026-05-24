@@ -81,6 +81,61 @@ def reconstruct_p2_species(games: list[dict]) -> list[str]:
     return seen
 
 
+def reconstruct_p2_team(games: list[dict]) -> dict[str, dict[str, Any]]:
+    """Forward-scan all snapshots, aggregate revealed P2 info per species.
+
+    Pure mirror of `reconstruct_p1_team` for the opponent side. Used by
+    the bench renderer in Bo1 (CTS) where there's no team-sheet to fall
+    back on — we only know what's been revealed during play. Each entry
+    has the same `{species, item?, ability?, teraType?, isTerastallized,
+    moves[]}` shape, with moves padded to 4 with `[UNREVEALED_MOVE]`.
+
+    Callers should typically gate the output by `snapshot.p2.seenSpecies`
+    before display — the player only "knows" about opponent mons they
+    have observed on field, not every species the forward-scan can
+    eventually identify.
+    """
+    aggregated: dict[str, dict[str, Any]] = {}
+
+    def _ensure(species: str) -> dict[str, Any]:
+        return aggregated.setdefault(
+            species,
+            {
+                "species": species,
+                "item": None,
+                "ability": None,
+                "teraType": None,
+                "isTerastallized": False,
+                "moves": [],
+            },
+        )
+
+    for game in games:
+        for snap in game.get("snapshots", []):
+            for p in snap.get("p2", {}).get("active", []):
+                entry = _ensure(p["species"])
+                if p.get("item") and not entry["item"]:
+                    entry["item"] = p["item"]
+                if p.get("ability") and not entry["ability"]:
+                    entry["ability"] = p["ability"]
+                if p.get("teraType") and not entry["teraType"]:
+                    entry["teraType"] = p["teraType"]
+                if p.get("isTerastallized"):
+                    entry["isTerastallized"] = True
+                for mv in p.get("revealedMoves") or []:
+                    if mv not in entry["moves"]:
+                        entry["moves"].append(mv)
+            for b in snap.get("p2", {}).get("bench", []):
+                _ensure(b["species"])
+
+    for entry in aggregated.values():
+        while len(entry["moves"]) < 4:
+            entry["moves"].append("[UNREVEALED_MOVE]")
+        entry["moves"] = entry["moves"][:4]
+
+    return aggregated
+
+
 def team_sheets_for_match(games: list[dict]) -> dict[str, list[dict]] | None:
     """Return the first non-null `teamSheets` from any game in the match.
 

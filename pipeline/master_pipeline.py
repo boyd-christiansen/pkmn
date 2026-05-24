@@ -47,12 +47,14 @@ from action_extraction import (
 from prompt_formatting import (
     format_p1_known_spreads_block,
     format_p1_team_block,
+    format_p2_inferred_spreads_block,
     format_user_prompt,
 )
 from team_reconstruction import (
     brought_species_keys_for_game,
     reconstruct_p1_team,
     reconstruct_p2_species,
+    reconstruct_p2_team,
     team_sheets_for_match,
 )
 from teacher import (
@@ -360,6 +362,10 @@ async def process_match(
     # so the threat matrix can reason about the unswitched-in backline too.
     # For CTS Bo1, fall back to whatever the snapshots reveal.
     p1_team_recon = reconstruct_p1_team(games)
+    # Bo1 CTS only: forward-scan opponent species for bench metadata
+    # rendering. Bo3 OTS gets this from team_sheets directly so the
+    # recon would be redundant work.
+    p2_team_recon = reconstruct_p2_team(games) if not team_sheets else None
     if team_sheets:
         p1_species_universe = [s["species"] for s in team_sheets["p1"]]
         p2_species_universe = [s["species"] for s in team_sheets["p2"]]
@@ -376,12 +382,30 @@ async def process_match(
     #   p2_running  — fed turn-by-turn; drives the matrix's P2 side.
     #                 Models the observational asymmetry — we learn about
     #                 the opponent through play.
+    stats: dict[str, int] = defaultdict(int)
+    match_id = match_record.get("match_id", "unknown")
+
     p1_running = damage_inferencer.init_knowledge(p1_species_universe)
     p2_running = damage_inferencer.init_knowledge(p2_species_universe)
-    p1_final, _ = await damage_inferencer.infer_match_final_bounds(
-        games, p1_species_universe, p2_species_universe,
-        session=aiohttp_session, base_url=calc_base_url,
-    )
+    # The match-final offline pass touches every damage event in every
+    # game of the match. If any one event causes a /calc failure (most
+    # commonly a malformed Pokémon entry on the Node side), we don't
+    # want to take down the whole corpus run — fall back to fully-open
+    # P1 bounds for this match and let the per-turn loop run normally.
+    # The YOUR SPREADS block will render as `(no observations yet)` for
+    # every P1 mon in this match, which is a sensible degradation.
+    try:
+        p1_final, _ = await damage_inferencer.infer_match_final_bounds(
+            games, p1_species_universe, p2_species_universe,
+            session=aiohttp_session, base_url=calc_base_url,
+        )
+    except Exception as e:
+        _log_error(
+            f"[{match_id}] match-final inference failed: {e}; "
+            f"falling back to fully-open P1 bounds for this match"
+        )
+        p1_final = damage_inferencer.init_knowledge(p1_species_universe)
+        stats["fallback_open_p1_bounds"] += 1
 
     # Bo1 system prompt is stable across all turns of the match.
     bo1_system_prompt = (
@@ -389,9 +413,6 @@ async def process_match(
         if not team_sheets
         else None
     )
-
-    stats: dict[str, int] = defaultdict(int)
-    match_id = match_record.get("match_id", "unknown")
 
     # Per-match buffers populated during the per-turn loop. We defer the
     # JSONL write until after the match-level judge runs so flagged turns
@@ -454,16 +475,30 @@ async def process_match(
             # YOUR SPREADS surfaces match-final P1 bounds (the player's
             # own-team knowledge stand-in).
             p1_spreads = format_p1_known_spreads_block(snap_pre, p1_final)
+            # OPP SPREADS uses chronological P2 inference. Bo3 OTS lets
+            # us list all 6 (player saw them at team preview); Bo1 CTS
+            # gates by snapshot.p2.seenSpecies inside the renderer.
+            if team_sheets:
+                opp_universe = [m["species"] for m in team_sheets["p2"]]
+            else:
+                opp_universe = None
+            p2_spreads = format_p2_inferred_spreads_block(
+                snap_pre, p2_running, species_universe=opp_universe,
+            )
             user_prompt = format_user_prompt(
                 snap_pre,
                 tm_text,
                 p1_inferred_block=p1_spreads,
+                p2_inferred_block=p2_spreads,
                 snapshots_so_far=snapshots,
                 current_idx=i,
                 prior_games=games[:game_idx],
                 game_index=game_idx,
                 total_games_in_series=len(games),
                 match_format=match_format,
+                team_sheets=team_sheets,
+                p1_team_recon=p1_team_recon,
+                p2_team_recon=p2_team_recon,
             )
             human_action = {
                 "slot_1": human_action_dict.get("a", slot_action("pass")),
@@ -571,17 +606,51 @@ async def _safe_update_knowledge(
 def _dry_run_messages(
     system_prompt: str, user_prompt: str, human_action: dict[str, Any]
 ) -> list[dict[str, Any]]:
+    """Placeholder messages for `--dry-run` mode.
+
+    Shaped to mirror a real teacher-LLM-produced row so the SFT inspector
+    parses it identically: an assistant message with a `submit_decision`
+    tool call (rather than a JSON dump in `content`), followed by the
+    matching tool-response ack. The `pre_tool_thought` is a stub flagging
+    that no LLM was actually called; the `action` field surfaces the
+    human's actual play from the source replay as a visual cue.
+
+    Use case: cheaply preview the full prompt corpus before paying for a
+    real synthesis run. Every turn shows the exact system + user prompts
+    the teacher would have seen, plus the ground-truth play it would
+    have been asked to justify.
+    """
+    dry_call_id = "call_dry_run"
     return [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
         {
             "role": "assistant",
-            "content": json.dumps(
+            "tool_calls": [
                 {
-                    "pre_tool_thought": "[DRY RUN — teacher LLM not invoked]",
-                    "action": human_action,
-                }
-            ),
+                    "id": dry_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "submit_decision",
+                        "arguments": json.dumps({
+                            "pre_tool_thought": (
+                                "[DRY RUN — teacher LLM was not invoked. "
+                                "The `action` field below is the human "
+                                "expert's actual play from the source "
+                                "replay, surfaced as a placeholder so "
+                                "this preview row is visually inspectable "
+                                "alongside its prompt.]"
+                            ),
+                            "action": human_action,
+                        }),
+                    },
+                },
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": dry_call_id,
+            "content": json.dumps({"status": "decision_committed_dry_run"}),
         },
     ]
 
@@ -659,30 +728,44 @@ async def _run_sync(
     sem = asyncio.Semaphore(concurrency)
 
     async def worker(rec: dict[str, Any]) -> dict[str, int]:
+        # Backstop: catch any unhandled exception so one bad match doesn't
+        # take down the gather. process_match already handles the common
+        # failure modes internally (skipped_ambiguous, skipped_threat_matrix_error,
+        # fallback_open_p1_bounds, skipped_llm_error). Anything else
+        # surfaces here as a `skipped_uncaught_exception` counter.
         async with sem:
-            return await process_match(
-                rec,
-                output_path=output_path,
-                calc_base_url=calc_base_url,
-                teacher=teacher,
-                aiohttp_session=aiohttp_session,
-                file_lock=file_lock,
-                format_id=format_id,
-                seen_keys=seen_keys,
-                dry_run=dry_run,
-                model=model,
-                leak_retries=leak_retries,
-                use_judge=use_judge,
-                judge_client=judge_client,
-                judge_model=judge_model,
-                judge_retries=judge_retries,
-            )
+            try:
+                return await process_match(
+                    rec,
+                    output_path=output_path,
+                    calc_base_url=calc_base_url,
+                    teacher=teacher,
+                    aiohttp_session=aiohttp_session,
+                    file_lock=file_lock,
+                    format_id=format_id,
+                    seen_keys=seen_keys,
+                    dry_run=dry_run,
+                    model=model,
+                    leak_retries=leak_retries,
+                    use_judge=use_judge,
+                    judge_client=judge_client,
+                    judge_model=judge_model,
+                    judge_retries=judge_retries,
+                )
+            except Exception as e:
+                _log_error(
+                    f"[{rec.get('match_id', '?')}] UNCAUGHT exception in process_match: "
+                    f"{type(e).__name__}: {e}; skipping match"
+                )
+                return {"skipped_uncaught_exception": 1}
 
     results = await tqdm.gather(
         *(worker(r) for r in records), desc="matches[sync]", unit="match",
     )
     totals: dict[str, int] = defaultdict(int)
     for r in results:
+        if not isinstance(r, dict):
+            continue
         for k, v in r.items():
             totals[k] += v
     return dict(totals)

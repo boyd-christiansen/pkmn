@@ -79,7 +79,70 @@ def _summarize_active(p: dict[str, Any]) -> str:
 
 
 def _summarize_bench(b: dict[str, Any]) -> str:
+    """Legacy bare bench summary — species + optional fainted flag.
+    Kept for any callers that want a one-line form; the user prompt
+    now uses `_summarize_bench_rich` instead."""
     return f"{b['species']}{' (fainted)' if b.get('fainted') else ''}"
+
+
+def _summarize_bench_rich(
+    bench_entry: dict[str, Any],
+    metadata: dict[str, Any] | None,
+) -> str:
+    """Multi-line per-mon bench rendering with item / ability / tera / moves.
+
+    When `metadata` is available (Bo3 team sheet, or Bo1 forward-scan
+    reconstruction), renders two lines:
+        - Whimsicott @ Focus Sash, ability=Prankster, tera=Ghost
+          moves: Tailwind / Moonblast / Encore / [UNREVEALED_MOVE]
+
+    When `metadata is None` (Bo1 P2 bench, mon seen but no metadata
+    captured yet — rare):
+        - Whimsicott (unknown — not yet revealed)
+
+    Fainted flag appended to the species line in either case.
+    """
+    species = bench_entry.get("species") or "?"
+    fainted = " (fainted)" if bench_entry.get("fainted") else ""
+    if metadata is None:
+        return f"  - {species}{fainted} (unknown — not yet revealed)"
+    item = metadata.get("item") or "?"
+    ability = metadata.get("ability") or "?"
+    tera = metadata.get("teraType") or "?"
+    moves = metadata.get("moves") or []
+    moves_str = " / ".join(moves) if moves else "?"
+    return (
+        f"  - {species}{fainted} @ {item}, ability={ability}, tera={tera}\n"
+        f"    moves: {moves_str}"
+    )
+
+
+def _build_meta_lookup(
+    sheet: list[dict[str, Any]] | None,
+    recon: dict[str, dict[str, Any]] | None,
+) -> dict[str, dict[str, Any]]:
+    """Combine team-sheet entries with Bo1 forward-scan recon entries.
+
+    Both data sources have the same shape (`{species, item, ability,
+    teraType, isTerastallized, moves[]}`) — sheets always carry complete
+    info, recons may have `[UNREVEALED_MOVE]` placeholders. Sheet wins
+    when both are present.
+
+    Keyed by `_species_key` so renderer lookups normalize species names
+    consistently with the rest of the pipeline.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    if recon:
+        for entry in recon.values():
+            sp = entry.get("species") or ""
+            if sp:
+                out[_species_key(sp)] = entry
+    if sheet:
+        for entry in sheet:
+            sp = entry.get("species") or ""
+            if sp:
+                out[_species_key(sp)] = entry
+    return out
 
 
 def _format_actives_with_empty_slots(side_snap: dict[str, Any]) -> str:
@@ -141,6 +204,43 @@ _FULLY_OPEN_MIN = 0
 _FULLY_OPEN_MAX = 252
 
 
+def _render_spread_line(
+    species: str,
+    entry: dict[str, dict[str, int]] | None,
+) -> str:
+    """Render one species line for the YOUR / OPP SPREADS blocks.
+
+    Returns just the body — `"Calyrex-Ice: Hp ≥244, Atk ≤8, ..."` or
+    `"Foobar: (no observations yet)"`. Caller is responsible for the
+    leading indent and the header. Shared between both spread blocks
+    so the one-sided-constraint formatting lives in exactly one place.
+    """
+    if not entry:
+        return f"{species}: (no observations yet)"
+    mins = entry.get("min_evs", {})
+    maxs = entry.get("max_evs", {})
+    constrained: list[str] = []
+    unconstrained: list[str] = []
+    for s in _STAT_DISPLAY:
+        lo = mins.get(s, _FULLY_OPEN_MIN)
+        hi = maxs.get(s, _FULLY_OPEN_MAX)
+        stat_label = s.capitalize()
+        if lo == _FULLY_OPEN_MIN and hi == _FULLY_OPEN_MAX:
+            unconstrained.append(stat_label)
+        elif lo == hi:
+            constrained.append(f"{stat_label} {lo}")
+        elif lo == _FULLY_OPEN_MIN:
+            constrained.append(f"{stat_label} ≤{hi}")
+        elif hi == _FULLY_OPEN_MAX:
+            constrained.append(f"{stat_label} ≥{lo}")
+        else:
+            constrained.append(f"{stat_label} {lo}–{hi}")
+    if not constrained:
+        return f"{species}: (no observations yet)"
+    tail = ", others ?" if unconstrained else ""
+    return f"{species}: " + ", ".join(constrained) + tail
+
+
 def format_p1_known_spreads_block(
     snapshot: dict[str, Any],
     p1_knowledge: dict[str, dict[str, dict[str, int]]],
@@ -165,34 +265,53 @@ def format_p1_known_spreads_block(
     lines: list[str] = ["=== YOUR SPREADS ==="]
     for p in actives:
         species = p.get("species") or "?"
-        key = _species_key(species)
-        entry = p1_knowledge.get(key)
-        if not entry:
-            lines.append(f"  {species}: (no observations yet)")
-            continue
-        mins = entry.get("min_evs", {})
-        maxs = entry.get("max_evs", {})
-        constrained: list[str] = []
-        unconstrained: list[str] = []
-        for s in _STAT_DISPLAY:
-            lo = mins.get(s, _FULLY_OPEN_MIN)
-            hi = maxs.get(s, _FULLY_OPEN_MAX)
-            stat_label = s.capitalize()
-            if lo == _FULLY_OPEN_MIN and hi == _FULLY_OPEN_MAX:
-                unconstrained.append(stat_label)
-            elif lo == hi:
-                constrained.append(f"{stat_label} {lo}")
-            elif lo == _FULLY_OPEN_MIN:
-                constrained.append(f"{stat_label} ≤{hi}")
-            elif hi == _FULLY_OPEN_MAX:
-                constrained.append(f"{stat_label} ≥{lo}")
-            else:
-                constrained.append(f"{stat_label} {lo}–{hi}")
-        if not constrained:
-            lines.append(f"  {species}: (no observations yet)")
-        else:
-            tail = ", others ?" if unconstrained else ""
-            lines.append(f"  {species}: " + ", ".join(constrained) + tail)
+        entry = p1_knowledge.get(_species_key(species))
+        lines.append("  " + _render_spread_line(species, entry))
+    return "\n".join(lines)
+
+
+def format_p2_inferred_spreads_block(
+    snapshot: dict[str, Any],
+    p2_knowledge: dict[str, dict[str, dict[str, int]]],
+    *,
+    species_universe: list[str] | None = None,
+) -> str:
+    """Render `=== OPP SPREADS (inferred) ===` block.
+
+    Visibility:
+      - If `species_universe` is provided (Bo3 OTS — player knows the
+        opponent's full 6-mon roster from team preview), render bounds
+        for every species in it.
+      - Otherwise (Bo1 CTS), render only species the player has actually
+        seen on field — i.e. those in `snapshot.p2.seenSpecies`.
+
+    The "(inferred)" tag stays in both formats — opponent spreads are
+    *always* inferred, even at deploy time, unlike P1's spreads which
+    the player built themselves.
+
+    Same one-sided constraint formatting as YOUR SPREADS via the shared
+    `_render_spread_line` helper. Returns empty string if there are no
+    species to render (e.g. Bo1 turn 1 before any opponent mon has
+    activated).
+    """
+    p2 = snapshot.get("p2") or {}
+    if species_universe is None:
+        seen_keys = {_species_key(s) for s in (p2.get("seenSpecies") or [])}
+        # Collect display-name species from snapshot, dedup by species_key.
+        species_universe = []
+        added: set[str] = set()
+        for p in (p2.get("active") or []) + (p2.get("bench") or []):
+            sp = p.get("species") or ""
+            k = _species_key(sp)
+            if k and k in seen_keys and k not in added:
+                species_universe.append(sp)
+                added.add(k)
+    if not species_universe:
+        return ""
+    lines: list[str] = ["=== OPP SPREADS (inferred) ==="]
+    for species in species_universe:
+        entry = p2_knowledge.get(_species_key(species))
+        lines.append("  " + _render_spread_line(species, entry))
     return "\n".join(lines)
 
 
@@ -208,6 +327,59 @@ def _slot_label(slot: str) -> str:
     return slot.upper()
 
 
+def _slot_label_with_species(
+    slot: str,
+    slot_species: dict[str, str] | None,
+) -> str:
+    """'p1a', {'p1a': 'Whimsicott'} -> 'P1[a]/Whimsicott'.
+
+    Slash delimiter (no spaces) so the slot+mon pair reads as one tight
+    identifier, distinct from any action verb that follows. Falls back
+    to the bare slot label when the species isn't in the map (rare: an
+    event references a slot that wasn't active at start of turn — e.g.
+    a switch-in event before the map is updated to include the new
+    occupant).
+    """
+    base = _slot_label(slot)
+    sp = (slot_species or {}).get(slot)
+    return f"{base}/{sp}" if sp else base
+
+
+def _init_slot_species(snap: dict[str, Any]) -> dict[str, str]:
+    """Build 'p1a'/'p1b'/'p2a'/'p2b' → species map from a snapshot's actives.
+
+    Used at the start of each turn's event walk to seed the slot→species
+    map. Slots with no active mon are absent from the map (rather than
+    mapped to None) so `dict.get(slot)` returns None cleanly.
+    """
+    out: dict[str, str] = {}
+    for side in ("p1", "p2"):
+        for a in (snap.get(side, {}) or {}).get("active", []) or []:
+            slot_letter = a.get("slot")
+            sp = a.get("species")
+            if slot_letter and sp:
+                out[f"{side}{slot_letter}"] = sp
+    return out
+
+
+def _apply_event_to_slot_map(
+    slot_species: dict[str, str],
+    ev: dict[str, Any],
+) -> None:
+    """Mutate slot_species in place to reflect one event.
+
+    Only switch events change slot occupancy (the new mon's `to_species`
+    replaces the previous occupant). Other event types are no-ops here
+    — even faints leave the entry in place because subsequent same-turn
+    damage events may still reference the fainted slot's species.
+    """
+    if ev.get("type") == "switch":
+        slot = ev.get("slot")
+        to_sp = ev.get("to_species")
+        if slot and to_sp:
+            slot_species[slot] = to_sp
+
+
 def _maybe_turns_left(n: int | None, total: int | None = None) -> str:
     if n is None:
         return ""
@@ -217,19 +389,34 @@ def _maybe_turns_left(n: int | None, total: int | None = None) -> str:
     return f" ({n} {unit} left)"
 
 
-def _scan_events(snapshots: list[dict[str, Any]], current_idx: int):
-    """Yield (turn_number, event) for every event in snapshots[0..current_idx-1].
+def _walk_events_with_slot_species(
+    snapshots: list[dict[str, Any]],
+    current_idx: int,
+):
+    """Yield (turn_number, event, slot_species_map) for every event in
+    snapshots[0..current_idx-1].
 
-    Note: snapshot at index N stores events that happened DURING turn N
-    (i.e. between |turn|N and |turn|N+1 markers). For "what was the state
-    at the start of turn current_idx+1", we read events from snapshots
-    [0..current_idx-1] (all turns *before* the current one).
+    The slot_species map is re-initialized from each snapshot's actives
+    at the start of that turn, then mutated turn-internally as switch
+    events yield so subsequent events in the same turn see the new
+    occupant. The yielded dict is the live map — callers should read
+    it at the yield point and not mutate it.
+
+    Note on indexing: snapshot at index N stores events that happened
+    DURING turn N (between |turn|N and |turn|N+1 markers). For "what
+    was the state at the start of turn current_idx+1", we read events
+    from snapshots[0..current_idx-1].
+
+    Replaces the older `_scan_events` which didn't carry the slot→species
+    map.
     """
     for i in range(min(current_idx, len(snapshots))):
         s = snapshots[i]
         turn_num = s.get("turn", i + 1)
+        slot_species = _init_slot_species(s)
         for ev in s.get("events") or []:
-            yield turn_num, ev
+            yield turn_num, ev, slot_species
+            _apply_event_to_slot_map(slot_species, ev)
 
 
 def format_game_state_ledger(
@@ -305,7 +492,9 @@ def format_game_state_ledger(
                 continue
             vols = active.get("volatiles") or {}
             slot = active.get("slot", "?")
-            label = f"{side_label}[{slot}] {active.get('species', '?')}"
+            # Slash between slot and species for consistency with the
+            # rest of the prompt's slot-augmented labels.
+            label = f"{side_label}[{slot}]/{active.get('species', '?')}"
             for vname, vinfo in vols.items():
                 vinfo = vinfo or {}
                 if vname == "substitute":
@@ -338,25 +527,30 @@ def format_game_state_ledger(
             lock = (active or {}).get("choiceLockedInto")
             if lock:
                 choice_parts.append(
-                    f"{side_label}[{active.get('slot', '?')}] {active.get('species', '?')} locked into {lock}"
+                    f"{side_label}[{active.get('slot', '?')}]/{active.get('species', '?')} "
+                    f"locked into {lock}"
                 )
     if choice_parts:
         lines.append("Choice locks:  " + "; ".join(choice_parts))
 
-    # Item events (last 3 from history, only if present).
+    # Item events (last 3 from history, only if present). Walked with
+    # slot-species context so the per-event species at the time of the
+    # consumption is rendered alongside the slot label (handles cases
+    # where a switch earlier in the turn changed slot occupancy).
     item_history: list[str] = []
-    for turn_num, ev in _scan_events(snapshots_so_far, current_idx):
-        if ev.get("type") == "item_event":
-            slot = ev.get("slot", "?")
-            kind = ev.get("kind", "?")
-            item = ev.get("item", "?")
-            sl = _slot_label(slot)
-            if kind == "consumed":
-                item_history.append(f"{sl} {item} consumed (T{turn_num})")
-            elif kind == "knocked_off":
-                item_history.append(f"{sl} {item} Knocked Off (T{turn_num})")
-            elif kind in ("tricked", "stolen", "flung", "incinerated", "popped", "harvested"):
-                item_history.append(f"{sl} {item} {kind} (T{turn_num})")
+    for turn_num, ev, slot_species in _walk_events_with_slot_species(snapshots_so_far, current_idx):
+        if ev.get("type") != "item_event":
+            continue
+        slot = ev.get("slot", "?")
+        kind = ev.get("kind", "?")
+        item = ev.get("item", "?")
+        sl = _slot_label_with_species(slot, slot_species)
+        if kind == "consumed":
+            item_history.append(f"{sl} {item} consumed (T{turn_num})")
+        elif kind == "knocked_off":
+            item_history.append(f"{sl} {item} Knocked Off (T{turn_num})")
+        elif kind in ("tricked", "stolen", "flung", "incinerated", "popped", "harvested"):
+            item_history.append(f"{sl} {item} {kind} (T{turn_num})")
     if item_history:
         # Only show the last 4 to keep the prompt tight.
         lines.append("Item events:   " + "; ".join(item_history[-4:]))
@@ -375,7 +569,7 @@ def format_game_state_ledger(
             stats = _accumulate_active_stats(snapshots_so_far, current_idx, full_slot, species)
             if stats["turns_on_field"] == 0 and stats["damage_pct"] == 0:
                 continue
-            label = f"{side_label}[{slot}] {species}"
+            label = f"{side_label}[{slot}]/{species}"
             if stats["damage_pct"] > 0:
                 cumulative_lines.append(
                     f"{label} took {stats['damage_pct']}% across {stats['hits']} hit(s) "
@@ -449,28 +643,47 @@ def _accumulate_active_stats(
     return {"damage_pct": damage_pct, "hits": hits, "turns_on_field": turns_on_field}
 
 
-def _format_event_inline(ev: dict[str, Any]) -> str | None:
+def _format_event_inline(
+    ev: dict[str, Any],
+    slot_species: dict[str, str] | None = None,
+) -> str | None:
     """Render a single TurnEvent as a one-line string. Returns None for events
     that should be folded into another (e.g. faint events covered by a
-    move's is_ko=True hit)."""
+    move's is_ko=True hit).
+
+    Slot labels get species-augmented via `_slot_label_with_species` so
+    the model doesn't have to track slot→species across turns. Where the
+    event payload itself carries species (`switch.from_species`,
+    `tera.species`, `faint.species`), that takes precedence over the
+    map lookup — it's the same species but always available.
+
+    Format convention: `P1[a]/Whimsicott/Icy Wind` (slash between slot
+    and species, slash between species and the action verb when there
+    are three distinct identifiers). For events with two-piece labels
+    (item events, faints, cant_move) the second slash is skipped and a
+    space is used instead, because the action isn't a discrete verb the
+    way a move name is: `P1[a]/Whimsicott consumed Focus Sash`.
+    """
+    sm = slot_species or {}
     t = ev.get("type")
     if t == "move":
-        attacker_label = _slot_label(ev.get("attacker_slot", "?"))
+        attacker_label = _slot_label_with_species(ev.get("attacker_slot", "?"), sm)
         move_name = ev.get("move_name", "?")
         cv = ev.get("called_via")
-        prefix = f"{attacker_label} "
         if cv:
             move_part = f"{cv} → {move_name}"
         else:
             move_part = move_name
+        # Three-piece: slot/mon/action_verb.
+        prefix = f"{attacker_label}/{move_part}"
         hits = ev.get("hits") or []
         if not hits:
             # Status / self-target move (Calm Mind, Protect, Rage Powder, ...).
-            return f"{prefix}{move_part}"
-        # Group hits by outcome for compact display.
+            return prefix
+        # Defender hits — slot/mon then space-separated damage/outcome.
         bits: list[str] = []
         for h in hits:
-            tgt = _slot_label(h.get("defender_slot", "?"))
+            tgt = _slot_label_with_species(h.get("defender_slot", "?"), sm)
             outcome = h.get("outcome", "?")
             if outcome == "damage":
                 hp_after = h.get("hp_after_pct")
@@ -486,33 +699,46 @@ def _format_event_inline(ev: dict[str, Any]) -> str | None:
             else:
                 bits.append(f"{tgt} {outcome}")
         kind_tag = " (spread)" if len(hits) >= 2 else ""
-        return f"{prefix}{move_part}{kind_tag} → " + ", ".join(bits)
+        return f"{prefix}{kind_tag} → " + ", ".join(bits)
     if t == "switch":
         side = ev.get("side", "?").upper()
-        slot = _slot_label(ev.get("slot", "?"))
+        slot = ev.get("slot", "?")
         from_sp = ev.get("from_species") or "(empty slot)"
         to_sp = ev.get("to_species", "?")
         forced = ev.get("forced_by")
         forced_part = f" (via {forced})" if forced else ""
-        return f"{side} switched {slot}: {from_sp} → {to_sp}{forced_part}"
+        # from_species is carried in the event payload — render it directly
+        # with the slash delimiter; the slot_species map will be updated
+        # to to_species by the caller after we yield.
+        slot_lbl = _slot_label(slot)
+        return f"{side} switched {slot_lbl}/{from_sp} → {to_sp}{forced_part}"
     if t == "tera":
         side = ev.get("side", "?").upper()
-        return f"{side} Tera'd: {ev.get('species', '?')} → {ev.get('to_type', '?')}"
+        slot = ev.get("slot")
+        species = ev.get("species", "?")
+        to_type = ev.get("to_type", "?")
+        # Tera events carry both slot and species — use both for consistency.
+        if slot:
+            return f"{side} Tera'd: {_slot_label(slot)}/{species} → {to_type}"
+        return f"{side} Tera'd: {species} → {to_type}"
     if t == "cant_move":
-        slot = _slot_label(ev.get("slot", "?"))
+        slot = ev.get("slot", "?")
+        sl = _slot_label_with_species(slot, sm)
         reason = ev.get("reason", "?")
         attempted = ev.get("attempted_move")
         att_part = f" (tried {attempted})" if attempted else ""
-        return f"{slot} couldn't move ({reason}){att_part}"
+        return f"{sl} couldn't move ({reason}){att_part}"
     if t == "item_event":
-        slot = _slot_label(ev.get("slot", "?"))
-        return f"{slot} {ev.get('kind', '?')} {ev.get('item', '?')}"
+        slot = ev.get("slot", "?")
+        sl = _slot_label_with_species(slot, sm)
+        return f"{sl} {ev.get('kind', '?')} {ev.get('item', '?')}"
     if t == "faint":
         # Faints are usually folded into the KO'd move event. If the faint
         # is from end-of-turn residual damage (Life Orb / weather / status),
         # render it as its own line so the cause is at least visible.
-        slot = _slot_label(ev.get("slot", "?"))
-        return f"{slot} {ev.get('species', '?')} fainted"
+        slot = ev.get("slot", "?")
+        species = ev.get("species") or sm.get(slot) or "?"
+        return f"{_slot_label(slot)}/{species} fainted"
     return None
 
 
@@ -526,6 +752,11 @@ def format_turn_by_turn(
 
     One block per prior turn in this game. Renders every event inline.
     No length cap (per design — sequence-aware reasoning is the point).
+
+    Per-turn `slot_species` map is seeded from the snapshot's actives at
+    the start of each turn and mutated as switch events render, so each
+    event sees the correct species in each slot at the moment it
+    happened (including mid-turn switches).
     """
     lines: list[str] = [f"=== TURN-BY-TURN (game {game_index + 1}) ==="]
     if current_idx == 0:
@@ -546,6 +777,7 @@ def format_turn_by_turn(
                 for h in ev.get("hits") or []:
                     if h.get("is_ko"):
                         ko_slots.add(h.get("defender_slot", ""))
+        slot_species = _init_slot_species(s)
         rendered_first = False
         for ev in events:
             if ev.get("type") == "faint" and _slot_label(ev.get("slot", ""))[:5].lower() in {
@@ -553,8 +785,10 @@ def format_turn_by_turn(
             }:
                 # Suppress if the matching slot was KO'd by a damage event already.
                 if ev.get("slot") in ko_slots:
+                    _apply_event_to_slot_map(slot_species, ev)
                     continue
-            line = _format_event_inline(ev)
+            line = _format_event_inline(ev, slot_species=slot_species)
+            _apply_event_to_slot_map(slot_species, ev)
             if not line:
                 continue
             prefix = f"T{turn_num}: " if not rendered_first else "    "
@@ -657,18 +891,33 @@ def format_user_prompt(
     threat_matrix_text: str,
     *,
     p1_inferred_block: str = "",
+    p2_inferred_block: str = "",
     snapshots_so_far: list[dict[str, Any]] | None = None,
     current_idx: int = 0,
     prior_games: list[dict[str, Any]] | None = None,
     game_index: int = 0,
     total_games_in_series: int = 1,
     match_format: str = "bo1",
+    team_sheets: dict[str, list[dict[str, Any]]] | None = None,
+    p1_team_recon: dict[str, dict[str, Any]] | None = None,
+    p2_team_recon: dict[str, dict[str, Any]] | None = None,
 ) -> str:
     """Compose the user prompt for one turn.
 
-    Includes (in order): board state header, current actives + benches,
-    GAME-STATE LEDGER, TURN-BY-TURN (this game), SERIES STATE (Bo3 only,
-    game_index > 0), YOUR SPREADS (inferred), and the threat matrix block.
+    Includes (in order): board state header, current actives + benches
+    (multi-line per mon with item/ability/tera/moves), GAME-STATE
+    LEDGER, TURN-BY-TURN (this game), SERIES STATE (Bo3 only,
+    game_index > 0), YOUR SPREADS (P1 match-final), OPP SPREADS
+    (chronological P2 inference), and the threat matrix block.
+
+    Bench metadata sources:
+      - `team_sheets` (Bo3 OTS): full info from the |showteam| decode.
+      - `p1_team_recon` / `p2_team_recon` (Bo1 CTS): forward-scan of
+        the match's snapshots, with `[UNREVEALED_MOVE]` padding for
+        moves not yet revealed.
+
+    P2 bench is gated by `snap.p2.seenSpecies` — the player only knows
+    about opponent mons they have actually observed on field.
     """
     f = snapshot.get("field", {})
     field_parts = []
@@ -685,17 +934,47 @@ def format_user_prompt(
 
     p1_active_lines = _format_actives_with_empty_slots(p1)
     p2_active_lines = "\n".join(_summarize_active(p) for p in p2.get("active", []))
-    # P1 bench: full brought-set (player knows their own selection from team preview).
-    p1_bench = ", ".join(_summarize_bench(b) for b in p1.get("bench", [])) or "(none)"
-    # P2 bench: chronologically gated — the player only learns the opponent's
-    # brought selection as the opponent actually switches them in. Use
-    # `seenSpecies` (emitted by the parser) as the visibility filter.
+
+    # Combined metadata lookups for bench enrichment. Sheet wins over
+    # recon when both are present (sheet always has complete moves).
+    p1_meta = _build_meta_lookup(
+        team_sheets["p1"] if team_sheets else None,
+        p1_team_recon,
+    )
+    p2_meta = _build_meta_lookup(
+        team_sheets["p2"] if team_sheets else None,
+        p2_team_recon,
+    )
+
+    # P1 bench: full brought-set (player knows their own selection from
+    # team preview), each mon rendered with full metadata.
+    p1_bench_entries = p1.get("bench") or []
+    if p1_bench_entries:
+        p1_bench = "\n".join(
+            _summarize_bench_rich(b, p1_meta.get(_species_key(b.get("species", ""))))
+            for b in p1_bench_entries
+        )
+    else:
+        p1_bench = "  (none)"
+
+    # P2 bench: chronologically gated by `seenSpecies` — the player only
+    # learns the opponent's brought selection as switches reveal them.
     p2_seen = {_species_key(s) for s in (p2.get("seenSpecies") or [])}
     p2_bench_visible = [
-        b for b in p2.get("bench", [])
+        b for b in (p2.get("bench") or [])
         if _species_key(b.get("species", "")) in p2_seen
     ]
-    p2_bench = ", ".join(_summarize_bench(b) for b in p2_bench_visible) or "(none)"
+    if p2_bench_visible:
+        p2_bench = "\n".join(
+            _summarize_bench_rich(b, p2_meta.get(_species_key(b.get("species", ""))))
+            for b in p2_bench_visible
+        )
+    else:
+        # Differentiate "opponent has no bench" (impossible — they have 4)
+        # from "we haven't seen any of their bench yet". The player hasn't
+        # observed any opponent switch-in yet, so we genuinely don't know
+        # what's behind their leads.
+        p2_bench = "  (unknown — opponent has not yet revealed any bench Pokémon)"
 
     # New historical context blocks.
     snaps = snapshots_so_far or []
@@ -710,18 +989,20 @@ def format_user_prompt(
         )
 
     spreads_block = (p1_inferred_block + "\n\n") if p1_inferred_block else ""
+    opp_spreads_block = (p2_inferred_block + "\n\n") if p2_inferred_block else ""
     series_block_part = (series_block + "\n\n") if series_block else ""
 
     return (
         f"=== TURN {snapshot.get('turn', '?')} ===\n"
         f"Field: {field_str}\n\n"
         f"YOUR (P1) ACTIVE:\n{p1_active_lines}\n"
-        f"YOUR (P1) BENCH: {p1_bench}\n\n"
+        f"YOUR (P1) BENCH:\n{p1_bench}\n\n"
         f"OPP (P2) ACTIVE:\n{p2_active_lines}\n"
-        f"OPP (P2) BENCH: {p2_bench}\n\n"
+        f"OPP (P2) BENCH:\n{p2_bench}\n\n"
         f"{ledger_block}\n\n"
         f"{rollup_block}\n\n"
         f"{series_block_part}"
         f"{spreads_block}"
+        f"{opp_spreads_block}"
         f"{threat_matrix_text}"
     )

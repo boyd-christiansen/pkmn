@@ -224,6 +224,24 @@ header h1 {
 .schema-badge.legacy  { background: rgba(255, 212, 59, 0.15); color: var(--warn); }
 .schema-badge.unknown { background: rgba(138, 147, 163, 0.15); color: var(--text-faint); }
 
+/* Surfaced on rows where the assistant message is a `--dry-run` placeholder
+   (no real LLM call). The action card still shows the human's actual play
+   from the source replay, so the user can sanity-check the full prompt
+   pipeline before paying for a real synthesis run. */
+.dry-run-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 8px;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  background: rgba(252, 196, 25, 0.25);
+  color: var(--warn);
+  border: 1px solid rgba(252, 196, 25, 0.5);
+}
+
 /* ============================================================
    Detail content cards
    ============================================================ */

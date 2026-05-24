@@ -62,12 +62,14 @@ from action_extraction import (
 from prompt_formatting import (
     format_p1_known_spreads_block,
     format_p1_team_block,
+    format_p2_inferred_spreads_block,
     format_user_prompt,
 )
 from team_reconstruction import (
     brought_species_keys_for_game,
     reconstruct_p1_team,
     reconstruct_p2_species,
+    reconstruct_p2_team,
     team_sheets_for_match,
 )
 from teacher import (
@@ -151,6 +153,9 @@ async def _prepare_match_turns(
     team_sheets = team_sheets_for_match(games) if match_format == "bo3" else None
 
     p1_team_recon = reconstruct_p1_team(games)
+    # Bo1 CTS only: forward-scan opponent species for bench metadata.
+    # Bo3 OTS pulls this from team_sheets so the recon is redundant work.
+    p2_team_recon = reconstruct_p2_team(games) if not team_sheets else None
     if team_sheets:
         p1_species_universe = [s["species"] for s in team_sheets["p1"]]
         p2_species_universe = [s["species"] for s in team_sheets["p2"]]
@@ -160,17 +165,30 @@ async def _prepare_match_turns(
 
     p1_running = damage_inferencer.init_knowledge(p1_species_universe)
     p2_running = damage_inferencer.init_knowledge(p2_species_universe)
-    p1_final, _ = await damage_inferencer.infer_match_final_bounds(
-        games, p1_species_universe, p2_species_universe,
-        session=aiohttp_session, base_url=calc_base_url,
-    )
+    match_id = match_record.get("match_id", "unknown")
+    # Match-final inference can fail on malformed snapshots (one bad
+    # /calc 400 from `damage_inferencer._call_calc`); fall back to open
+    # P1 bounds rather than killing the entire batch run. Mirror of the
+    # guard in master_pipeline.process_match.
+    try:
+        p1_final, _ = await damage_inferencer.infer_match_final_bounds(
+            games, p1_species_universe, p2_species_universe,
+            session=aiohttp_session, base_url=calc_base_url,
+        )
+    except Exception as e:
+        click.echo(
+            f"[{match_id}] match-final inference failed: {e}; "
+            f"falling back to fully-open P1 bounds for this match",
+            err=True,
+        )
+        p1_final = damage_inferencer.init_knowledge(p1_species_universe)
+        stats["fallback_open_p1_bounds"] = stats.get("fallback_open_p1_bounds", 0) + 1
 
     bo1_system_prompt = (
         render_system_prompt(format_p1_team_block(p1_team_recon))
         if not team_sheets
         else None
     )
-    match_id = match_record.get("match_id", "unknown")
 
     for game_idx, game in enumerate(games):
         snapshots = game.get("snapshots") or []
@@ -227,16 +245,27 @@ async def _prepare_match_turns(
                 continue
 
             p1_spreads = format_p1_known_spreads_block(snap_pre, p1_final)
+            if team_sheets:
+                opp_universe = [m["species"] for m in team_sheets["p2"]]
+            else:
+                opp_universe = None
+            p2_spreads = format_p2_inferred_spreads_block(
+                snap_pre, p2_running, species_universe=opp_universe,
+            )
             user_prompt = format_user_prompt(
                 snap_pre,
                 tm_text,
                 p1_inferred_block=p1_spreads,
+                p2_inferred_block=p2_spreads,
                 snapshots_so_far=snapshots,
                 current_idx=i,
                 prior_games=games[:game_idx],
                 game_index=game_idx,
                 total_games_in_series=len(games),
                 match_format=match_format,
+                team_sheets=team_sheets,
+                p1_team_recon=p1_team_recon,
+                p2_team_recon=p2_team_recon,
             )
             human_action = {
                 "slot_1": human_action_dict.get("a", slot_action("pass")),
