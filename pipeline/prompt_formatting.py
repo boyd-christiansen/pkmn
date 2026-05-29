@@ -776,11 +776,37 @@ def _format_event_inline(
     return None
 
 
+KEY_STRATEGIC_MOVES = {
+    "trickroom", "tailwind", "icywind", "electroweb", "scaryface",
+    "protect", "wideguard", "quickguard", "spikyshield", "banefulbunker",
+    "detect", "obstruct", "silktrap", "burningbulwark", "kingsshield",
+    "ragepowder", "followme", "allyswitch",
+    "spore", "yawn", "fakeout", "taunt", "encore", "haze", "roar",
+    "whirlwind", "trick", "switcheroo", "willowisp", "thunderwave",
+    "nuzzle", "glare", "reflect", "lightscreen", "auroraveil",
+    "sunnyday", "raindance", "sandstorm", "hail", "snowscape",
+    "electricterrain", "grassyterrain", "mistyterrain", "psychicterrain",
+    "uturn", "voltswitch", "flipturn", "chillyreception",
+    "swordsdance", "calmmind", "nastyplot", "dragondance", "irondefense",
+    "bulkup", "recover", "roost", "slackoff", "softboiled", "milkdrink",
+    "pollenpuff", "helpinghand"
+}
+
+
+def _is_strategic_move(move_name: str) -> bool:
+    """Returns True if the move has key strategic or utility value in VGC."""
+    if not move_name:
+        return False
+    norm = "".join(c for c in move_name.lower() if c.isalnum())
+    return norm in KEY_STRATEGIC_MOVES
+
+
 def format_turn_by_turn(
     snapshots_so_far: list[dict[str, Any]],
     current_idx: int,
     *,
     game_index: int = 0,
+    summarize: bool = False,
 ) -> str:
     """=== TURN-BY-TURN (game N) ===  block.
 
@@ -814,6 +840,14 @@ def format_turn_by_turn(
         slot_species = _init_slot_species(s)
         rendered_first = False
         for ev in events:
+            # If summarizing, skip move events that are neither strategic nor KO causing
+            if summarize and ev.get("type") == "move":
+                move_name = ev.get("move_name", "")
+                is_strategic = _is_strategic_move(move_name)
+                has_ko = any(h.get("is_ko") for h in ev.get("hits") or [])
+                if not is_strategic and not has_ko:
+                    continue
+
             if ev.get("type") == "faint" and _slot_label(ev.get("slot", ""))[:5].lower() in {
                 "p1[a]", "p1[b]", "p2[a]", "p2[b]"
             }:
@@ -905,9 +939,9 @@ def format_series_state(
             if tu:
                 lines.append(f"  {side_label}{tu['species']} → {tu['teraType']} on T{tu['onTurn']}")
 
-        # Inline the full turn-by-turn action log for this prior game.
-        # We pass `current_idx=len(snaps)` to render every turn.
-        rollup = format_turn_by_turn(snaps, len(snaps), game_index=gi)
+        # Inline the summarized action log for this prior game.
+        # We pass `current_idx=len(snaps)` and `summarize=True` to render only strategic events.
+        rollup = format_turn_by_turn(snaps, len(snaps), game_index=gi, summarize=True)
         # Strip the rollup's own header — we already labelled the game above.
         rollup_body = rollup.split("\n", 1)[1] if "\n" in rollup else ""
         if rollup_body:

@@ -268,7 +268,10 @@ _SHARED_RULES_TAIL = """2. The Tool Rule: You have two tools.
 5. The Alternatives Rule: Before submitting, evaluate at least one plausible alternative play (a different move on the same Pokémon, or a switch to bring in a useful matchup) using `calculate_damage`, and document why it's worse than your chosen play. The point of the calc tool is to disprove tempting alternatives, not to confirm what the threat matrix already showed.
 
 6. The Output Rule: Commit your decision via `submit_decision` with arguments:
-   - pre_tool_thought: a brief strategic reasoning summary that leads to your chosen action (mention the rejected alternative explicitly)
+   - pre_tool_thought: A structured reasoning summary that MUST explicitly contain these three sections in order:
+     1. "Unified Joint Objective": A clear statement of what both active Pokémon are attempting to achieve together this turn.
+     2. "Slot 1 Analysis": The target play for slot [a] (or slot [b] if only one) and why the rejected alternative is worse.
+     3. "Slot 2 Analysis": The target play for slot [b] (or slot [a] if only one) and why the rejected alternative is worse.
    - action: {{ slot_1, slot_2 }} where each slot describes the action for that active Pokémon
 """
 
