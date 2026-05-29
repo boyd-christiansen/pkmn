@@ -474,7 +474,7 @@ async def process_match(
 
             # YOUR SPREADS surfaces match-final P1 bounds (the player's
             # own-team knowledge stand-in).
-            p1_spreads = format_p1_known_spreads_block(snap_pre, p1_final)
+            p1_spreads = format_p1_known_spreads_block(snap_pre, p1_final, format_id=format_id)
             # OPP SPREADS uses chronological P2 inference. Bo3 OTS lets
             # us list all 6 (player saw them at team preview); Bo1 CTS
             # gates by snapshot.p2.seenSpecies inside the renderer.

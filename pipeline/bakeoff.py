@@ -327,7 +327,7 @@ async def _bakeoff_one_match(
                     continue
 
                 # YOUR SPREADS uses match-final P1 bounds.
-                spreads = format_p1_known_spreads_block(snap_pre, state["p1_final"])
+                spreads = format_p1_known_spreads_block(snap_pre, state["p1_final"], format_id=format_id)
                 user_prompt = format_user_prompt(
                     snap_pre, tm_text,
                     p1_inferred_block=spreads,

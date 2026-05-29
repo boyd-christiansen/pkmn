@@ -244,7 +244,7 @@ async def _prepare_match_turns(
                 )
                 continue
 
-            p1_spreads = format_p1_known_spreads_block(snap_pre, p1_final)
+            p1_spreads = format_p1_known_spreads_block(snap_pre, p1_final, format_id=format_id)
             if team_sheets:
                 opp_universe = [m["species"] for m in team_sheets["p2"]]
             else:

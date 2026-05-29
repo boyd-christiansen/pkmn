@@ -244,6 +244,8 @@ def _render_spread_line(
 def format_p1_known_spreads_block(
     snapshot: dict[str, Any],
     p1_knowledge: dict[str, dict[str, dict[str, int]]],
+    *,
+    format_id: str | None = None,
 ) -> str:
     """Render `=== YOUR SPREADS ===` block (no "(inferred)" tag).
 
@@ -258,6 +260,9 @@ def format_p1_known_spreads_block(
     chronological state. This block represents "what the player knows
     about their own team" — knowledge they had at deploy time, not
     knowledge that accrues turn by turn.
+
+    If format_id is provided, substitutes canonical priors for any stats
+    that remain fully open (lo == 0 and hi == 252) to mask implicit data leaks.
     """
     actives = (snapshot.get("p1") or {}).get("active") or []
     if not actives:
@@ -266,6 +271,35 @@ def format_p1_known_spreads_block(
     for p in actives:
         species = p.get("species") or "?"
         entry = p1_knowledge.get(_species_key(species))
+        
+        # Deep-copy/initialize the entry structure to prevent mutating caller's p1_knowledge.
+        if entry:
+            entry = {
+                "min_evs": dict(entry.get("min_evs", {})),
+                "max_evs": dict(entry.get("max_evs", {}))
+            }
+        else:
+            entry = {
+                "min_evs": {s: 0 for s in _STAT_DISPLAY},
+                "max_evs": {s: 252 for s in _STAT_DISPLAY}
+            }
+
+        # Substitute canonical priors for fully open/unconstrained stats to mask leaks
+        if format_id:
+            try:
+                from canonical_priors import get_probable_spread
+                prior = get_probable_spread(species, format_id)
+                if prior and prior.evs:
+                    for s in _STAT_DISPLAY:
+                        lo = entry["min_evs"].get(s, 0)
+                        hi = entry["max_evs"].get(s, 252)
+                        if lo == 0 and hi == 252:
+                            val = prior.evs.get(s, 0)
+                            entry["min_evs"][s] = val
+                            entry["max_evs"][s] = val
+            except Exception:
+                pass
+
         lines.append("  " + _render_spread_line(species, entry))
     return "\n".join(lines)
 
