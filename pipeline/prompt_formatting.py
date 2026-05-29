@@ -939,9 +939,9 @@ def format_series_state(
             if tu:
                 lines.append(f"  {side_label}{tu['species']} → {tu['teraType']} on T{tu['onTurn']}")
 
-        # Inline the summarized action log for this prior game.
-        # We pass `current_idx=len(snaps)` and `summarize=True` to render only strategic events.
-        rollup = format_turn_by_turn(snaps, len(snaps), game_index=gi, summarize=True)
+        # Inline the full turn-by-turn action log for this prior game.
+        # We pass `current_idx=len(snaps)` and `summarize=False` to render all events verbatim.
+        rollup = format_turn_by_turn(snaps, len(snaps), game_index=gi, summarize=False)
         # Strip the rollup's own header — we already labelled the game above.
         rollup_body = rollup.split("\n", 1)[1] if "\n" in rollup else ""
         if rollup_body:
