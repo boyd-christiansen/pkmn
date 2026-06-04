@@ -27,9 +27,9 @@ pipeline/
     ├── __init__.py           # re-exports for `from teacher import ...`
     ├── base.py               # TeacherProvider ABC, schemas, prompts,
     │                         #   detect_oracle_leak + extract_pre_tool_thought
-    ├── openai.py             # OpenAI adapter (production default)
+    ├── openai.py             # OpenAI adapter (post-bake-off alternative; --provider openai)
     ├── anthropic.py          # Anthropic adapter
-    ├── google.py             # Google adapter
+    ├── google.py             # Google adapter (production default since Plan v8)
     ├── judge.py              # Plan v4: judge_match_cots — match-level
     │                         #   model-judge validator for CoT hygiene
     └── batch_openai.py       # Plan v4: BatchTeacherProvider ABC +
@@ -629,20 +629,27 @@ cd pipeline
 # Smoke test (no API key needed):
 .venv/bin/python master_pipeline.py --limit 1 --dry-run
 
-# Real run on a single Bo3 match (OpenAI default, gpt-5.5, judge on):
-OPENAI_API_KEY=sk-... .venv/bin/python master_pipeline.py --limit 1
+# Real run on a single Bo3 match (Gemini default since Plan v8, judge on):
+GOOGLE_API_KEY=... .venv/bin/python master_pipeline.py --limit 1
 
-# Production: hybrid mode — first 50 sync as quality gate, rest via Batch:
+# Production: sync mode at concurrency 8 (Gemini is cheap enough not to need batch):
+GOOGLE_API_KEY=... .venv/bin/python master_pipeline.py \
+    --mode sync --concurrency 8
+
+# OpenAI hybrid mode — first 50 sync as quality gate, rest via Batch:
 OPENAI_API_KEY=sk-... .venv/bin/python master_pipeline.py \
-    --mode hybrid --hybrid-sync-n 50
+    --provider openai --mode hybrid --hybrid-sync-n 50
 
 # Pure batch mode (OpenAI-only in v1); resume in-flight batches:
 OPENAI_API_KEY=sk-... .venv/bin/python master_pipeline.py \
-    --mode batch --resume
+    --provider openai --mode batch --resume
 
 # Pick a different provider (sync only for non-OpenAI in v1):
 ANTHROPIC_API_KEY=sk-... .venv/bin/python master_pipeline.py \
     --provider anthropic --limit 1
+
+# Plan v8 — disable the fragment-game filter (default drops games with ≤1 turn-pair):
+.venv/bin/python master_pipeline.py --min-game-turns 0
 ```
 
 ##### Synthesis flags
@@ -654,18 +661,20 @@ ANTHROPIC_API_KEY=sk-... .venv/bin/python master_pipeline.py \
 | `--calc-base-url` | `http://localhost:3000` | |
 | `--format-id` | auto from filename | Drives chaos-priors lookup. |
 | `--limit` | none | Process first N matches (test batch). |
-| `--concurrency` | `1` | Sync mode: max matches in flight. Keep low for rate limits. |
+| `--concurrency` | `1` | Sync mode: max matches in flight. Bump to 8 for production. |
 | `--dry-run` | off | Skip the LLM call entirely. Works in sync and batch modes. |
-| `--provider` | `openai` | Choice of `openai` / `anthropic` / `google`. Batch mode requires `openai`. |
+| `--provider` | `google` | Choice of `openai` / `anthropic` / `google`. Batch mode requires `openai`. Production default flipped to `google` in Plan v8. |
 | `--model` | per-provider default | OpenAI: `gpt-5.5`. Anthropic: `claude-sonnet-4-6`. Google: `gemini-3.1-pro-preview`. Override with `TEACHER_MODEL_{OPENAI,ANTHROPIC,GOOGLE}` env vars. |
 | `--leak-retries` | `3` | Regex-leak retries per turn before the row drops. `0` for smoke / measurement runs. |
+| `--min-game-turns` | `2` | Plan v8 — drop games whose snapshot count produces fewer than this many turn-pairs. Default removes ghost games + single-decision sweeps. Set 0 to disable. |
 
-##### Judge flags (Plan v4)
+##### Judge flags (Plan v4 + v8 provider dispatch)
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--use-judge / --no-judge` | `--use-judge` | Toggle the per-match model-judge validator. Requires `OPENAI_API_KEY` regardless of teacher provider. |
-| `--judge-model` | `gpt-5.5` | Model used for the judge call. Set `JUDGE_MODEL=gpt-5.5-mini` in env for the cost win once mini access opens up. |
+| `--use-judge / --no-judge` | `--use-judge` | Toggle the per-match model-judge validator. |
+| `--judge-provider` | `google` | Plan v8 — which LLM backend the judge uses. Default tracks the production teacher provider (Gemini). Set `openai` for cross-provider sanity checks. |
+| `--judge-model` | `gemini-3.1-pro-preview` | Model the judge calls. Default tracks the judge-provider's default (google → gemini-3.1-pro-preview; openai → gpt-5.5). Override via `JUDGE_MODEL` env var. |
 | `--judge-retries` | `2` | Re-synthesis passes after the judge flags a turn. On exhaustion, drops only flagged turns. |
 
 ##### Batch / hybrid flags (Plan v4)
@@ -734,13 +743,13 @@ raw replay JSON
 | `damage_inferencer.py` | Working. Dual-state, two-way binary search, atomic apply, 508-EV constraint pass, crit-aware via `/calc isCrit`, multi-hit filter, `events_to_damage_events()` filter for non-own-move callers (Metronome / Copycat / Sketch / Snatch / Me First / Dancer / Instruct / Mirror Move / Assist / Nature Power excluded; Sleep Talk allowed). Plus `infer_match_final_bounds()` for the match-final P1 spreads. |
 | `threat_matrix.py` | Working. Dual-track Absolute + Probable output, driven by the asymmetric `(p1_final, p2_running)` knowledge pair. When canonical priors are ≥40-EV-clipped by the inferred bounds, the Probable column is dropped and the line tagged `(off-meta)`. Optional `format_id` drives Smogon-backed priors. |
 | `teacher/base.py` | Provider-agnostic core: `TeacherProvider` ABC, schemas (incl. `submit_decision` tool), prompt templates (6 rules: Masking/OTS, Tool, Threat-Matrix, Spread, Alternatives, Output), ground-truth stripping, `detect_oracle_leak` regex + `extract_pre_tool_thought` helper. Present-tense system prompts. Plan v3 Tool Rule directs calc at hypotheticals the matrix doesn't cover (no per-turn minimum). `# TODO(rlhf-followup)` flags the prompt-driven alternative evaluation as temporary. |
-| `teacher/openai.py` | OpenAI adapter; default model `gpt-5.5`. Per-call timeout 120s, per-turn ceiling 300s. **Bake-off winner** — production default. |
+| `teacher/openai.py` | OpenAI adapter; default model `gpt-5.5`. Per-call timeout 120s, per-turn ceiling 300s. Bake-off tied at 100% / 0% with Gemini. **Available via `--provider openai`** — also required for `--mode batch`. |
 | `teacher/anthropic.py` | Anthropic adapter; default model `claude-sonnet-4-6`. Same tool-loop semantics. Bake-off result: 32% near-miss meta-leak rate; not used in production. |
-| `teacher/google.py` | Google adapter; default model `gemini-3.1-pro-preview`. Same tool-loop semantics. Bake-off result: clean (0% leak) but slower wall-clock; viable cost-sensitive alternative to OpenAI. |
-| `teacher/judge.py` | Plan v4. `judge_match_cots(turn_records, ...) -> JudgeResult` — one gpt-5.5 call per match scoring every CoT for meta-leaks. Structured-output schema; fail-open on judge errors. Default model gpt-5.5 (~$0.014/match); switch to gpt-5.5-mini once available via `JUDGE_MODEL` env var. |
+| `teacher/google.py` | Google adapter; default model `gemini-3.1-pro-preview`. Same tool-loop semantics. Bake-off result: clean (0% leak), cheaper unit-cost than OpenAI ($0.04 vs $0.07/row). **Production default since Plan v8** — economics dominated the bake-off-tied-on-quality result given ~$100K GCP credits. |
+| `teacher/judge.py` | Plan v4 + Plan v8 provider dispatch. `judge_match_cots(turn_records, *, client, provider, ...) -> JudgeResult` — one model call per match scoring every CoT for meta-leaks. Structured-output schema (`response_format=json_schema` for OpenAI, `response_schema` for Gemini); fail-open on judge errors. Default provider `google`, default model `gemini-3.1-pro-preview` (~$0.014/match). Set `JUDGE_PROVIDER=openai` / `JUDGE_MODEL=gpt-5.5` to revert. |
 | `teacher/batch_openai.py` | Plan v4. `BatchTeacherProvider` ABC + `BatchOpenAIProvider`. `build_request` / `submit_batch` / `poll` / `fetch_results` / `cancel`. OpenAI Batch API: 50% off both input and output, 24h SLA, ~10K-line cap per batch. v1 OpenAI-only; Anthropic / Google batch adapters TODO. |
 | `team_reconstruction.py` / `action_extraction.py` / `prompt_formatting.py` | Helper modules split out of the orchestrator so `master_pipeline.py` stays focused on CLI + per-match async loop. `bakeoff.py` and `batch_runner.py` import from these directly rather than from `master_pipeline`. `prompt_formatting.format_p1_known_spreads_block` is the renamed/repurposed Plan v3 YOUR SPREADS renderer. |
-| `bakeoff.py` | Head-to-head bake-off runner. `--limit N` covers the first N matches in one invocation with one combined summary; `--match-id <substring>` for a single-match smoke run. Reports per-provider cost, tool-call rate, CoT length, action-match rate. Output is one `bakeoff_<provider>.jsonl` per provider, append-mode, resumable on rerun (skips rows already keyed by `(match_id, game_index, turn)`). May 2026 result: OpenAI gpt-5.5 won. |
+| `bakeoff.py` | Head-to-head bake-off runner. `--limit N` covers the first N matches in one invocation with one combined summary; `--match-id <substring>` for a single-match smoke run. Reports per-provider cost, tool-call rate, CoT length, action-match rate. Output is one `bakeoff_<provider>.jsonl` per provider, append-mode, resumable on rerun (skips rows already keyed by `(match_id, game_index, turn)`). May 2026 result: OpenAI gpt-5.5 and Google gemini-3.1-pro tied at 100%/0% quality; Gemini chosen for production in Plan v8 on economics. |
 | `batch_runner.py` | Plan v4. `_prepare_match_turns` (shared sync/batch prep) + `BatchWorkItem` dataclass + `run_batch_for_matches` (per-cycle state machine) + `_resume_inflight_batches` (drain in-flight batches on `--resume`). Per-match state in `batch_state/{match_id}.json`. v1 OpenAI-only. |
 | `master_pipeline.py` | Working. CLI orchestrator with `--mode {sync,batch,hybrid}` dispatcher. `flip_match_to_winner` makes every SFT example come from the series winner's perspective; match-final P1 spreads in user prompt; asymmetric threat matrix; per-format system prompt branch; three historical-context blocks (`GAME-STATE LEDGER`, `TURN-BY-TURN`, `SERIES STATE`); explicit empty-slot annotation; perspective-aware bench rendering. Per-match buffered write + judge integration (Plan v4). `--provider {openai,anthropic,google}` flag (batch is OpenAI-only). `--dry-run` exercises orchestration without LLM cost. |
 

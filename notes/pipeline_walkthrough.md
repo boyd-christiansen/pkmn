@@ -958,10 +958,19 @@ Tera…") was correctly spared.
 
 ### Step 12 — Batch mode + hybrid (Plan v4)
 
-The bake-off picked OpenAI as the production teacher. At full corpus
-scale (~13K matches × ~5 turns × ~70% extractable ≈ 50k SFT rows ≈
-$2.3K sync), submitting via the OpenAI Batch API saves ~50% on both
-input and output tokens — meaningful at this volume.
+The bake-off had OpenAI gpt-5.5 and Google gemini-3.1-pro tied at 100%
+match-rate / 0% leak. Plan v4 ran with OpenAI as production teacher
+and built the batch path around the OpenAI Batch API; Plan v8 later
+flipped the production default to Gemini once the project picked up
+~$100K in GCP credits (see Step 13 below). The batch architecture
+described here is OpenAI-only in v1 — it's still the cheapest path
+when running OpenAI, and a Vertex Batch equivalent for Gemini is on
+the deferred-followups list.
+
+At full corpus scale (~13K matches × ~5 turns × ~70% extractable ≈
+50k SFT rows ≈ $2.3K sync via OpenAI), submitting via the OpenAI
+Batch API saves ~50% on both input and output tokens — meaningful at
+this volume.
 
 **The catch:** OpenAI Batch requires each request line to be a single
 self-contained API call. Our teacher LLM tool loop is N sequential
@@ -1023,27 +1032,72 @@ The sync portion serves as a quality gate AND a sanity check on the
 model's current behavior. The batch portion gets the cost win on the
 bulk of the corpus.
 
+### Step 13 — Provider flip + fragment filter (Plan v8)
+
+Plan v8 changed two things on top of the architecture above.
+
+**Production teacher → Gemini.** The bake-off had OpenAI and Gemini
+tied on quality (100% / 0% both), with Gemini at unit-cost ~40%
+cheaper ($0.04/row vs $0.07). Once the project picked up ~$100K in
+GCP credits — earmarked for the downstream fine-tuning and
+constitutional-learning inference runs as well as synthesis — the
+tie-breaker collapsed to "use what the credit pool subsidizes":
+
+- `master_pipeline.py --provider` default flipped from `openai` →
+  `google`.
+- `--judge-provider` follows (default `google`); the judge gained a
+  `_judge_via_gemini` dispatch path alongside the original
+  `_judge_via_openai`.
+- OpenAI and Anthropic remain a flag-flip away (`--provider openai
+  --judge-provider openai`); the OpenAI-only batch mode still works
+  for the OpenAI provider.
+- A Vertex Batch adapter is now the natural follow-up to recover the
+  batch-cost win in Gemini-land. Deferred.
+
+**Fragment-game filter.** Reviewing the dry-run preview surfaced a
+class of "fragment" games — 0-snapshot ghost games (parser artifacts
+producing 0 SFT rows) and 1-turn-pair single-decision sweeps — that
+contribute disproportionately low decision signal. A new
+`action_extraction.filter_fragment_games(games, min_turn_pairs=2)`
+helper drops them at match prep, gated by the new
+`--min-game-turns N` flag (default 2; set 0 to disable, set higher
+for richer-context-only).
+
+Numbers from the actual corpus (default `min_game_turns=2`):
+
+| | Bo1 | Bo3 |
+|---|---|---|
+| Games dropped | 455 / 10,997 | 239 / 5,540 |
+| Rows lost | 326 / 63,557 (0.51%) | 143 / 32,296 (0.44%) |
+| Corpus kept | 99.5% | 99.6% |
+
+Net: ~99.5% of the corpus is retained; the dropped half-percent was
+truly-low-context rows that wouldn't have moved the model meaningfully.
+
 ---
 
 ## Where we are, what's next
 
 **Current state:** end-to-end pipeline works in `--dry-run`, sync,
-batch, and hybrid modes. Live with provider adapters for OpenAI
-(production default), Anthropic, and Google (`teacher/openai.py` /
-`teacher/anthropic.py` / `teacher/google.py`, all re-exported via
-`teacher/__init__.py`). One match through the orchestrator in sync
-mode produces 8–10 SFT rows covering damage moves, switches, status
-moves, and spread moves with correctly-extracted ground-truth labels,
-match-final P1 spreads, an asymmetric threat matrix, and the
-historical-context prompt structure. A model-judge call confirms CoT
-hygiene before per-match atomic commit.
+batch, and hybrid modes. Production teacher is **Google Gemini** since
+Plan v8 (`teacher/google.py`, default `gemini-3.1-pro-preview`);
+OpenAI and Anthropic remain available via `--provider`. One match
+through the orchestrator in sync mode produces 8–10 SFT rows covering
+damage moves, switches, status moves, and spread moves with
+correctly-extracted ground-truth labels, match-final P1 spreads,
+chronological OPP SPREADS, an asymmetric threat matrix, enriched
+bench metadata, slash-delimited slot/species labels, and the
+historical-context prompt structure. A model-judge call (also Gemini
+by default, Plan v8) confirms CoT hygiene before per-match atomic
+commit. The Plan v8 fragment-game filter drops ~470 truly-low-context
+rows (~0.5%) before synthesis.
 
 **Rough scale:** 13,919 matches × ~5 turns/match × ~70% extractable ≈
-**~50k SFT examples** at full corpus scale. At gpt-5.5 pricing the
-sync run is roughly $2K–$3K. Plan v4's `--mode batch` halves that
-via the OpenAI Batch API (50% off both input and output tokens;
-~$1.15K saved on full corpus). The judge layer adds ~$5–40 across
-the corpus depending on whether mini access is available.
+**~93k SFT examples** at full corpus scale (post Plan v8's fragment
+filter, ~93,435 rows). At Gemini pricing the sync run is roughly
+$1.6K–$1.8K, effectively zero against the ~$100K GCP credit pool.
+The judge layer adds ~$5–40. OpenAI synthesis would cost ~$3.3K via
+`--provider openai`; OpenAI batch mode (`--mode batch`) halves that.
 
 **What's landed beyond the original walkthrough:**
 
@@ -1073,14 +1127,26 @@ the corpus depending on whether mini access is available.
   `teacher/batch_openai.py`) + per-match atomic write + resume
   support via `active_batch_id` breadcrumbs in
   `batch_state/{match_id}.json`.
+- **Plan v6:** OPP SPREADS (chronological P2 inference), enriched
+  bench metadata (item / ability / tera / moves per bench mon),
+  `(unknown — opponent hasn't revealed)` instead of `(none)` for
+  empty P2 bench, slash-delimited slot/species/action labels in
+  LEDGER / TURN-BY-TURN / SERIES STATE.
+- **Plan v8:** production teacher + judge flipped from OpenAI →
+  Gemini (`--provider google`, `--judge-provider google` as
+  defaults; OpenAI / Anthropic remain a flag-flip away). Judge gained
+  provider dispatch via `_judge_via_gemini` + `_judge_via_openai`.
+  Fragment-game filter (`action_extraction.filter_fragment_games`,
+  `--min-game-turns 2` default) drops ~470 truly-low-context rows
+  before synthesis (~0.5% of corpus).
 
 **What we still want:** the full list lives in
 [`TODO.md`](TODO.md) — active workstreams (real corpus run on hybrid
-mode, holdout eval, Anthropic/Google batch adapters), the three
-`# TODO(...)` markers in source (`rlhf-followup`, series-state
-summarizer, canonical-prior substitution), Plan v4 follow-ups
-(judge-rate dashboard, regex-filter retirement), long-horizon
-workstreams (selection-model SFT, RLHF), inspector enhancements, and
-further data-sourcing options.
+mode, holdout eval, Vertex Batch adapter, Anthropic Message Batches),
+the three `# TODO(...)` markers in source (`rlhf-followup`,
+series-state summarizer, canonical-prior substitution), Plan v4
+follow-ups (judge-rate dashboard, regex-filter retirement),
+long-horizon workstreams (selection-model SFT, RLHF), inspector
+enhancements, and further data-sourcing options.
 
 But the floor is the hard part. That's what's done.

@@ -1,18 +1,24 @@
-"""Match-level model-judge validator (plan v4, workstream 1).
+"""Match-level model-judge validator (plan v4, generalized in plan v8).
 
-The v3 regex `detect_oracle_leak` catches the strongest phrases
-("training section", "the target action", "expert's decision") but
-misses softer meta-references ("clearly the right move", "the data
+The v3 regex `detect_oracle_leak` catches the strongest meta-leak
+phrases ("training section", "the target action", "expert's decision")
+but misses softer references ("clearly the right move", "the data
 points to", first-person-knowledge-as-fact constructions). This module
 adds a second-line filter that submits an entire match's worth of CoTs
-in ONE call to OpenAI and gets back a list of turn indices to retry.
+in ONE call to a frontier model and gets back a list of turn indices
+to retry.
 
-Default model is `gpt-5.5` (~$0.014/match in smoke testing); the
-ideal model is `gpt-5.5-mini` (~$0.0015/match — ~10× cheaper) but the
-project account doesn't currently have access. Override via the
-`JUDGE_MODEL` env var or the `--judge-model` CLI flag once mini access
-opens up. See the `DEFAULT_JUDGE_MODEL` block below for the trade-off
-notes.
+**Provider dispatch (Plan v8).** Originally OpenAI-only; now
+provider-agnostic via the `provider` kwarg. Plan v8 flipped the
+production default to Google Gemini to match the new teacher provider
+(the May 2026 bake-off had Gemini tied with OpenAI on quality, slightly
+cheaper at unit cost, and the project has ~$100K in GCP credits). The
+OpenAI judge path is preserved for `--provider openai` backward compat.
+
+Default model: `gemini-3.1-pro-preview` (the bake-off winner). Override
+via the `JUDGE_MODEL` env var or the `--judge-model` CLI flag. To
+explicitly use OpenAI, pass `provider="openai"` and a `gpt-5.5`-class
+model.
 
 Why per-match, not per-row:
   - Amortizes a fixed system prompt across N turns. An 8-turn match
@@ -21,15 +27,10 @@ Why per-match, not per-row:
     referencing the training framing is a stronger signal than each
     in isolation.
 
-The judge is provider-agnostic in spirit but only OpenAI is wired today
-(matching the post-bake-off standardization on OpenAI). To swap to a
-different judge provider, replace the client kwarg with one of compatible
-shape and adjust the structured-output call path.
-
 Contract callers care about (`master_pipeline._run_judge_with_retries`,
 `batch_runner.run_batch_for_matches`):
-  - `judge_match_cots(records, ...) -> JudgeResult` with
-    `flagged_turn_indices` and `reasons`.
+  - `judge_match_cots(records, *, client, provider, ...) -> JudgeResult`
+    with `flagged_turn_indices` and `reasons`.
   - `extract_pre_tool_thought(messages) -> str | None` (re-exported from
     `teacher.base`) for parsing saved rows.
 
@@ -49,6 +50,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from openai import AsyncOpenAI
+from google import genai
+from google.genai import types as genai_types
 
 from .base import (
     PRICE_PER_M_TOKENS,
@@ -60,14 +63,20 @@ from .base import (
 # Constants / defaults
 # -----------------------------------------------------------------------------
 
-# NOTE: Plan v4 spec'd `gpt-5.5-mini` for ~$0.0015/match, but the project
-# account doesn't currently have access to that tier — the OpenAI API
-# returns 404 model_not_found. We fall back to `gpt-5.5` (the teacher
-# model the bake-off used) which costs ~20x more per token but is still
-# only ~$0.04/match — a rounding error against the $0.07/turn synthesis
-# cost. If mini access opens up, set `JUDGE_MODEL=gpt-5.5-mini` in the
-# env to switch over without a code change.
-DEFAULT_JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "gpt-5.5")
+# Production default = google (the v8 switch). To use OpenAI, pass
+# `provider="openai"` explicitly + a gpt-5.5-class model.
+DEFAULT_JUDGE_PROVIDER = os.environ.get("JUDGE_PROVIDER", "google")
+
+# Default model tracks the production provider. Gemini's pro tier mirrors
+# what the bake-off used (gemini-3.1-pro-preview).
+DEFAULT_JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "gemini-3.1-pro-preview")
+
+# Backup default for the OpenAI judge path. Kept for backward compat with
+# Plan v4 callers / docs that mention gpt-5.5. (gpt-5.5-mini would be
+# cheaper but the project's OpenAI account doesn't have access; gpt-5.5
+# is the working tier.)
+DEFAULT_JUDGE_MODEL_OPENAI = "gpt-5.5"
+
 DEFAULT_JUDGE_RETRIES = 2
 DEFAULT_JUDGE_TIMEOUT = 60.0
 
@@ -111,10 +120,12 @@ class JudgeResult:
 
 
 # -----------------------------------------------------------------------------
-# Structured-output schema (OpenAI response_format json_schema)
+# Structured-output schemas (per provider)
 # -----------------------------------------------------------------------------
 
-_JUDGE_RESPONSE_SCHEMA: dict[str, Any] = {
+# OpenAI uses `response_format=json_schema` with the wrapper shape
+# {name, strict, schema}.
+_OPENAI_JUDGE_RESPONSE_SCHEMA: dict[str, Any] = {
     "name": "match_judge_verdict",
     "strict": True,
     "schema": {
@@ -144,9 +155,36 @@ _JUDGE_RESPONSE_SCHEMA: dict[str, Any] = {
     },
 }
 
+# Gemini uses `response_schema` (no name/strict wrapper, no
+# additionalProperties keyword — the schema is the body of the OpenAPI
+# 3.0 object). Same logical shape as the OpenAI version.
+_GEMINI_JUDGE_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "flagged_turns": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "turn_idx": {
+                        "type": "integer",
+                        "description": "0-based index into the input turn list.",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Short phrase identifying the leak (≤120 chars).",
+                    },
+                },
+                "required": ["turn_idx", "reason"],
+            },
+        }
+    },
+    "required": ["flagged_turns"],
+}
+
 
 # -----------------------------------------------------------------------------
-# Prompt template
+# Prompt template (provider-agnostic)
 # -----------------------------------------------------------------------------
 #
 # Positive examples are real Anthropic-flagged quotes from the v3 bake-off.
@@ -238,15 +276,38 @@ def _render_turn_block(records: list[dict[str, Any]]) -> str:
     return "\n\n".join(parts)
 
 
+def _parse_flagged(parsed: dict[str, Any], n_turns: int) -> tuple[list[int], dict[int, str]]:
+    """Shared post-processing of the judge's structured-output payload.
+
+    Both providers return the same JSON shape under their respective
+    structured-output APIs. Drops out-of-range indices and de-dupes
+    repeated turn_idx entries; both are silent corrections (we don't
+    fail the whole match for judge-side confusion).
+    """
+    flagged_raw = parsed.get("flagged_turns") or []
+    indices: list[int] = []
+    reasons: dict[int, str] = {}
+    for entry in flagged_raw:
+        idx = entry.get("turn_idx")
+        if not isinstance(idx, int) or idx < 0 or idx >= n_turns:
+            continue
+        if idx in reasons:
+            continue
+        indices.append(idx)
+        reasons[idx] = (entry.get("reason") or "")[:120]
+    return indices, reasons
+
+
 # -----------------------------------------------------------------------------
-# Public API
+# Public API — provider dispatch
 # -----------------------------------------------------------------------------
 
 
 async def judge_match_cots(
     turn_records: list[dict[str, Any]],
     *,
-    client: AsyncOpenAI,
+    client: Any,                                  # AsyncOpenAI | genai.Client
+    provider: str = DEFAULT_JUDGE_PROVIDER,
     model: str = DEFAULT_JUDGE_MODEL,
     timeout: float = DEFAULT_JUDGE_TIMEOUT,
 ) -> JudgeResult:
@@ -265,12 +326,45 @@ async def judge_match_cots(
     Returns a `JudgeResult`. On any error the caller is expected to
     fail-open and write all rows as if the judge passed — a single
     judge hiccup must not lose a match's worth of work.
+
+    Dispatch:
+      • `provider="google"` (default) — uses Gemini's
+        `client.aio.models.generate_content()` with
+        `response_mime_type="application/json"` + `response_schema`.
+        Client is `google.genai.Client`.
+      • `provider="openai"` — uses OpenAI's
+        `client.chat.completions.create()` with
+        `response_format={"type":"json_schema","json_schema":...}`.
+        Client is `openai.AsyncOpenAI`.
     """
-    t0 = time.monotonic()
     if not turn_records:
         # Defensive: no work to do. Don't burn an API call.
         return JudgeResult(flagged_turn_indices=[])
+    if provider == "google":
+        return await _judge_via_gemini(turn_records, client=client,
+                                       model=model, timeout=timeout)
+    if provider == "openai":
+        return await _judge_via_openai(turn_records, client=client,
+                                       model=model, timeout=timeout)
+    return JudgeResult(
+        flagged_turn_indices=[],
+        error=f"unknown judge provider: {provider!r}",
+    )
 
+
+# -----------------------------------------------------------------------------
+# OpenAI judge (Plan v4 original; preserved for --provider openai)
+# -----------------------------------------------------------------------------
+
+
+async def _judge_via_openai(
+    turn_records: list[dict[str, Any]],
+    *,
+    client: AsyncOpenAI,
+    model: str,
+    timeout: float,
+) -> JudgeResult:
+    t0 = time.monotonic()
     match_id = turn_records[0].get("match_id", "?")
     turn_block = _render_turn_block(turn_records)
     user_msg = JUDGE_USER_TEMPLATE.format(
@@ -293,7 +387,7 @@ async def judge_match_cots(
                 ],
                 response_format={
                     "type": "json_schema",
-                    "json_schema": _JUDGE_RESPONSE_SCHEMA,
+                    "json_schema": _OPENAI_JUDGE_RESPONSE_SCHEMA,
                 },
             ),
             timeout=timeout,
@@ -327,23 +421,96 @@ async def judge_match_cots(
             error=f"judge response not valid JSON: {e}",
         )
 
-    flagged_raw = parsed.get("flagged_turns") or []
-    n_turns = len(turn_records)
-    indices: list[int] = []
-    reasons: dict[int, str] = {}
-    for entry in flagged_raw:
-        idx = entry.get("turn_idx")
-        if not isinstance(idx, int) or idx < 0 or idx >= n_turns:
-            # Out-of-range index — judge confusion. Skip silently rather
-            # than fail the whole match.
-            continue
-        if idx in reasons:
-            # De-dupe; if the judge emitted the same idx twice, keep the
-            # first reason and drop the second.
-            continue
-        indices.append(idx)
-        reasons[idx] = (entry.get("reason") or "")[:120]
+    indices, reasons = _parse_flagged(parsed, len(turn_records))
+    return JudgeResult(
+        flagged_turn_indices=indices,
+        reasons=reasons,
+        raw_response=raw,
+        input_tokens=in_tok,
+        output_tokens=out_tok,
+        cost_usd=cost,
+        elapsed_seconds=time.monotonic() - t0,
+        error=None,
+    )
 
+
+# -----------------------------------------------------------------------------
+# Gemini judge (Plan v8 — production default)
+# -----------------------------------------------------------------------------
+
+
+async def _judge_via_gemini(
+    turn_records: list[dict[str, Any]],
+    *,
+    client: genai.Client,
+    model: str,
+    timeout: float,
+) -> JudgeResult:
+    t0 = time.monotonic()
+    match_id = turn_records[0].get("match_id", "?")
+    turn_block = _render_turn_block(turn_records)
+    user_msg = JUDGE_USER_TEMPLATE.format(
+        match_id=match_id, n_turns=len(turn_records), turn_block=turn_block,
+    )
+
+    # Gemini structured-output: response_mime_type="application/json" +
+    # response_schema in OpenAPI 3.0 dialect (the same dialect
+    # teacher/google.py uses for tool schemas). The system instruction
+    # rides on `config`, not as a content message.
+    try:
+        response = await asyncio.wait_for(
+            client.aio.models.generate_content(
+                model=model,
+                contents=[
+                    genai_types.Content(
+                        role="user",
+                        parts=[genai_types.Part(text=user_msg)],
+                    )
+                ],
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=JUDGE_SYSTEM_PROMPT,
+                    response_mime_type="application/json",
+                    response_schema=_GEMINI_JUDGE_RESPONSE_SCHEMA,
+                ),
+            ),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        return JudgeResult(
+            flagged_turn_indices=[],
+            elapsed_seconds=time.monotonic() - t0,
+            error=f"judge timeout after {timeout}s",
+        )
+    except Exception as e:  # noqa: BLE001 — fail-open on any client error
+        return JudgeResult(
+            flagged_turn_indices=[],
+            elapsed_seconds=time.monotonic() - t0,
+            error=f"{type(e).__name__}: {e}",
+        )
+
+    # Token usage on Gemini: usage_metadata.prompt_token_count /
+    # candidates_token_count. Fall back gracefully if absent.
+    um = getattr(response, "usage_metadata", None)
+    in_tok = int(getattr(um, "prompt_token_count", 0) or 0)
+    out_tok = int(getattr(um, "candidates_token_count", 0) or 0)
+    cost = estimate_cost_usd("google", model, in_tok, out_tok)
+
+    # `response.text` is the SDK's convenience accessor for the
+    # primary text part of the first candidate; for JSON mode it
+    # returns the model's serialized JSON output.
+    raw = (response.text or "").strip() if hasattr(response, "text") else ""
+    try:
+        parsed = json.loads(raw) if raw else {"flagged_turns": []}
+    except json.JSONDecodeError as e:
+        return JudgeResult(
+            flagged_turn_indices=[],
+            raw_response=raw,
+            input_tokens=in_tok, output_tokens=out_tok, cost_usd=cost,
+            elapsed_seconds=time.monotonic() - t0,
+            error=f"judge response not valid JSON: {e}",
+        )
+
+    indices, reasons = _parse_flagged(parsed, len(turn_records))
     return JudgeResult(
         flagged_turn_indices=indices,
         reasons=reasons,
@@ -358,6 +525,8 @@ async def judge_match_cots(
 
 __all__ = [
     "DEFAULT_JUDGE_MODEL",
+    "DEFAULT_JUDGE_MODEL_OPENAI",
+    "DEFAULT_JUDGE_PROVIDER",
     "DEFAULT_JUDGE_RETRIES",
     "DEFAULT_JUDGE_TIMEOUT",
     "JudgeResult",

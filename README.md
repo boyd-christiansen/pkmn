@@ -197,14 +197,18 @@ cd pipeline
 # Smoke test (no API key needed, exercises everything except the LLM call):
 .venv/bin/python master_pipeline.py --limit 1 --dry-run
 
-# Real run on a single match (sync mode, OpenAI default, judge on):
-OPENAI_API_KEY=sk-... .venv/bin/python master_pipeline.py --limit 1
+# Real run on a single match (sync mode, Gemini default since Plan v8, judge on):
+GOOGLE_API_KEY=... .venv/bin/python master_pipeline.py --limit 1
 
-# Production: hybrid mode — first 50 sync as quality gate, rest via Batch API:
-.venv/bin/python master_pipeline.py --mode hybrid --hybrid-sync-n 50
+# Production: sync mode at concurrency 8 (batch mode is OpenAI-only):
+.venv/bin/python master_pipeline.py --mode sync --concurrency 8
+
+# Hybrid (OpenAI-only — requires --provider openai for the batch portion):
+OPENAI_API_KEY=sk-... .venv/bin/python master_pipeline.py \
+    --provider openai --mode hybrid --hybrid-sync-n 50
 
 # Resume a crashed batch run (re-polls in-flight batches from --state-dir):
-.venv/bin/python master_pipeline.py --mode batch --resume
+.venv/bin/python master_pipeline.py --provider openai --mode batch --resume
 
 # Pick a different provider / model (sync only for non-OpenAI providers):
 ANTHROPIC_API_KEY=sk-... .venv/bin/python master_pipeline.py \
@@ -252,7 +256,7 @@ endpoints, schema-awareness notes, and the "what it doesn't do" list.
 | `pipeline/teacher/` (sub-package: `base.py` + `openai.py` / `anthropic.py` / `google.py` / `judge.py` / `batch_openai.py`, re-exported via `__init__.py`) | Working. Provider-agnostic `TeacherProvider` ABC; tool-use loop with `calculate_damage` + `submit_decision`. The model has only one output channel — tool calls — so it can't bypass the calc tool. Two system-prompt templates: Bo1 CTS (Masking Rule + reconstructed team) vs Bo3 OTS (full sheets + ★ brought-flag). Present-tense framing throughout. Plus `judge.py` (match-level model-judge validator) and `batch_openai.py` (`BatchTeacherProvider` ABC + OpenAI Batch API adapter). |
 | `pipeline/batch_runner.py` | Working. Per-iteration state machine for `--mode batch`: bundles all in-flight turns at iter=K into one batch upload, runs calc microservice calls synchronously between cycles, persists `BatchWorkItem` state in `batch_state/{match_id}.json`. Supports `--resume` via `active_batch_id` breadcrumbs. Also hosts `_prepare_match_turns()`, the shared sync-and-batch prep helper. |
 | `pipeline/master_pipeline.py` | Working. CLI orchestrator with `--mode {sync,batch,hybrid}` dispatcher. `flip_match_to_winner` makes every example come from the series winner's perspective. Three historical-context blocks in the user prompt (GAME-STATE LEDGER / TURN-BY-TURN / SERIES STATE). YOUR SPREADS surfaces match-final P1 bounds (Plan v3). Per-match buffered write + judge integration (Plan v4). Empty-slot annotation. Perspective-aware bench gating. `--provider {openai,anthropic,google}` flag; batch is OpenAI-only in v1. Resumable. |
-| `pipeline/bakeoff.py` | Working. Runs the same match through multiple providers in lockstep and reports per-row cost, tool-call rate, action-match rate, CoT length, wall-clock. **Result (May 2026):** OpenAI gpt-5.5 won — 100% match rate, 0% leak, $0.07/row. Google gemini-3.1-pro also clean. Anthropic claude-sonnet-4-6 produced near-miss meta-leaks in 32% of saved rows (motivated Plan v4's judge layer). |
+| `pipeline/bakeoff.py` | Working. Runs the same match through multiple providers in lockstep and reports per-row cost, tool-call rate, action-match rate, CoT length, wall-clock. **Result (May 2026):** Google gemini-3.1-pro and OpenAI gpt-5.5 tied on quality (100% match rate, 0% leak), with Gemini at $0.04/row vs OpenAI's $0.07. **Plan v8 made Gemini the production default** to align with the project's ~$100K GCP credit pool — OpenAI remains a one-flag flip via `--provider openai`. Anthropic claude-sonnet-4-6 produced near-miss meta-leaks in 32% of saved rows (motivated Plan v4's judge layer). |
 | `inspector/` | Working. FastAPI + vanilla-JS single-page app on port 8001. Browses every JSONL under `pipeline/parsed_data/`; splits user prompts into 8 logical sections; renders the calc-tool loop step-by-step; pins two rows for side-by-side compare; cross-references rows against the underlying parsed match snapshots. Schema-aware — handles current and legacy prompt formats. Read-only (writes nothing back). |
 
 See each subdirectory's README for setup, contracts, and design notes.

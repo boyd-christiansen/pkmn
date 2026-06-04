@@ -55,7 +55,9 @@ import click
 import damage_inferencer
 import threat_matrix
 from action_extraction import (
+    DEFAULT_MIN_GAME_TURNS,
     extract_p1_actions,
+    filter_fragment_games,
     flip_match_to_winner,
     slot_action,
 )
@@ -76,6 +78,7 @@ from teacher import (
     BatchOpenAIProvider,
     BatchPollStatus,
     DEFAULT_JUDGE_MODEL,
+    DEFAULT_JUDGE_PROVIDER,
     DEFAULT_JUDGE_RETRIES,
     MAX_CALC_CALLS_BEFORE_FORCE_SUBMIT,
     MAX_TOOL_ITERATIONS,
@@ -127,19 +130,25 @@ async def _prepare_match_turns(
     calc_base_url: str,
     aiohttp_session: aiohttp.ClientSession,
     seen_keys: set[tuple[str, int, int]] | None = None,
+    min_game_turns: int = DEFAULT_MIN_GAME_TURNS,
 ) -> tuple[list[TurnPrep], dict[str, int]]:
     """Pure-prep half of `master_pipeline.process_match` — no LLM calls.
 
     Returns the per-turn TurnPrep list (in chronological order across all
     games of the match) plus a stats dict for skipped turns (ambiguous
-    actions / threat-matrix failures / already-done resume hits).
+    actions / threat-matrix failures / already-done resume hits /
+    fragment-game drops).
 
     Threading model: this is async because `damage_inferencer` and
     `threat_matrix` are network-bound (calc microservice). Within a
     match the loop is sequential because each turn's threat matrix
     depends on `p2_running` updated by prior turns' events.
     """
-    stats: dict[str, int] = {"skipped_ambiguous": 0, "skipped_threat_matrix_error": 0, "already_done": 0}
+    stats: dict[str, int] = {
+        "skipped_ambiguous": 0,
+        "skipped_threat_matrix_error": 0,
+        "already_done": 0,
+    }
     seen_keys = seen_keys or set()
     preps: list[TurnPrep] = []
 
@@ -147,6 +156,16 @@ async def _prepare_match_turns(
     games = match_record.get("games") or []
     if not games:
         stats["skipped_no_games"] = 1
+        return preps, stats
+
+    # Plan v8 — drop fragment games (too-short to carry meaningful
+    # decision context). Default `min_game_turns=2` removes
+    # 0-snapshot ghosts + 1-pair single-decision sweeps.
+    games, frag_dropped = filter_fragment_games(games, min_game_turns)
+    if frag_dropped:
+        stats["dropped_fragment_games"] = frag_dropped
+    if not games:
+        stats["skipped_all_games_too_short"] = 1
         return preps, stats
 
     match_format = match_record.get("format", "bo1")
@@ -692,10 +711,12 @@ async def run_batch_for_matches(
     leak_retries: int = PRODUCTION_LEAK_RETRIES,
     use_judge: bool = True,
     judge_client: Any = None,
+    judge_provider: str = DEFAULT_JUDGE_PROVIDER,
     judge_model: str = DEFAULT_JUDGE_MODEL,
     judge_retries: int = DEFAULT_JUDGE_RETRIES,
     teacher_for_judge_retry: TeacherProvider | None = None,
     resume: bool = False,
+    min_game_turns: int = DEFAULT_MIN_GAME_TURNS,
 ) -> dict[str, int]:
     """Drive every match's turns through the batch state machine.
 
@@ -760,6 +781,7 @@ async def run_batch_for_matches(
             calc_base_url=calc_base_url,
             aiohttp_session=aiohttp_session,
             seen_keys=seen_keys,
+            min_game_turns=min_game_turns,
         )
         for k, v in prep_stats.items():
             stats.setdefault(k, 0)
@@ -967,6 +989,7 @@ async def run_batch_for_matches(
                 row_buffer,
                 turn_contexts,
                 judge_client=judge_client,
+                judge_provider=judge_provider,
                 judge_model=judge_model,
                 judge_retries=judge_retries,
                 teacher=teacher_for_judge_retry,

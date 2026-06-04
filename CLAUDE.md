@@ -54,14 +54,14 @@ cd pipeline && .venv/bin/python canonical_priors.py --format-id gen9vgc2026regi
 # 4. Parse + stitch replays → per-turn snapshots + events stream
 cd pipeline && .venv/bin/python replay_parser.py
 
-# 5. Generate SFT training JSONL  (set OPENAI_API_KEY)
+# 5. Generate SFT training JSONL  (set GOOGLE_API_KEY — Gemini is the prod default since Plan v8)
 cd pipeline && .venv/bin/python master_pipeline.py
 # Smoke-test without the LLM call:
 cd pipeline && .venv/bin/python master_pipeline.py --limit 1 --dry-run
-# Production: hybrid mode — first 50 sync as quality gate, rest via OpenAI Batch (~50% cheaper):
-cd pipeline && .venv/bin/python master_pipeline.py --mode hybrid --hybrid-sync-n 50
-# Batch mode is OpenAI-only in v1; resume in-flight batches with --resume:
-cd pipeline && .venv/bin/python master_pipeline.py --mode batch --resume
+# Production: sync mode with Gemini (default). Batch mode is OpenAI-only:
+cd pipeline && .venv/bin/python master_pipeline.py --mode sync --concurrency 8
+# OpenAI-batch hybrid (OpenAI-only, requires --provider openai); resume with --resume:
+cd pipeline && .venv/bin/python master_pipeline.py --provider openai --mode batch --resume
 ```
 
 ## Conventions
@@ -212,13 +212,19 @@ pipeline/parsed_data/sft_training_data.jsonl   # one fine-tuning example per tur
   long-tail catch. With `--leak-retries 3 --judge-retries 2`
   (production defaults), persistent leaks drop only the offending
   turn — the rest of the match still writes.
-- **Judge always uses OpenAI.** Even if the teacher is anthropic or
-  google, the judge spins up its own `AsyncOpenAI` client. The
-  `OPENAI_API_KEY` is required whenever `--use-judge` is on (default).
-  Pass `--no-judge` if you only want the regex filter.
+- **Judge defaults to the same provider as the teacher (Plan v8).** Set
+  via `--judge-provider {google,openai}`. Default `google` matches the
+  production teacher (Gemini). Plan v4 originally hard-wired the judge
+  to OpenAI for cross-provider consistency; Plan v8 dropped that — the
+  cross-provider value wasn't paying for the extra OpenAI dependency
+  once we standardized the teacher. Override to `openai` to opt back
+  into cross-provider sanity-checking.
 - **`--mode batch` is OpenAI-only in v1.** Anthropic Message Batches
-  and Vertex Batch are on the roadmap but not implemented; the CLI
-  rejects `--provider {anthropic,google}` with `--mode batch`.
+  and Vertex Batch (the natural fit now that Gemini is the default
+  teacher) are deferred follow-ups; the CLI rejects `--provider
+  {anthropic,google}` with `--mode batch`. With ~$100K GCP credits the
+  unit-cost saving from batch is no longer a hard constraint, so sync
+  mode with Gemini is the production path.
 - **Batch latency is unpredictable.** OpenAI's SLA is 24h per cycle.
   Empirically the smoke-test runs we did completed cycles in <2min,
   but a corpus-scale run may see the documented 1–3h band. Plan for
@@ -249,25 +255,34 @@ toward hypotheticals the threat matrix doesn't already cover — there
 is no per-turn minimum.
 
 Pick a provider via `master_pipeline.py --provider {openai,anthropic,google}`
-(default: `openai` — the bake-off winner; see below). Override the model
-id with `--model gpt-5.5-pro` etc.
+(default: `google` — production switch landed in Plan v8; see below).
+Override the model id with `--model gemini-3.1-flash-preview` etc.
 
 For a head-to-head comparison: `python bakeoff.py --providers openai,anthropic,google --limit 5`
 runs the same match through each provider and reports per-row cost,
 tool-call rate, CoT length, action-match rate, and wall-clock.
 
-### Bake-off result (May 2026)
+### Bake-off result (May 2026) — Gemini chosen for production in Plan v8
 
 | Provider | Match% | Leak rate | $/row | Avg CoT | Notes |
 |---|---|---|---|---|---|
-| **OpenAI gpt-5.5** | **100.0%** | **0%** | $0.07 | 902ch | Concise, consistent. **Production default.** |
-| Google gemini-3.1-pro | 100.0% | 0% | $0.04 | 1027ch | Cheapest; slower wall-clock. |
+| **Google gemini-3.1-pro** | **100.0%** | **0%** | $0.04 | 1027ch | Tied OpenAI on quality at unit-cost ~40% cheaper. **Production default (Plan v8).** |
+| OpenAI gpt-5.5 | 100.0% | 0% | $0.07 | 902ch | Concise, consistent. Available via `--provider openai`; required for `--mode batch`. |
 | Anthropic claude-sonnet-4-6 | 61.3% | 32% near-miss | $0.09 | 4004ch | Verbose; systematic meta-references in CoT ("the target action" / "training section"). Not used in production. |
 
 Anthropic's near-miss leaks ("the target action", "training section"
 substrings) motivated plan v4's two-stage leak filter — the regex
 tightened to catch those, and a model-judge layer catches softer
 meta-references. See "Plan v4: judge + batch" below.
+
+Plan v8 flipped the production default from OpenAI → Gemini once the
+project picked up ~$100K in GCP credits. The bake-off had the two
+providers tied on quality (100% / 0%), so the tie-breaker became
+economics: GCP credits make Gemini effectively free for both
+synthesis AND the downstream fine-tuning + constitutional-learning
+inference. OpenAI remains a one-flag-flip away (`--provider openai`)
+for cross-provider sanity-checks or when the OpenAI-only batch mode
+is needed.
 
 ## Plan v4: judge + batch
 
@@ -276,8 +291,8 @@ Two follow-up workstreams shipped on top of the bake-off:
 ### 1. Match-level model-judge validator
 
 `pipeline/teacher/judge.py` exposes `judge_match_cots(turn_records,
-*, client, model=DEFAULT_JUDGE_MODEL) -> JudgeResult`. After every
-match's turns are synthesized (sync OR batch), the orchestrator
+*, client, provider, model=DEFAULT_JUDGE_MODEL) -> JudgeResult`. After
+every match's turns are synthesized (sync OR batch), the orchestrator
 buffers them, submits all of the match's `pre_tool_thought` CoTs to
 the judge in **one** call, and the judge returns
 `{flagged_turn_indices, reasons}`. Flagged turns are re-synthesized
@@ -285,11 +300,17 @@ via the sync teacher (even in batch mode — batch latency is too high
 for retry); after `judge_retries` exhausted (default 2), only the
 still-flagged turns get dropped — the rest of the match writes.
 
-CLI: `--use-judge / --no-judge`, `--judge-model`, `--judge-retries`.
+Plan v8 added provider dispatch: `--judge-provider {google,openai}`,
+defaulting to `google` (matches the production teacher). The OpenAI
+judge path is preserved for explicit `--judge-provider openai` runs.
 
-Cost: one judge call per match. Spec'd at gpt-5.5-mini (~$0.0015 /
-match), defaulting to gpt-5.5 (~$0.014 / match) until mini access
-opens up. Both negligible against the per-row synthesis cost.
+CLI: `--use-judge / --no-judge`, `--judge-provider`, `--judge-model`,
+`--judge-retries`.
+
+Cost: one judge call per match. Default Gemini path
+(`gemini-3.1-pro-preview`) is ~$0.014/match — equivalent to the OpenAI
+gpt-5.5 path it replaced. Both negligible against the per-row
+synthesis cost, both effectively free under GCP credits.
 
 ### 2. Batch mode + `--mode {sync,batch,hybrid}`
 
@@ -308,9 +329,13 @@ max_leak_rate` (default 0.02), the run halts before submitting the
 batch portion — better to fail loudly than silently commit thousands
 of dollars to a regressed prompt.
 
-Batch is OpenAI-only in v1. Anthropic Message Batches and Vertex Batch
-adapters are next; the abstraction (`BatchTeacherProvider` ABC) is
-already in place.
+Batch is OpenAI-only in v1. Now that Plan v8 made Gemini the
+production teacher, a **Vertex Batch adapter is the natural next
+workstream** (the `BatchTeacherProvider` ABC is already in place;
+the work is one concrete adapter + plumbing). Anthropic Message
+Batches sits behind that as a smaller priority. With ~$100K GCP
+credits available, batch cost savings are softer than they were
+when OpenAI was production default.
 
 CLI: `--mode {sync,batch,hybrid}`, `--hybrid-sync-n`,
 `--hybrid-min-match-rate`, `--hybrid-max-leak-rate`,
@@ -322,15 +347,15 @@ CLI: `--mode {sync,batch,hybrid}`, `--hybrid-sync-n`,
 Stored in `.env` at the repo root (gitignored):
 
 ```
-OPENAI_API_KEY=sk-...
-ANTHROPIC_API_KEY=sk-ant-...
-GOOGLE_API_KEY=...
+GOOGLE_API_KEY=...          # required for production (Gemini default)
+OPENAI_API_KEY=sk-...       # required for --provider openai / --mode batch / --judge-provider openai
+ANTHROPIC_API_KEY=sk-ant-... # optional
 ```
 
 Each pipeline invocation sources `.env` via `set -a && source ../.env && set +a`
 (see test commands earlier in the session). Only the providers whose key
-is present will actually run; missing-key providers are skipped with a
-warning.
+is present will actually run; missing-key providers raise a clear error
+at startup.
 
 Default models (frontier mid-tier in each family — best cost/quality balance
 for our tool-loop use case):

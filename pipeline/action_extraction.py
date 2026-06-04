@@ -126,6 +126,52 @@ def flip_match_to_winner(match: dict) -> dict:
 
 
 # =============================================================================
+# Fragment-game filter
+# =============================================================================
+#
+# Some games in the corpus produce 0 or 1 SFT rows — early-quit games,
+# parser ghosts (1-snapshot games with no events), or single-decision
+# sweeps. These have minimal training signal relative to their share of
+# the synthesis budget (and their per-row context is thin since there's
+# no game-history ledger / turn-by-turn rollup to learn from). The
+# `filter_fragment_games` helper drops them at the match-prep stage,
+# keeping the corpus weighted toward games with meaningful play.
+# =============================================================================
+
+
+DEFAULT_MIN_GAME_TURNS = 2
+
+
+def filter_fragment_games(
+    games: list[dict[str, Any]],
+    min_turn_pairs: int = DEFAULT_MIN_GAME_TURNS,
+) -> tuple[list[dict[str, Any]], int]:
+    """Drop games whose snapshot count produces fewer than `min_turn_pairs`
+    SFT-extractable turns.
+
+    A game with N snapshots produces at most N-1 turn-pairs (each pair =
+    one potential SFT row, subject to the `skipped_ambiguous` filter
+    downstream). The default `min_turn_pairs=2` drops:
+      • 0-snapshot games (parser artifacts; produce 0 rows)
+      • 1-snapshot games (turn=1 with no events; produce 0 rows)
+      • 2-snapshot games (1 turn-pair; a single decision with no
+        game-history context to draw on)
+
+    Bumping to 3+ drops more aggressively (3 = 2 turn-pairs min, etc.);
+    set 0 to disable the filter entirely.
+
+    Returns:
+        (kept_games, dropped_count) — kept_games is a fresh list (the
+        input is not mutated), dropped_count is for stats reporting.
+    """
+    kept = [
+        g for g in games
+        if max(0, len(g.get("snapshots") or []) - 1) >= min_turn_pairs
+    ]
+    return kept, len(games) - len(kept)
+
+
+# =============================================================================
 # P1 action extraction
 # =============================================================================
 

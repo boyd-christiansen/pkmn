@@ -127,15 +127,21 @@ Total wall-clock: ~30 min. No API keys needed.
 ## Path B — Full real synthesis (don't, unless you're scoping cost)
 
 Same as Path A, but drop `--dry-run --no-judge` from step 7 and set
-`OPENAI_API_KEY` in a top-level `.env` file:
+`GOOGLE_API_KEY` (production default since Plan v8) in a top-level
+`.env` file:
 
 ```bash
-echo "OPENAI_API_KEY=sk-..." >> .env
-.venv/bin/python master_pipeline.py --input parsed_data/bo3.jsonl --mode hybrid
+echo "GOOGLE_API_KEY=..." >> .env
+.venv/bin/python master_pipeline.py --input parsed_data/bo3.jsonl
 ```
 
-This calls the real OpenAI API for every turn (~$1,800 for the full
-93K-row corpus in hybrid mode). **Don't run this just to look at
+This calls the real Gemini API for every turn (~$1,800 for the full
+93K-row corpus; effectively zero against the project's ~$100K GCP
+credit pool). The pipeline-from-here also writes via the model judge
+(`--use-judge`, on by default), which calls Gemini once per match.
+For OpenAI synthesis instead, add `--provider openai
+--judge-provider openai`; that path costs ~$3,300 against the project's
+OpenAI account. **Don't run any real synthesis just to look at
 prompts** — the dry-run path produces the same prompts at zero cost.
 Path B is only relevant if you want to spot-check real model output
 against the dry-run baseline.

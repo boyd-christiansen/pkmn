@@ -40,7 +40,9 @@ import canonical_priors  # noqa: F401  — imported for symmetry; future use in 
 import damage_inferencer
 import threat_matrix
 from action_extraction import (
+    DEFAULT_MIN_GAME_TURNS,
     extract_p1_actions,
+    filter_fragment_games,
     flip_match_to_winner,
     slot_action,
 )
@@ -60,6 +62,8 @@ from team_reconstruction import (
 from teacher import (
     BatchOpenAIProvider,
     DEFAULT_JUDGE_MODEL,
+    DEFAULT_JUDGE_MODEL_OPENAI,
+    DEFAULT_JUDGE_PROVIDER,
     DEFAULT_JUDGE_RETRIES,
     DEFAULT_MAX_CYCLE_WAIT_SECONDS,
     DEFAULT_POLL_INTERVAL_SECONDS,
@@ -225,7 +229,8 @@ async def _run_judge_with_retries(
     match_buffer: list[dict[str, Any]],
     turn_contexts: list[dict[str, Any]],
     *,
-    judge_client: Any,  # AsyncOpenAI; typed loose to avoid import cycle in tests
+    judge_client: Any,                                # AsyncOpenAI | genai.Client
+    judge_provider: str,                              # "google" | "openai"
     judge_model: str,
     judge_retries: int,
     teacher: TeacherProvider,
@@ -271,7 +276,10 @@ async def _run_judge_with_retries(
             for i, row in enumerate(match_buffer)
         ]
         jr: JudgeResult = await judge_match_cots(
-            turn_records, client=judge_client, model=judge_model,
+            turn_records,
+            client=judge_client,
+            provider=judge_provider,
+            model=judge_model,
         )
         stats["judge_cost_micro_usd"] += int(jr.cost_usd * 1_000_000)
         if jr.error:
@@ -344,8 +352,10 @@ async def process_match(
     leak_retries: int = PRODUCTION_LEAK_RETRIES,
     use_judge: bool = True,
     judge_client: Any = None,
+    judge_provider: str = DEFAULT_JUDGE_PROVIDER,
     judge_model: str = DEFAULT_JUDGE_MODEL,
     judge_retries: int = DEFAULT_JUDGE_RETRIES,
+    min_game_turns: int = DEFAULT_MIN_GAME_TURNS,
 ) -> dict[str, int]:
     # Series-winner-as-P1: every SFT example is generated from the perspective
     # of the player who won the series. P2-won matches are relabeled in full.
@@ -354,6 +364,17 @@ async def process_match(
     games = match_record.get("games") or []
     if not games:
         return {"skipped_no_games": 1}
+
+    # Plan v8 — drop fragment games (too-short to carry meaningful
+    # decision context). Default `min_game_turns=2` removes 0-snapshot
+    # ghost games + 1-pair single-decision sweeps. Track for stats.
+    games, frag_dropped = filter_fragment_games(games, min_game_turns)
+    fragment_stats: dict[str, int] = {}
+    if frag_dropped:
+        fragment_stats["dropped_fragment_games"] = frag_dropped
+    if not games:
+        fragment_stats["skipped_all_games_too_short"] = 1
+        return fragment_stats
 
     match_format = match_record.get("format", "bo1")
     team_sheets = team_sheets_for_match(games) if match_format == "bo3" else None
@@ -383,6 +404,9 @@ async def process_match(
     #                 Models the observational asymmetry — we learn about
     #                 the opponent through play.
     stats: dict[str, int] = defaultdict(int)
+    # Carry forward any pre-init bumps (e.g. fragment-game filter).
+    for k, v in fragment_stats.items():
+        stats[k] += v
     match_id = match_record.get("match_id", "unknown")
 
     p1_running = damage_inferencer.init_knowledge(p1_species_universe)
@@ -559,6 +583,7 @@ async def process_match(
             match_buffer,
             turn_contexts,
             judge_client=judge_client,
+            judge_provider=judge_provider,
             judge_model=judge_model,
             judge_retries=judge_retries,
             teacher=teacher,
@@ -687,22 +712,42 @@ def _read_match_records(input_path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def _build_judge_client(use_judge: bool, dry_run: bool) -> Any:
-    """Construct the AsyncOpenAI client used by the judge, or None.
+def _build_judge_client(use_judge: bool, dry_run: bool, judge_provider: str) -> Any:
+    """Construct the judge client. Provider dispatch (Plan v8):
 
-    The judge always uses OpenAI (post-bake-off standardization) even if
-    the teacher provider is anthropic/google — we want consistent judging
-    across runs regardless of which teacher we're auditing.
+      - `judge_provider="google"` → `google.genai.Client` (the production
+        default; picks up `GOOGLE_API_KEY` or `GEMINI_API_KEY` from env).
+      - `judge_provider="openai"` → `openai.AsyncOpenAI` (Plan v4 path;
+        kept for explicit `--provider openai` runs).
+
+    Plan v4 originally required OpenAI regardless of teacher provider so
+    every judge call was cross-provider. Plan v8 dropped that — we
+    standardized the teacher on Gemini and the judge with it, both for
+    consistency and because the cross-provider cost / dependency was
+    no longer paying for itself. Use `--judge-provider openai` to opt
+    back into the cross-provider mode.
     """
     if dry_run or not use_judge:
         return None
-    if not os.environ.get("OPENAI_API_KEY"):
-        raise click.ClickException(
-            "OPENAI_API_KEY env var is required for --use-judge (judge always "
-            "uses OpenAI). Pass --no-judge to skip."
-        )
-    from openai import AsyncOpenAI
-    return AsyncOpenAI()
+    if judge_provider == "google":
+        if not (os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")):
+            raise click.ClickException(
+                "GOOGLE_API_KEY (or GEMINI_API_KEY) env var is required for "
+                "--use-judge with the default Gemini judge. Pass --no-judge "
+                "to skip the judge layer, or --judge-provider openai to use "
+                "the OpenAI judge instead."
+            )
+        from google import genai
+        return genai.Client()
+    if judge_provider == "openai":
+        if not os.environ.get("OPENAI_API_KEY"):
+            raise click.ClickException(
+                "OPENAI_API_KEY env var is required for --use-judge "
+                "--judge-provider openai. Pass --no-judge to skip."
+            )
+        from openai import AsyncOpenAI
+        return AsyncOpenAI()
+    raise click.ClickException(f"unknown --judge-provider: {judge_provider}")
 
 
 async def _run_sync(
@@ -721,8 +766,10 @@ async def _run_sync(
     seen_keys: set[tuple[str, int, int]],
     leak_retries: int,
     use_judge: bool,
+    judge_provider: str,
     judge_model: str,
     judge_retries: int,
+    min_game_turns: int,
 ) -> dict[str, int]:
     """Sync runner: original `process_match` flow over the given records."""
     sem = asyncio.Semaphore(concurrency)
@@ -749,8 +796,10 @@ async def _run_sync(
                     leak_retries=leak_retries,
                     use_judge=use_judge,
                     judge_client=judge_client,
+                    judge_provider=judge_provider,
                     judge_model=judge_model,
                     judge_retries=judge_retries,
+                    min_game_turns=min_game_turns,
                 )
             except Exception as e:
                 _log_error(
@@ -784,6 +833,7 @@ async def _run_batch(
     seen_keys: set[tuple[str, int, int]],
     leak_retries: int,
     use_judge: bool,
+    judge_provider: str,
     judge_model: str,
     judge_retries: int,
     state_dir: Path,
@@ -791,6 +841,7 @@ async def _run_batch(
     max_cycle_wait_seconds: float,
     resume: bool,
     model: str | None,
+    min_game_turns: int,
 ) -> dict[str, int]:
     """Batch runner: drive every match's turns through one batch cycle
     per tool-loop iteration via the OpenAI Batch API.
@@ -823,10 +874,12 @@ async def _run_batch(
         leak_retries=leak_retries,
         use_judge=use_judge,
         judge_client=judge_client,
+        judge_provider=judge_provider,
         judge_model=judge_model,
         judge_retries=judge_retries,
         teacher_for_judge_retry=teacher,
         resume=resume,
+        min_game_turns=min_game_turns,
     )
     return stats
 
@@ -884,12 +937,14 @@ async def _run_hybrid(
     seen_keys: set[tuple[str, int, int]],
     leak_retries: int,
     use_judge: bool,
+    judge_provider: str,
     judge_model: str,
     judge_retries: int,
     state_dir: Path,
     poll_interval_seconds: float,
     max_cycle_wait_seconds: float,
     resume: bool,
+    min_game_turns: int,
 ) -> dict[str, int]:
     """Sync-then-batch quality-gated hybrid.
 
@@ -921,8 +976,10 @@ async def _run_hybrid(
         seen_keys=seen_keys,
         leak_retries=leak_retries,
         use_judge=use_judge,
+        judge_provider=judge_provider,
         judge_model=judge_model,
         judge_retries=judge_retries,
+        min_game_turns=min_game_turns,
     )
     passed, gate_msg = _hybrid_gate_passed(
         sync_stats,
@@ -948,6 +1005,7 @@ async def _run_hybrid(
         seen_keys=seen_keys,
         leak_retries=leak_retries,
         use_judge=use_judge,
+        judge_provider=judge_provider,
         judge_model=judge_model,
         judge_retries=judge_retries,
         state_dir=state_dir,
@@ -955,6 +1013,7 @@ async def _run_hybrid(
         max_cycle_wait_seconds=max_cycle_wait_seconds,
         resume=resume,
         model=model,
+        min_game_turns=min_game_turns,
     )
     # Merge.
     combined: dict[str, int] = defaultdict(int)
@@ -977,6 +1036,7 @@ async def run(
     provider: str,
     leak_retries: int = PRODUCTION_LEAK_RETRIES,
     use_judge: bool = True,
+    judge_provider: str = DEFAULT_JUDGE_PROVIDER,
     judge_model: str = DEFAULT_JUDGE_MODEL,
     judge_retries: int = DEFAULT_JUDGE_RETRIES,
     mode: str = "sync",
@@ -987,6 +1047,7 @@ async def run(
     hybrid_sync_n: int = DEFAULT_HYBRID_SYNC_N,
     hybrid_min_match_rate: float = DEFAULT_HYBRID_MIN_MATCH_RATE,
     hybrid_max_leak_rate: float = DEFAULT_HYBRID_MAX_LEAK_RATE,
+    min_game_turns: int = DEFAULT_MIN_GAME_TURNS,
 ) -> None:
     """Top-level dispatcher. Picks `_run_sync` / `_run_batch` / `_run_hybrid`
     based on `mode`."""
@@ -997,12 +1058,16 @@ async def run(
     if not dry_run:
         teacher = _build_teacher(provider, model)
 
-    judge_client = _build_judge_client(use_judge, dry_run)
+    judge_client = _build_judge_client(use_judge, dry_run, judge_provider)
 
     if mode == "batch" and provider != "openai":
         raise click.ClickException(
-            f"--mode batch is OpenAI-only in v1 (got provider={provider}). "
-            f"Use --mode sync for non-OpenAI providers."
+            f"--mode batch requires --provider openai in v1 (got {provider}). "
+            f"Vertex Batch API adapter is a future workstream — see "
+            f"notes/TODO.md for the deferred-follow-ups list. For "
+            f"production with Gemini, use --mode sync; with $100K GCP "
+            f"credits available the unit-cost saving from batch isn't a "
+            f"hard constraint."
         )
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -1037,8 +1102,10 @@ async def run(
                 seen_keys=seen_keys,
                 leak_retries=leak_retries,
                 use_judge=use_judge,
+                judge_provider=judge_provider,
                 judge_model=judge_model,
                 judge_retries=judge_retries,
+                min_game_turns=min_game_turns,
             )
         elif mode == "batch":
             if dry_run:
@@ -1075,6 +1142,7 @@ async def run(
                     seen_keys=seen_keys,
                     leak_retries=leak_retries,
                     use_judge=use_judge,
+                    judge_provider=judge_provider,
                     judge_model=judge_model,
                     judge_retries=judge_retries,
                     state_dir=state_dir,
@@ -1082,6 +1150,7 @@ async def run(
                     max_cycle_wait_seconds=max_cycle_wait_seconds,
                     resume=resume,
                     model=model,
+                    min_game_turns=min_game_turns,
                 )
         elif mode == "hybrid":
             totals = await _run_hybrid(
@@ -1102,12 +1171,14 @@ async def run(
                 seen_keys=seen_keys,
                 leak_retries=leak_retries,
                 use_judge=use_judge,
+                judge_provider=judge_provider,
                 judge_model=judge_model,
                 judge_retries=judge_retries,
                 state_dir=state_dir,
                 poll_interval_seconds=poll_interval_seconds,
                 max_cycle_wait_seconds=max_cycle_wait_seconds,
                 resume=resume,
+                min_game_turns=min_game_turns,
             )
         else:
             raise click.ClickException(f"unknown --mode: {mode}")
@@ -1149,9 +1220,11 @@ async def run(
 @click.option(
     "--provider",
     type=click.Choice(["openai", "anthropic", "google"]),
-    default="openai",
+    default="google",
     show_default=True,
-    help="Which teacher LLM backend to use.",
+    help="Which teacher LLM backend to use. Production default is Google "
+         "(Gemini) — bake-off-winning quality + GCP credit availability. "
+         "OpenAI / Anthropic remain available for explicit selection.",
 )
 @click.option(
     "--model",
@@ -1166,16 +1239,34 @@ async def run(
 @click.option(
     "--use-judge/--no-judge", default=True, show_default=True,
     help="Run the per-match model-judge validator (plan v4). Catches the long-tail "
-         "meta-leaks that the regex filter misses. Adds ~$0.0015 per match.",
+         "meta-leaks that the regex filter misses. Adds ~$0.014 per match.",
+)
+@click.option(
+    "--judge-provider",
+    type=click.Choice(["openai", "google"]),
+    default=DEFAULT_JUDGE_PROVIDER,
+    show_default=True,
+    help="Which LLM backend the judge uses. Default Google (matches the "
+         "production teacher provider). Set to openai to use OpenAI for a "
+         "cross-provider sanity-check.",
 )
 @click.option(
     "--judge-model", default=DEFAULT_JUDGE_MODEL, show_default=True,
-    help="Model the judge calls. Always OpenAI; gpt-5.5-mini is the default tier.",
+    help="Model the judge calls. Default tracks the judge-provider's default "
+         "(google → gemini-3.1-pro-preview; openai → gpt-5.5). Override with "
+         "this flag or via the JUDGE_MODEL env var.",
 )
 @click.option(
     "--judge-retries", type=int, default=DEFAULT_JUDGE_RETRIES, show_default=True,
     help="Re-synthesis passes after the judge flags a turn. On exhaustion, drops only "
          "the flagged turns; the rest of the match commits cleanly.",
+)
+@click.option(
+    "--min-game-turns", type=int, default=DEFAULT_MIN_GAME_TURNS, show_default=True,
+    help="Drop games whose snapshot count produces fewer than this many "
+         "turn-pairs (= max possible SFT rows from the game). Default 2 "
+         "removes ghost games + single-decision sweeps that lack meaningful "
+         "history context. Set 0 to disable; set 4+ for richer-context-only.",
 )
 @click.option(
     "--mode",
@@ -1227,8 +1318,8 @@ async def run(
          "proceed to batch.",
 )
 def cli(input_path, output_path, calc_base_url, format_id, limit, concurrency, dry_run,
-        provider, model, leak_retries, use_judge, judge_model, judge_retries,
-        mode, state_dir, poll_interval_seconds, max_cycle_wait_seconds, resume,
+        provider, model, leak_retries, use_judge, judge_provider, judge_model, judge_retries,
+        min_game_turns, mode, state_dir, poll_interval_seconds, max_cycle_wait_seconds, resume,
         hybrid_sync_n, hybrid_min_match_rate, hybrid_max_leak_rate):
     """Generate the SFT training JSONL from parsed replay data."""
     resolved_format = _resolve_format_id(input_path, format_id)
@@ -1236,9 +1327,10 @@ def cli(input_path, output_path, calc_base_url, format_id, limit, concurrency, d
         f"using format_id={resolved_format}  dry_run={dry_run}  "
         f"provider={provider}  model={model or '(default)'}  leak_retries={leak_retries}  "
         f"judge={'on' if use_judge else 'off'}"
-        + (f" ({judge_model}, retries={judge_retries})" if use_judge else "")
+        + (f" ({judge_provider}/{judge_model}, retries={judge_retries})" if use_judge else "")
         + f"  mode={mode}"
         + (f" (sync_n={hybrid_sync_n})" if mode == "hybrid" else "")
+        + f"  min_game_turns={min_game_turns}"
     )
     asyncio.run(
         run(
@@ -1253,6 +1345,7 @@ def cli(input_path, output_path, calc_base_url, format_id, limit, concurrency, d
             provider=provider,
             leak_retries=leak_retries,
             use_judge=use_judge,
+            judge_provider=judge_provider,
             judge_model=judge_model,
             judge_retries=judge_retries,
             mode=mode,
@@ -1263,6 +1356,7 @@ def cli(input_path, output_path, calc_base_url, format_id, limit, concurrency, d
             hybrid_sync_n=hybrid_sync_n,
             hybrid_min_match_rate=hybrid_min_match_rate,
             hybrid_max_leak_rate=hybrid_max_leak_rate,
+            min_game_turns=min_game_turns,
         )
     )
 

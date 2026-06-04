@@ -56,6 +56,8 @@ from .batch_openai import (
 from .google import DEFAULT_MODEL_GOOGLE, GoogleProvider
 from .judge import (
     DEFAULT_JUDGE_MODEL,
+    DEFAULT_JUDGE_MODEL_OPENAI,
+    DEFAULT_JUDGE_PROVIDER,
     DEFAULT_JUDGE_RETRIES,
     DEFAULT_JUDGE_TIMEOUT,
     JUDGE_SYSTEM_PROMPT,
@@ -95,8 +97,10 @@ __all__ = [
     "GoogleProvider",
     "DEFAULT_MODEL_GOOGLE",
     "OpenAIProvider",
-    # Judge (plan v4)
+    # Judge (plan v4 + v8 provider dispatch)
     "DEFAULT_JUDGE_MODEL",
+    "DEFAULT_JUDGE_MODEL_OPENAI",
+    "DEFAULT_JUDGE_PROVIDER",
     "DEFAULT_JUDGE_RETRIES",
     "DEFAULT_JUDGE_TIMEOUT",
     "JUDGE_SYSTEM_PROMPT",
