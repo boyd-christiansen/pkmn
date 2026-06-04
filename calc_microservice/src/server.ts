@@ -1,6 +1,6 @@
 import express from 'express';
 import { runCalc } from './calc.js';
-import { lookupMove } from './dex.js';
+import { lookupMove, lookupSpecies } from './dex.js';
 import { parseLog } from './parse_log.js';
 import type { CalcRequest } from './types.js';
 
@@ -31,6 +31,14 @@ app.get('/dex/move/:name', (req, res) => {
     return res.status(404).json({ error: `move not found: ${req.params.name}` });
   }
   return res.json(move);
+});
+
+app.get('/dex/species/:name', (req, res) => {
+  const species = lookupSpecies(req.params.name);
+  if (!species) {
+    return res.status(404).json({ error: `species not found: ${req.params.name}` });
+  }
+  return res.json(species);
 });
 
 app.post('/parse_log', (req, res) => {

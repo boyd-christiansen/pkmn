@@ -24,11 +24,14 @@ gate; if `match_rate ≥ 0.95` and `leak_rate ≤ 0.02`, the remaining
 real Batch p50 latency.
 
 Pre-flight checks:
-- Calc microservice running (`cd calc_microservice && npm run dev`).
-- Canonical priors bootstrapped for both formats.
+- Calc microservice running (`cd calc_microservice && npm run dev`) —
+  now also serves `/dex/species` (base stats for speed inference).
 - `parsed_data/{bo1,bo3}.jsonl` exists.
-- `OPENAI_API_KEY` set (judge always uses OpenAI; teacher does too in
-  batch mode).
+- `GOOGLE_API_KEY` set — Gemini is the production teacher + judge since
+  Plan v8. (`OPENAI_API_KEY` only needed for `--provider openai` or the
+  OpenAI-only `--mode batch`.)
+- (Canonical-priors bootstrap is gone — Smogon meta machinery was
+  removed in Plan v9; `unknown` is the spread fallback.)
 
 Spot-check after the sync gate completes — inspect a few rows via the
 inspector before letting the batch portion fire.
@@ -61,24 +64,34 @@ would simplify the state machine significantly for that provider.
 
 ## Code-level TODOs (`# TODO(...)` markers)
 
-Three open markers in the Python source.
+Two open markers in the Python source. (The third,
+`TODO(canonical-prior-substitution)`, was resolved by the Plan-v9
+meta-machinery removal — `unknown` is now the explicit fallback, and
+the backward-leak risk is defused structurally by the six-roster +
+unknown-brought-placeholder rendering, not by masking with a
+slightly-fictional Smogon spread.)
 
 ### `TODO(rlhf-followup)` — pipeline/teacher/base.py:248
 
-Replace the prompt-driven Alternatives Rule (rule 5 of the system
-prompt) with minimax / Monte Carlo distillation. The current teacher
-cherry-picks weak alternatives because it already knows the answer
-from the `=== TRAINING-MODE TARGET ===` block; a proper search step
-would surface alternatives that *genuinely competed* with the chosen
-play, making the rationalization meaningful.
+Replace the prompt-driven alternative evaluation with minimax / Monte
+Carlo distillation. The obligation now lives ONLY in the
+synthesis-time `SYNTHESIS_GROUND_TRUTH_SUFFIX` (conditional — "demonstrate
+disproving a real alternative; no floor"), stripped before saving; the
+live-inference Alternatives Rule no longer mandates a per-turn calc
+(Plan v9 / Issue 4). The teacher still cherry-picks weak alternatives
+because it knows the answer from the `=== TRAINING-MODE TARGET ===`
+block; a proper search step would surface alternatives that *genuinely
+competed* with the chosen play.
 
 Architecture sketch: a separate "alternatives engine" runs a shallow
 search over the action space (filtered by the threat matrix); the
 teacher then articulates *why* the chosen play beat each of the
 top-K alternatives. Bigger workstream — likely a separate sibling of
-`master_pipeline.py` similar to `batch_runner.py`.
+`master_pipeline.py` similar to `batch_runner.py`. **Validate any
+change to the Alternatives Rule via the eval loop (action-match rate
+on the holdout), not from the diff** — it shapes model behavior.
 
-### `TODO(token-efficient-series-summary)` — pipeline/prompt_formatting.py:582
+### `TODO(token-efficient-series-summary)` — pipeline/prompt_formatting.py:888
 
 Learned or rule-based summarizer for `=== SERIES STATE ===`. Today
 the function inlines the full prior-game turn-by-turn rollup
@@ -90,19 +103,63 @@ Goal: distill "what mattered for THIS turn's decision" rather than
 faints, Teras, choice-locks, weather changes); upgrade to a learned
 summarizer if the heuristic falls short.
 
-### `TODO(canonical-prior-substitution)` — pipeline/prompt_formatting.py:134
+---
 
-Substitute the canonical Smogon spread for fully-open stats in `=== YOUR
-SPREADS ===` so the block looks the same whether observation was
-sparse or rich. Masks the implicit leak Plan v3 accepted as risk:
-mons that never took damage render as `(no observations yet)`, which
-a student model could learn means "this mon was never hit this
-match."
+## Plan v9 follow-ups (data bugs surfaced + parser gaps)
 
-Implementation is small (modify `format_p1_known_spreads_block` to
-fall through to `canonical_priors.get_probable_spread` when bounds
-are fully open) — held back only by judgment on whether masking with
-slightly-fictional spreads is worse than the implicit leak.
+Plan v9 (the four-issue pass — roster/spread model, volatile audit,
+field-ledger consolidation, Alternatives Rule split) shipped. It left
+two classes of follow-up: data bugs the new validator found, and
+parser gaps that block a hard action mask.
+
+### Choice-lock false-positives — `calc_microservice/src/parse_log.ts` `snapshotChoiceLock`
+
+`validate_action_legality.py` finds **32 turns** (0.03%) where the
+prompt renders `choiceLockedInto X` but the human freely plays a
+different move next turn (e.g. Flutter Mane "locked into Dazzling
+Gleam" → plays Misty Terrain → Shadow Ball). A real play can't
+violate a real Choice lock, so the lock is being rendered when it
+shouldn't be: `snapshotChoiceLock` sets it from `item.includes('choice')
+&& p.lastMove` without confirming the mon hasn't switched since
+`lastMove` (which resets the lock). Fix: gate on "still in since
+lastMove", then reparse. Low rate but it teaches a false constraint.
+
+### OTS moveset-membership mismatches — team-sheet decode
+
+The validator finds **10 turns** (0.01%) where the human used a move
+absent from the mon's OTS `knownMoves` (e.g. Calyrex-Shadow plays
+Shadow Ball / Protect while its sheet lists Pollen Puff). Indicates a
+`|showteam|` decode / species-alignment bug mis-assigning a sheet's
+moves. Investigate `decodeShowteam` + per-mon sheet→active mapping.
+
+### Parser enhancement for a hard action mask — Issue 2 Part B gap
+
+The volatile audit confirmed Perish/stat-stages/choice-lock/taunt/
+healblock/confusion/substitute are represented correctly, but:
+- **Encore / Disable carry only a boolean** — no locked/disabled move
+  id. The ledger now frames the restriction honestly ("can only repeat
+  its last move, or switch"), but the model can't see *which* move,
+  and the validator can't verify the label respects the lock.
+- **Trapping is not captured at all** — no `trapped` flag, so "switched
+  while trapped" can't be detected and the model can't see a switch is
+  illegal.
+
+Fix = parser additions: capture the encored move (`p.lastMove` while
+the encore volatile is active), the disabled move id, and a `trapped`
+boolean (Shadow Tag / Arena Trap / Magnet Pull / partial-trap). Once
+those land, `validate_action_legality.py` can scan those classes too,
+and the prompt can carry an explicit per-slot legal-action set rather
+than today's implicit "read the ledger" mask. Requires a reparse +
+preview regen.
+
+### Hyphenated-forme species-name normalization
+
+Bo1 `YOUR SPREADS` / bench occasionally renders a forme as its key
+(`urshifurapidstrike`) instead of the display name
+(`Urshifu-Rapid-Strike`). The reconstructed-roster path keys off the
+snapshot species string, which is the normalized key for some
+hyphenated formes. Cosmetic; fix in the parser's species display
+normalization (or map keys→display in `reconstruct_p1_team`).
 
 ---
 
@@ -225,8 +282,9 @@ these are the next levers.
   reference for damage math, legality checks, etc.
 - **`smogon.com/stats/{YYYY-MM}/{format}-{cutoff}.json`** — monthly Smogon
   usage stats: top Pokémon, move/item/teammate distributions, win rates per
-  Elo cutoff. Great for evaluation and team-building context. (Already used
-  by `canonical_priors.py`.)
+  Elo cutoff. Great for evaluation and team-building context. (Formerly
+  consumed by `canonical_priors.py`, removed in Plan v9 — kept here as a
+  data source if a usage-prior ever re-enters scope, e.g. a selection model.)
 
 ### Can we scrape *all* battles?
 

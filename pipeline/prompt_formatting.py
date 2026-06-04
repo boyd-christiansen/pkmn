@@ -117,6 +117,50 @@ def _summarize_bench_rich(
     )
 
 
+# Reg I doubles always brings exactly four of the six-mon roster.
+REG_I_BRING_COUNT = 4
+
+
+def _distinct_species_count(*entry_lists: list[dict[str, Any]]) -> int:
+    """Distinct species keys across one or more active/bench entry lists."""
+    keys: set[str] = set()
+    for lst in entry_lists:
+        for e in lst or []:
+            sp = e.get("species") or ""
+            if sp:
+                keys.add(_species_key(sp))
+    return len(keys)
+
+
+def _brought_placeholder_lines(identified: int, *, side: str) -> list[str]:
+    """Unknown-brought-slot placeholder lines.
+
+    Reg I guarantees four brings. When the brought mons we can actually
+    *identify* fall short of four, the remaining slot(s) still exist — we
+    just can't name them. Rendering an explicit placeholder (rather than
+    silently showing a short bench) keeps `unknown`/absence from being
+    read as "this side only brought N". A placeholder is always
+    spread-`unknown`; identity-unknown and damage-observed are mutually
+    exclusive in this data (a mon can't deal/take damage without
+    switching in, which reveals it), so an unnamed slot never carries
+    bounds.
+
+      • Own side (p1): a teammate you selected but that has not taken the
+        field at any point this game — "brought, never sent". Its absence
+        is itself signal (you judged it not worth playing).
+      • Opponent (p2): a brought mon not yet revealed — existence known
+        (they will have four), identity still hidden until it switches in.
+    """
+    n = REG_I_BRING_COUNT - identified
+    if n <= 0:
+        return []
+    if side == "p1":
+        note = "(brought, never sent this game — a teammate you selected but have not played; spread: unknown)"
+    else:
+        note = "(brought, identity not yet revealed — a 4-of-6 selection the opponent has not switched in; spread: unknown)"
+    return [f"  - {note}"] * n
+
+
 def _build_meta_lookup(
     sheet: list[dict[str, Any]] | None,
     recon: dict[str, dict[str, Any]] | None,
@@ -190,12 +234,14 @@ def _format_actives_with_empty_slots(side_snap: dict[str, Any]) -> str:
 # labelled "(inferred)" to avoid prompting the model to second-guess
 # numbers it would in fact have at deploy.
 #
-# Risk acknowledged: stats with no observations (e.g. SpD of a Pokémon
-# that never took special damage in this match) render as `?`. The model
-# could theoretically learn "if SpD is `?`, the mon never took spdamage"
-# — implicit signal leak. Mitigated by not explaining derivation in the
-# prompt. TODO: substitute canonical priors for fully-open stats so the
-# block looks the same whether observation was sparse or rich.
+# On the fallback: a stat with no observations renders as `?` (and a mon
+# with no constrained stat renders as `unknown`). `unknown` — not a
+# canonical Smogon spread — is the deliberate fallback: Smogon-meta
+# substitution was removed (it was more confusing than useful in live
+# game context). The implicit-leak risk ("a persistently-`unknown` mon
+# was inert") is defused structurally instead: the roster/bench section
+# renders every brought mon plus unknown-brought-slot placeholders, so an
+# `unknown` spread is never a clean tell that a mon never mattered.
 # =============================================================================
 
 
@@ -211,12 +257,20 @@ def _render_spread_line(
     """Render one species line for the YOUR / OPP SPREADS blocks.
 
     Returns just the body — `"Calyrex-Ice: Hp ≥244, Atk ≤8, ..."` or
-    `"Foobar: (no observations yet)"`. Caller is responsible for the
-    leading indent and the header. Shared between both spread blocks
-    so the one-sided-constraint formatting lives in exactly one place.
+    `"Foobar: unknown"`. Caller is responsible for the leading indent and
+    the header. Shared between both spread blocks so the one-sided-
+    constraint formatting lives in exactly one place.
+
+    `unknown` is the single fallback state: it means strictly "no
+    observation has narrowed this spread as of this turn". It deliberately
+    does NOT distinguish "never on the field" from "played but never gave
+    up a constraining observation" — not-brought / inert is a conclusion,
+    not a fact we hand the model, so the roster/bench section (which marks
+    who is active / benched / a not-yet-pinned brought slot) is what
+    contextualizes an `unknown` spread.
     """
     if not entry:
-        return f"{species}: (no observations yet)"
+        return f"{species}: unknown"
     mins = entry.get("min_evs", {})
     maxs = entry.get("max_evs", {})
     constrained: list[str] = []
@@ -236,7 +290,7 @@ def _render_spread_line(
         else:
             constrained.append(f"{stat_label} {lo}–{hi}")
     if not constrained:
-        return f"{species}: (no observations yet)"
+        return f"{species}: unknown"
     tail = ", others ?" if unconstrained else ""
     return f"{species}: " + ", ".join(constrained) + tail
 
@@ -244,28 +298,45 @@ def _render_spread_line(
 def format_p1_known_spreads_block(
     snapshot: dict[str, Any],
     p1_knowledge: dict[str, dict[str, dict[str, int]]],
+    *,
+    species_universe: list[str] | None = None,
 ) -> str:
     """Render `=== YOUR SPREADS ===` block (no "(inferred)" tag).
 
-    For each active P1 mon, show every stat whose bound has been tightened
-    on either side beyond the fully-open `[0, 252]` defaults. Stats with
-    no constraint render as `?`. If the upper bound is tightened only,
-    show as `≤ N`; lower bound only, `≥ N`; both, the explicit range.
-    Pinned to a single value when min == max.
+    Renders ALL of the player's roster, not just the active pair — your
+    benched (brought-but-inactive) and even your unbrought mons persist
+    here turn to turn and game to game, because their spreads are fixed
+    for the series and only tighten. (Previously this dropped everything
+    but the two actives, which read as if your bench had no spread at
+    all.) Pass `species_universe` = the full P1 roster (6 mons from the
+    Bo3 team sheet; the reconstructed roster in Bo1). Falls back to the
+    active pair only when no universe is supplied.
 
-    The caller should pass the **match-final** P1 KnowledgeState (from
-    `damage_inferencer.infer_match_final_bounds`), NOT the running
-    chronological state. This block represents "what the player knows
-    about their own team" — knowledge they had at deploy time, not
-    knowledge that accrues turn by turn.
+    Per stat: `≤ N` when only the upper bound tightened, `≥ N` lower
+    only, the explicit range when both, a single value when pinned, and
+    the whole line is `unknown` when nothing has narrowed.
+
+    The caller passes the **match-final** P1 KnowledgeState (from
+    `damage_inferencer.infer_match_final_bounds`) — "what the player
+    knows about their own team", knowledge they had at deploy time.
     """
-    actives = (snapshot.get("p1") or {}).get("active") or []
-    if not actives:
+    if species_universe:
+        species_list = list(species_universe)
+    else:
+        species_list = [
+            p.get("species") or "?"
+            for p in ((snapshot.get("p1") or {}).get("active") or [])
+        ]
+    if not species_list:
         return ""
+    seen_keys: set[str] = set()
     lines: list[str] = ["=== YOUR SPREADS ==="]
-    for p in actives:
-        species = p.get("species") or "?"
-        entry = p1_knowledge.get(_species_key(species))
+    for species in species_list:
+        k = _species_key(species)
+        if k in seen_keys:
+            continue
+        seen_keys.add(k)
+        entry = p1_knowledge.get(k)
         lines.append("  " + _render_spread_line(species, entry))
     return "\n".join(lines)
 
@@ -500,10 +571,13 @@ def format_game_state_ledger(
                 if vname == "substitute":
                     hp = vinfo.get("hp")
                     vol_parts.append(f"{label} Substitute" + (f" ({hp} HP)" if hp is not None else ""))
-                elif vname == "encoredInto":
-                    vol_parts.append(f"{label} Encore-locked into {vinfo}")
+                elif vname == "encored":
+                    # Parser carries a boolean (the locked move isn't in the
+                    # snapshot schema). Frame the option-restriction the model
+                    # must reason over: it can only repeat its last move or switch.
+                    vol_parts.append(f"{label} Encore-locked (can only repeat its last move, or switch)")
                 elif vname == "disabled":
-                    vol_parts.append(f"{label} Disabled: {vinfo}")
+                    vol_parts.append(f"{label} has a move Disabled (that move is unavailable this turn)")
                 elif vname == "taunt":
                     vol_parts.append(f"{label} Taunt{_maybe_turns_left(vinfo.get('turnsLeft'))}")
                 elif vname == "healBlock":
@@ -919,16 +993,12 @@ def format_user_prompt(
     P2 bench is gated by `snap.p2.seenSpecies` — the player only knows
     about opponent mons they have actually observed on field.
     """
-    f = snapshot.get("field", {})
-    field_parts = []
-    if f.get("weather"):
-        field_parts.append(f"weather={f['weather']}")
-    if f.get("terrain"):
-        field_parts.append(f"terrain={f['terrain']}")
-    field_parts.append(f"P1-tailwind={'YES' if f.get('tailwindP1') else 'no'}")
-    field_parts.append(f"P2-tailwind={'YES' if f.get('tailwindP2') else 'no'}")
-    field_str = ", ".join(field_parts)
-
+    # Field / timed-effect state is rendered exclusively in the GAME-STATE
+    # LEDGER below (weather, terrain, Trick Room, per-side Tailwind, screens
+    # — every duration as "(N turns left)"). The header used to duplicate a
+    # thinner version (weather/terrain names + binary tailwind) which the
+    # model had to reconcile against the ledger; that duplication is gone so
+    # the ledger is the single source of truth for field state.
     p1 = snapshot.get("p1", {})
     p2 = snapshot.get("p2", {})
 
@@ -947,34 +1017,41 @@ def format_user_prompt(
     )
 
     # P1 bench: full brought-set (player knows their own selection from
-    # team preview), each mon rendered with full metadata.
+    # team preview), each mon rendered with full metadata. Any brought
+    # slot we can't identify from replay usage (a teammate that never took
+    # the field) is filled with an explicit placeholder so the bench reads
+    # as four brings, not a short roster.
+    p1_active_entries = p1.get("active") or []
     p1_bench_entries = p1.get("bench") or []
-    if p1_bench_entries:
-        p1_bench = "\n".join(
-            _summarize_bench_rich(b, p1_meta.get(_species_key(b.get("species", ""))))
-            for b in p1_bench_entries
-        )
-    else:
-        p1_bench = "  (none)"
+    p1_bench_lines = [
+        _summarize_bench_rich(b, p1_meta.get(_species_key(b.get("species", ""))))
+        for b in p1_bench_entries
+    ]
+    p1_bench_lines += _brought_placeholder_lines(
+        _distinct_species_count(p1_active_entries, p1_bench_entries), side="p1"
+    )
+    p1_bench = "\n".join(p1_bench_lines) if p1_bench_lines else "  (none)"
 
     # P2 bench: chronologically gated by `seenSpecies` — the player only
     # learns the opponent's brought selection as switches reveal them.
+    # Unrevealed brought slots become placeholders (existence known,
+    # identity hidden until they switch in).
+    p2_active_entries = p2.get("active") or []
     p2_seen = {_species_key(s) for s in (p2.get("seenSpecies") or [])}
     p2_bench_visible = [
         b for b in (p2.get("bench") or [])
         if _species_key(b.get("species", "")) in p2_seen
     ]
-    if p2_bench_visible:
-        p2_bench = "\n".join(
-            _summarize_bench_rich(b, p2_meta.get(_species_key(b.get("species", ""))))
-            for b in p2_bench_visible
-        )
-    else:
-        # Differentiate "opponent has no bench" (impossible — they have 4)
-        # from "we haven't seen any of their bench yet". The player hasn't
-        # observed any opponent switch-in yet, so we genuinely don't know
-        # what's behind their leads.
-        p2_bench = "  (unknown — opponent has not yet revealed any bench Pokémon)"
+    p2_bench_lines = [
+        _summarize_bench_rich(b, p2_meta.get(_species_key(b.get("species", ""))))
+        for b in p2_bench_visible
+    ]
+    # Identified opponent brings = distinct on-field actives + revealed bench.
+    p2_bench_lines += _brought_placeholder_lines(
+        _distinct_species_count(p2_active_entries, p2_bench_visible), side="p2"
+    )
+    p2_bench = "\n".join(p2_bench_lines) if p2_bench_lines else \
+        "  (unknown — opponent has not yet revealed any bench Pokémon)"
 
     # New historical context blocks.
     snaps = snapshots_so_far or []
@@ -993,8 +1070,7 @@ def format_user_prompt(
     series_block_part = (series_block + "\n\n") if series_block else ""
 
     return (
-        f"=== TURN {snapshot.get('turn', '?')} ===\n"
-        f"Field: {field_str}\n\n"
+        f"=== TURN {snapshot.get('turn', '?')} ===\n\n"
         f"YOUR (P1) ACTIVE:\n{p1_active_lines}\n"
         f"YOUR (P1) BENCH:\n{p1_bench}\n\n"
         f"OPP (P2) ACTIVE:\n{p2_active_lines}\n"

@@ -184,6 +184,8 @@ async def _prepare_match_turns(
 
     p1_running = damage_inferencer.init_knowledge(p1_species_universe)
     p2_running = damage_inferencer.init_knowledge(p2_species_universe)
+    p1_universe_keys = {damage_inferencer.species_key(s) for s in p1_species_universe}
+    p2_universe_keys = {damage_inferencer.species_key(s) for s in p2_species_universe}
     match_id = match_record.get("match_id", "unknown")
     # Match-final inference can fail on malformed snapshots (one bad
     # /calc 400 from `damage_inferencer._call_calc`); fall back to open
@@ -232,6 +234,7 @@ async def _prepare_match_turns(
                 await _safe_update_knowledge(
                     snap_pre, snap_post, events_stream, p1_running, p2_running,
                     session=aiohttp_session, base_url=calc_base_url,
+                    p1_universe=p1_universe_keys, p2_universe=p2_universe_keys,
                 )
                 continue
 
@@ -241,6 +244,7 @@ async def _prepare_match_turns(
                 await _safe_update_knowledge(
                     snap_pre, snap_post, events_stream, p1_running, p2_running,
                     session=aiohttp_session, base_url=calc_base_url,
+                    p1_universe=p1_universe_keys, p2_universe=p2_universe_keys,
                 )
                 continue
 
@@ -260,10 +264,13 @@ async def _prepare_match_turns(
                 await _safe_update_knowledge(
                     snap_pre, snap_post, events_stream, p1_running, p2_running,
                     session=aiohttp_session, base_url=calc_base_url,
+                    p1_universe=p1_universe_keys, p2_universe=p2_universe_keys,
                 )
                 continue
 
-            p1_spreads = format_p1_known_spreads_block(snap_pre, p1_final)
+            p1_spreads = format_p1_known_spreads_block(
+                snap_pre, p1_final, species_universe=p1_species_universe
+            )
             if team_sheets:
                 opp_universe = [m["species"] for m in team_sheets["p2"]]
             else:
@@ -315,24 +322,32 @@ async def _prepare_match_turns(
             await _safe_update_knowledge(
                 snap_pre, snap_post, events_stream, p1_running, p2_running,
                 session=aiohttp_session, base_url=calc_base_url,
+                p1_universe=p1_universe_keys, p2_universe=p2_universe_keys,
             )
 
     return preps, stats
 
 
 async def _safe_update_knowledge(
-    snap_pre, snap_post, events_stream, p1_knowledge, p2_knowledge, *, session, base_url
+    snap_pre, snap_post, events_stream, p1_knowledge, p2_knowledge, *, session, base_url,
+    p1_universe=None, p2_universe=None,
 ):
     """Mirror of `master_pipeline._safe_update_knowledge` — kept duplicated
     rather than imported so this module stays an importable sibling rather
-    than a circular dependency on master_pipeline."""
+    than a circular dependency on master_pipeline. Runs damage inference
+    (when there are damage events) plus the observed-flag + speed
+    (move-order) pass every turn."""
     damage_events = damage_inferencer.events_to_damage_events(events_stream)
-    if not damage_events:
-        return
     try:
-        await damage_inferencer.update_knowledge(
-            snap_pre, snap_post, damage_events, p1_knowledge, p2_knowledge,
+        if damage_events:
+            await damage_inferencer.update_knowledge(
+                snap_pre, snap_post, damage_events, p1_knowledge, p2_knowledge,
+                session=session, base_url=base_url,
+            )
+        await damage_inferencer.update_observed_and_speed(
+            snap_pre, events_stream, p1_knowledge, p2_knowledge,
             session=session, base_url=base_url,
+            p1_universe=p1_universe, p2_universe=p2_universe,
         )
     except Exception as e:
         click.echo(f"update_knowledge failed: {e}", err=True)

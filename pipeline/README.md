@@ -6,10 +6,13 @@ conversational training data.
 ```
 pipeline/
 ├── replay_parser.py          # raw replay JSONs → per-turn snapshot JSONL
-├── canonical_priors.py       # Smogon chaos data lookup (no network)
 ├── damage_inferencer.py      # binary-search EV bound inference +
-│                             #   infer_match_final_bounds (match-final pass)
-├── threat_matrix.py          # dual-track damage envelope per turn
+│                             #   infer_match_final_bounds (match-final pass) +
+│                             #   update_observed_and_speed (observed flag +
+│                             #   move-order Speed upper-bound)
+├── threat_matrix.py          # Absolute damage envelope per turn
+├── validate_action_legality.py  # read-only corpus validator: SFT labels
+│                             #   vs their own turn state (data-bug scanner)
 ├── team_reconstruction.py    # P1 team / brought-set / sheet helpers
 ├── action_extraction.py      # winner-flip + extract_p1_actions
 ├── prompt_formatting.py      # 8-section user-prompt composer
@@ -123,36 +126,32 @@ emits one JSONL row per *match*.
 [calc_microservice README](../calc_microservice/README.md#post-parse_log) for
 the per-turn shape.
 
-### `canonical_priors.py` *(implemented — Smogon-backed)*
+### `canonical_priors.py` *(removed in Plan v9)*
 
-Returns the *probable* spread (EVs / IVs / nature) for a species under
-standard meta play. Backs the **Probable Range** track in
-`threat_matrix.py`.
+The Smogon meta machinery is gone. `canonical_priors.py` and the
+`pipeline/data/smogon_chaos_*.json` caches were deleted when the threat
+matrix dropped its "Probable" / canonical-meta second track. The matrix
+now renders the **Absolute** envelope only (the strict provable range
+from both sides' inferred `KnowledgeState` bounds); an unconstrained
+stat renders the word `unknown` rather than a canonical spread.
 
-- **API:** `get_probable_spread(species, format_id=None) -> ProbableSpread`.
-  The result has a `source` field: `"chaos"` | `"curated"` | `"heuristic"`.
-- **Lookup order** (each step falls through on miss):
-  1. **Smogon Chaos JSON** at `pipeline/data/smogon_chaos_{format_id}.json` —
-     loads the per-species `Spreads` dict and picks the most-used
-     `"Nature:hp/atk/def/spa/spd/spe"` entry. Real usage data.
-  2. **Curated table** of spreads for the top ~40 Reg I species (Calyrex-Shadow
-     → Timid SpA/Spe, Amoonguss → Calm HP/SpD, etc.). Used when chaos
-     hasn't been bootstrapped or the species genuinely has 0 usage rows.
-  3. **Base-stat heuristic** for anything else (offensive vs bulky vs default).
-- **Touches:** at runtime, only the local cache file. Network access is
-  isolated to `fetch_chaos(...)` (CLI-invoked).
+### `validate_action_legality.py` *(implemented — Plan v9)*
 
-#### Bootstrap
+Read-only corpus validator. Scans the SFT labels for actions that
+contradict their own turn state — choice-lock (a Choice-item mon must
+repeat its locked move), tera-after-used (can't Terastallize twice),
+OTS moveset-membership (a Bo3 move must be on the team sheet). Since
+every label is a real human play, any violation is a **data bug**, not
+a model error.
 
 ```bash
 cd pipeline
-.venv/bin/python canonical_priors.py --format-id gen9vgc2026regi
-.venv/bin/python canonical_priors.py --format-id gen9vgc2026regibo3
+.venv/bin/python validate_action_legality.py
 ```
 
-Walks back from the current month until a 200 OK chaos file is found
-(default: 12 months back), saves to `pipeline/data/smogon_chaos_<format_id>.json`.
-Add `--cutoff 1500` to use the high-ladder cut instead of all rated games.
+- **Touches:** reads `parsed_data/sft_training_data.jsonl` +
+  `parsed_data/{bo1,bo3}.jsonl` only. No network, no LLM, no calc
+  service, no sibling imports.
 
 ### `damage_inferencer.py` *(implemented — dual-state, two-way)*
 
@@ -167,8 +166,8 @@ via binary search against the calc microservice.
   `KnowledgeState`s.
 - **Out:** the same `(p1_knowledge, p2_knowledge)` tuple, mutated in
   place — `min_evs` ratcheted up, `max_evs` ratcheted down per event.
-- **Touches:** `POST /calc` and `GET /dex/move/:name`. No replay parsing,
-  no LLM, no sibling imports.
+- **Touches:** `POST /calc`, `GET /dex/move/:name`, and
+  `GET /dex/species/:name`. No replay parsing, no LLM, no sibling imports.
 - **Two-way binary search.** For each non-status event we run six binary
   searches per damage event:
   - DEFENDER `min_def`, `max_def`, `min_hp`, `max_hp`
@@ -212,6 +211,16 @@ via binary search against the calc microservice.
   snapshot[N]`, `snapshot_post = snapshot[N+1]`. Use
   `damage_inferencer.events_to_damage_events()` to filter the stream
   for inference-eligible damage observations.
+- **`update_observed_and_speed()` (Plan v9).** Two move-order-driven
+  derivations per turn:
+  - **`observed` flag.** A mon is marked `observed` the moment it
+    deals/takes damage or reveals move order — the causal definition of
+    when a mon stops rendering as `unknown` in the spread blocks.
+  - **Speed upper-bound.** A mon that moved *after* a known mon is
+    genuinely slower, so its Speed gets a conservative upper bound from
+    move order. Choice-Scarf-safe (the bound only tightens on the slower
+    side of an observed ordering). Needs base stats from the new
+    `GET /dex/species/:name` endpoint.
 
 ### Format split: CTS (Bo1) vs OTS (Bo3)
 
@@ -232,38 +241,31 @@ The pipeline branches on `match_record["format"]`:
   `knownMoves: string[4] | null` field carries the OTS-known full moveset
   — `threat_matrix` prefers `knownMoves` when present (Bo3) and falls
   back to `revealedMoves` (Bo1). VGC OTS does not reveal EVs / IVs /
-  Nature, so the dual-track inferencer continues to do the heavy lifting
+  Nature, so the dual-state inferencer continues to do the heavy lifting
   on spread bounds.
 
-### `threat_matrix.py` *(implemented — dual-track)*
+### `threat_matrix.py` *(implemented — Absolute-only since Plan v9)*
 
 Renders the per-turn damage envelope as a compact human-readable text
-block, with **two damage tracks per matchup**:
+block. One track per matchup:
 
-- **Absolute** — strict mathematical envelope from the live
+- **Absolute** — the strict mathematical envelope from the live
   `KnowledgeState`s. Wide but provable.
-- **Probable (meta)** — single calc result using each Pokémon's
-  `canonical_priors` spread. Narrow, fast, and only as good as the prior.
 
-When the canonical prior is clipped from the inferred KnowledgeState
-bounds by **≥ 40 EVs** on any relevant stat, the Probable calc is
-**skipped entirely** for that line and only the Absolute envelope is
-shown, tagged `(off-meta)`. Avoids surfacing a "meta" range we've
-already disproven.
+Plan v9 deleted the second "Probable (meta)" track (it depended on the
+now-removed `canonical_priors`). There is no `| meta` column and no
+`(off-meta)` tag anymore. An unconstrained stat renders the word
+`unknown` rather than falling back to a canonical spread.
 
-- **In:** one snapshot, `p1_side` (which side is "us"), **both**
-  `p1_knowledge` and `p2_knowledge`, and an optional `format_id` (forwarded
-  to `canonical_priors` so the Probable track uses real Smogon usage data
-  when a chaos cache is bootstrapped for that format).
+- **In:** one snapshot, `p1_side` (which side is "us"), and **both**
+  `p1_knowledge` and `p2_knowledge`.
 - **Out:** a single string, grouped per attacker. Each attacker block
   shows one line per (move, defender) pair (or a single grouped line
-  per spread move). Off-meta lines drop the Probable column. Chip moves
-  (max % < 15% across every defender) are collapsed into a single
-  footer line per attacker.
-- **Touches:** `POST /calc` (2 calls per (move, defender) cell when
-  off-meta — abs-low, abs-high; +1 Probable call when in-meta) and
-  `GET /dex/move/:name` (cached, fetched for category + target).
-  Status moves filtered out.
+  per spread move). Chip moves (max % < 15% across every defender) are
+  collapsed into a single footer line per attacker.
+- **Touches:** `POST /calc` (2 calls per (move, defender) cell —
+  abs-low, abs-high) and `GET /dex/move/:name` (cached, fetched for
+  category + target). Status moves filtered out.
 - **Volatile state:** status, boosts, weather, terrain, side conditions,
   Tera state — all threaded into every payload from the snapshot.
 - **Spread modifier auto-applies.** Doubles spread moves
@@ -276,8 +278,8 @@ already disproven.
 
 ```
 [us Chi-Yu]  (boosts={spe: -1, spa: -2})
-  Heat Wave [spread]: Miraidon 11.7%–13.7%, Iron Bundle 47.8%–62.6%  [Iron Bundle: guaranteed 2HKO]  (off-meta)
-  Overheat → Iron Bundle    85.5%–116.8%  | meta 103.0%–122.7%  [guaranteed OHKO]
+  Heat Wave [spread]: Miraidon 11.7%–13.7%, Iron Bundle 47.8%–62.6%  [Iron Bundle: guaranteed 2HKO]
+  Overheat → Iron Bundle    85.5%–116.8%  [guaranteed OHKO]
   …plus 1 chip move(s): Snarl
 ```
 
@@ -523,9 +525,13 @@ losing patterns at the same Elo. Including some intra-series losses
 series-winner sometimes drops a game to RNG / matchup, and that
 reasoning is still high-quality.
 
-**Match-final P1 spreads in the user prompt (Plan v3).** Each turn's
-user prompt includes a `=== YOUR SPREADS ===` block listing every
-tightened EV bound for each active P1 mon. Computed once per match via
+**Match-final P1 spreads in the user prompt (Plan v3, six-roster in
+Plan v9).** Each turn's user prompt includes a `=== YOUR SPREADS ===`
+block listing every tightened EV bound. **Plan v9 renders the full
+known roster per side** — both `=== YOUR SPREADS ===` and `=== OPP
+SPREADS (inferred) ===` now show all 6 in Bo3 (from the team sheets)
+and the revealed-so-far set in Bo1, rather than only the 2 active mons
+(a bug fixed in v9). Bounds are computed once per match via
 `damage_inferencer.infer_match_final_bounds` — the tightest bounds the
 inferencer can extract from the **entire** match's events. The player
 knew their own spreads from day one, and the match-final bound is the
@@ -534,9 +540,11 @@ operator surfaces exact spreads from the team-builder JSON.) The render
 uses one-sided constraints — `Stat ≤N` when only the upper bound has
 narrowed, `Stat ≥N` when only the lower bound has narrowed, the
 explicit range when both, or `Stat N` when pinned to a single value.
-Fully-open stats roll up into a trailing `, others ?`. The Spread Rule
-in the system prompt tells the model how to reason from ranges (worst
-case for survival checks, best case for offensive checks).
+Fully-open stats roll up into a trailing `, others ?`, and a mon with
+no constraints at all renders the single fallback state `unknown`
+(Plan v9 replaced the old `(no observations yet)` string). The Spread
+Rule in the system prompt tells the model how to reason from ranges
+(worst case for survival checks, best case for offensive checks).
 
 **Asymmetric threat matrix (Plan v3).** The threat matrix gets the
 `(p1_final, p2_running)` pair: match-final-tight P1 bounds (we know
@@ -572,13 +580,19 @@ rest of the match commits atomically to the SFT JSONL.
     slot (likely forced out before acting) → caller skips the turn.
 - **Historical context blocks.** `format_user_prompt` composes three
   prompt sections in addition to the current-frame board state:
-  - `=== GAME-STATE LEDGER ===` — faints, Tera-used per side, field +
-    pseudo-weather + side conditions with turns-left (singular/plural
-    handled), on-active volatiles (Substitute / Encore / Taunt / …),
-    choice locks (move name normalized via the dex), recent item
-    events, and a Cumulative damage row showing per-active total
-    damage taken across past turns + turns on field. Only-when-active
-    rows: empty rows omit.
+  - `=== GAME-STATE LEDGER ===` — faints, Tera-used per side, and
+    (Plan v9) **all timed field effects** — weather, terrain, Trick
+    Room, per-side Tailwind, screens (Reflect / Light Screen / Aurora
+    Veil) — each with a `(N turns left)` count. The per-turn header's
+    old `Field: weather=…, P1-tailwind=…` line was removed; field state
+    now lives **only** here. Also: on-active volatiles (Substitute /
+    Encore / Taunt / …) — Encore renders as "Encore-locked (can only
+    repeat its last move, or switch)" and Disable as "has a move
+    Disabled (...)" (the parser carries only a boolean, no move name —
+    a known gap in `notes/TODO.md`); choice locks (move name normalized
+    via the dex); recent item events; and a Cumulative damage row
+    showing per-active total damage taken across past turns + turns on
+    field. Only-when-active rows: empty rows omit.
   - `=== TURN-BY-TURN (game N) ===` — every prior turn's events as
     indented one-liners. No length cap.
   - `=== SERIES STATE (Bo3, game N of M) ===` — Bo3 game ≥ 2 only.
@@ -597,16 +611,23 @@ rest of the match commits atomically to the SFT JSONL.
   `format_user_prompt` filters P2's bench by `seenSpecies`
   (chronological reveal — what the player has actually observed of
   the opponent's selection).
+- **Unknown-brought-slot placeholders (Plan v9).** Reg I always brings
+  4, but the brought-4 is never in the replay data — only usage is. So
+  when fewer than 4 brought mons are identifiable, the BENCH section
+  adds explicit placeholders to fill out the 4: the player's own side
+  reads `(brought, never sent this game ...)`, the opponent's side
+  reads `(brought, identity not yet revealed ...)`. There is no
+  "not-brought" state.
 - **Process loop** per match:
   1. `reconstruct_p1_team` + gather P2 species from snapshots.
-  2. `init_knowledge` for both sides at fully-open `[0, 252]` bounds (per
-     project spec: canonical priors live in the threat-matrix Probable
-     track only; the inferencer's Absolute track stays strict-math).
+  2. `init_knowledge` for both sides at fully-open `[0, 252]` bounds (the
+     inferencer's Absolute envelope stays strict-math — no priors, no
+     meta seeding; an unconstrained stat reads `unknown`).
   3. Render system prompt (with team block + Masking Rule).
   4. For each `(snap_pre, snap_post, snap_pre.events)` triple in turn
      order:
      - Extract P1's action; skip turn if ambiguous.
-     - Generate threat matrix (uses `format_id` for chaos-backed Probable).
+     - Generate the Absolute-only threat matrix.
      - Format user prompt — passes the full snapshot history of this
        game (`snapshots_so_far`, `current_idx`) and prior games
        (`prior_games`) for the new historical context blocks.
@@ -659,7 +680,7 @@ ANTHROPIC_API_KEY=sk-... .venv/bin/python master_pipeline.py \
 | `--input` | `parsed_data/bo3.jsonl` | Match-records JSONL from replay_parser. |
 | `--output` | `parsed_data/sft_training_data.jsonl` | Append-only JSONL; per-match atomic commit. |
 | `--calc-base-url` | `http://localhost:3000` | |
-| `--format-id` | auto from filename | Drives chaos-priors lookup. |
+| `--format-id` | auto from filename | Identifies the format (CTS Bo1 vs OTS Bo3) for prompt rendering. |
 | `--limit` | none | Process first N matches (test batch). |
 | `--concurrency` | `1` | Sync mode: max matches in flight. Bump to 8 for production. |
 | `--dry-run` | off | Skip the LLM call entirely. Works in sync and batch modes. |
@@ -708,9 +729,10 @@ raw replay JSON
     │    for each turn in order:
     │      → action_extraction.extract_p1_actions(snap_pre, snap_post, events)
     │        (the human's ground-truth play; skip turn if ambiguous)
-    │      → threat_matrix.generate(snap_pre, "p1", p1_final, p2_running, ...)
-    │        (dual-track Absolute + Probable; asymmetric pair gives realistic
-    │         tightness on our side, looseness on theirs; off-meta lines drop Probable)
+    │      → threat_matrix.generate(snap_pre, "p1", p1_final, p2_running)
+    │        (Absolute-only provable envelope; asymmetric pair gives realistic
+    │         tightness on our side, looseness on theirs; unconstrained stats
+    │         render `unknown`)
     │      → prompt_formatting.format_user_prompt(snap_pre, ..., snapshots_so_far,
     │                            current_idx, prior_games, game_index, match_format)
     │        (composes board state + GAME-STATE LEDGER + TURN-BY-TURN +
@@ -739,10 +761,11 @@ raw replay JSON
 | Module | State |
 |---|---|
 | `replay_parser.py` | Working. Run `python replay_parser.py --help`. Captures per-turn `events` (TurnEvent[]) from `/parse_log` into the JSONL. |
-| `canonical_priors.py` | Working. Library + bootstrap CLI. Reads Smogon Chaos JSON when present; falls back to curated table → heuristic. |
-| `damage_inferencer.py` | Working. Dual-state, two-way binary search, atomic apply, 508-EV constraint pass, crit-aware via `/calc isCrit`, multi-hit filter, `events_to_damage_events()` filter for non-own-move callers (Metronome / Copycat / Sketch / Snatch / Me First / Dancer / Instruct / Mirror Move / Assist / Nature Power excluded; Sleep Talk allowed). Plus `infer_match_final_bounds()` for the match-final P1 spreads. |
-| `threat_matrix.py` | Working. Dual-track Absolute + Probable output, driven by the asymmetric `(p1_final, p2_running)` knowledge pair. When canonical priors are ≥40-EV-clipped by the inferred bounds, the Probable column is dropped and the line tagged `(off-meta)`. Optional `format_id` drives Smogon-backed priors. |
-| `teacher/base.py` | Provider-agnostic core: `TeacherProvider` ABC, schemas (incl. `submit_decision` tool), prompt templates (6 rules: Masking/OTS, Tool, Threat-Matrix, Spread, Alternatives, Output), ground-truth stripping, `detect_oracle_leak` regex + `extract_pre_tool_thought` helper. Present-tense system prompts. Plan v3 Tool Rule directs calc at hypotheticals the matrix doesn't cover (no per-turn minimum). `# TODO(rlhf-followup)` flags the prompt-driven alternative evaluation as temporary. |
+| `canonical_priors.py` | **Removed in Plan v9.** Deleted alongside the `smogon_chaos_*.json` caches when the threat matrix dropped its Probable / canonical-meta track. |
+| `damage_inferencer.py` | Working. Dual-state, two-way binary search, atomic apply, 508-EV constraint pass, crit-aware via `/calc isCrit`, multi-hit filter, `events_to_damage_events()` filter for non-own-move callers (Metronome / Copycat / Sketch / Snatch / Me First / Dancer / Instruct / Mirror Move / Assist / Nature Power excluded; Sleep Talk allowed). Plus `infer_match_final_bounds()` for the match-final P1 spreads, and `update_observed_and_speed()` (Plan v9 — per-mon `observed` flag + move-order Speed upper-bound, base stats via `/dex/species`). |
+| `threat_matrix.py` | Working. Absolute-only output (Plan v9 removed the Probable track), driven by the asymmetric `(p1_final, p2_running)` knowledge pair. An unconstrained stat renders the word `unknown`. |
+| `validate_action_legality.py` | Plan v9. Read-only corpus validator scanning SFT labels for actions that contradict their own turn state (choice-lock, tera-after-used, OTS moveset-membership). Since labels are real human plays, any violation is a data bug. Run `python validate_action_legality.py`. |
+| `teacher/base.py` | Provider-agnostic core: `TeacherProvider` ABC, schemas (incl. `submit_decision` tool), prompt templates (6 rules: Masking/OTS, Tool, Threat-Matrix, Spread, Alternatives, Output), ground-truth stripping, `detect_oracle_leak` regex + `extract_pre_tool_thought` helper. Present-tense system prompts. Plan v3 Tool Rule directs calc at hypotheticals the matrix doesn't cover (no per-turn minimum). Plan v9 split the Alternatives Rule — the live-inference rule 5 no longer mandates evaluating an alternative every turn; the mandatory-alternative obligation moved into the synthesis-only `SYNTHESIS_GROUND_TRUTH_SUFFIX` as a conditional (stripped before save), so at live inference the model commits immediately when the matrix settles the question. `# TODO(rlhf-followup)` still flags the prompt-driven alternative evaluation as temporary. |
 | `teacher/openai.py` | OpenAI adapter; default model `gpt-5.5`. Per-call timeout 120s, per-turn ceiling 300s. Bake-off tied at 100% / 0% with Gemini. **Available via `--provider openai`** — also required for `--mode batch`. |
 | `teacher/anthropic.py` | Anthropic adapter; default model `claude-sonnet-4-6`. Same tool-loop semantics. Bake-off result: 32% near-miss meta-leak rate; not used in production. |
 | `teacher/google.py` | Google adapter; default model `gemini-3.1-pro-preview`. Same tool-loop semantics. Bake-off result: clean (0% leak), cheaper unit-cost than OpenAI ($0.04 vs $0.07/row). **Production default since Plan v8** — economics dominated the bake-off-tied-on-quality result given ~$100K GCP credits. |
@@ -756,10 +779,10 @@ raw replay JSON
 ## Planned follow-up workstreams
 
 Tracked in [`../notes/TODO.md`](../notes/TODO.md) — the master tracker
-for all non-shipped work across the project. That includes the three
+for all non-shipped work across the project. That includes the
 `# TODO(...)` markers in this directory (`rlhf-followup` in
-`teacher/base.py`, `token-efficient-series-summary` and the
-canonical-prior substitution note in `prompt_formatting.py`), Plan v4
-follow-ups (Anthropic / Google batch adapters, judge-rate dashboard),
-and long-horizon plans (selection-model SFT corpus, RLHF). Pipeline-
-adjacent additions live there too — don't fork the list here.
+`teacher/base.py`, `token-efficient-series-summary` in
+`prompt_formatting.py`), Plan v4 follow-ups (Anthropic / Google batch
+adapters, judge-rate dashboard), and long-horizon plans
+(selection-model SFT corpus, RLHF). Pipeline-adjacent additions live
+there too — don't fork the list here.

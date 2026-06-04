@@ -82,10 +82,18 @@ def species_key(species: str) -> str:
     return "".join(c for c in species.lower() if c.isalnum())
 
 
-def init_knowledge_entry() -> dict[str, dict[str, int]]:
+def init_knowledge_entry() -> dict[str, Any]:
     return {
         "min_evs": {s: DEFAULT_MIN_EV for s in STATS},
         "max_evs": {s: DEFAULT_MAX_EV for s in STATS},
+        # `observed` is True once this Pokémon has been involved in ANY
+        # spread-relevant event (dealt damage, took damage, or revealed
+        # move order). It is the causal answer to "is this mon `unknown`?":
+        # a mon stays `unknown` strictly while observed is False. Distinct
+        # from "observed but EV-unconstrained" — that mon has observed=True
+        # with still-wide bounds, so a persistently-wide spread can no
+        # longer be misread as "this mon was inert all game".
+        "observed": False,
     }
 
 
@@ -406,6 +414,8 @@ async def infer_match_final_bounds(
     """
     p1 = init_knowledge(p1_species)
     p2 = init_knowledge(p2_species)
+    p1_uni = {species_key(s) for s in p1_species}
+    p2_uni = {species_key(s) for s in p2_species}
 
     own_session = session is None
     if own_session:
@@ -417,11 +427,17 @@ async def infer_match_final_bounds(
                 snap_pre, snap_post = snaps[i], snaps[i + 1]
                 events_stream = snap_pre.get("events") or []
                 damage_events = events_to_damage_events(events_stream)
-                if not damage_events:
-                    continue
-                await update_knowledge(
-                    snap_pre, snap_post, damage_events, p1, p2,
-                    session=session, base_url=base_url, fuzzy_hp_pct=fuzzy_hp_pct,
+                if damage_events:
+                    await update_knowledge(
+                        snap_pre, snap_post, damage_events, p1, p2,
+                        session=session, base_url=base_url, fuzzy_hp_pct=fuzzy_hp_pct,
+                    )
+                # Speed (move-order) + observed-flag pass runs every turn,
+                # including damage-free turns (status moves still reveal order).
+                await update_observed_and_speed(
+                    snap_pre, events_stream, p1, p2,
+                    session=session, base_url=base_url,
+                    p1_universe=p1_uni, p2_universe=p2_uni,
                 )
     finally:
         if own_session:
@@ -567,6 +583,303 @@ async def _process_event(
     _apply_total_ev_constraint(d_state[d_key])
 
 
+# ===========================================================================
+# Observed-flag marking + speed (move-order) inference
+# ===========================================================================
+#
+# Damage events tighten atk / spa / def / spd / hp. Speed is invisible to
+# the damage path entirely — yet move-order is the single most reliably
+# observable signal in a real game (any two mons that act reveal a relative
+# speed ordering). This block adds:
+#
+#   1. `mark_observed_from_events` — flips each roster mon's `observed` flag
+#      the moment it acts (uses a move) or is hit. Drives the `unknown`
+#      vs observed-but-wide distinction in the spread blocks.
+#
+#   2. `infer_speed_from_move_order` — a deliberately CONSERVATIVE upper-bound
+#      pass. A Choice Scarf only makes a mon faster, so "B resolved AFTER A"
+#      proves B is genuinely slower than A's *maximum possible* speed — a
+#      valid, monotonically-tightening upper bound on B's Spe EV. We only
+#      trust the slower direction, and only on clean turns:
+#        • no Trick Room (it inverts the order→speed mapping),
+#        • no Tailwind on either side, no Sticky Web on either side
+#          (speed multipliers we'd otherwise have to model),
+#        • no After You / Quash / Instruct (explicit order manipulation),
+#        • both moves priority-0 and damaging, neither called via
+#          Metronome/Dancer/etc. (priority abilities like Prankster only
+#          touch status moves; Gale Wings needs a Flying move — priority-0
+#          damaging excludes both),
+#        • the slower mon is not paralyzed (para is a speed *reduction*,
+#          so a para'd slow mon could secretly be fast).
+#
+# `update_observed_and_speed` runs both and is called from every place that
+# calls `update_knowledge` (the two `_safe_update_knowledge` copies + the
+# match-final pass), so both running and final states get speed + observed.
+
+_BASE_STATS_CACHE: dict[str, dict[str, int]] = {}
+_MOVE_INFO_CACHE: dict[str, dict[str, Any] | None] = {}
+_ORDER_MANIPULATION_MOVES = frozenset({"afteryou", "quash", "instruct"})
+
+
+async def get_base_stats(
+    session: aiohttp.ClientSession, base_url: str, species: str
+) -> dict[str, int]:
+    """Base-stat block for a species via the calc service's /dex/species.
+    Returns {} for unknown species (transformed forms, typos) so callers
+    can skip cleanly."""
+    key = species_key(species)
+    if key in _BASE_STATS_CACHE:
+        return _BASE_STATS_CACHE[key]
+    async with session.get(f"{base_url}/dex/species/{key}") as r:
+        if r.status == 404:
+            _BASE_STATS_CACHE[key] = {}
+            return {}
+        if r.status >= 400:
+            raise RuntimeError(f"/dex/species {r.status}")
+        data = await r.json()
+    bs = data.get("baseStats") or {}
+    _BASE_STATS_CACHE[key] = bs
+    return bs
+
+
+async def _get_move_info(
+    session: aiohttp.ClientSession, base_url: str, move: str
+) -> dict[str, Any] | None:
+    """Full /dex/move record (category, priority, target...). None if unknown."""
+    key = species_key(move)
+    if key in _MOVE_INFO_CACHE:
+        return _MOVE_INFO_CACHE[key]
+    async with session.get(f"{base_url}/dex/move/{key}") as r:
+        if r.status == 404:
+            _MOVE_INFO_CACHE[key] = None
+            return None
+        if r.status >= 400:
+            raise RuntimeError(f"/dex/move {r.status}")
+        info = await r.json()
+    _MOVE_INFO_CACHE[key] = info
+    return info
+
+
+def _speed_stat(base: int, ev: int, *, iv: int = 31, nature_mult: float = 1.0) -> int:
+    """Level-50 Speed stat from base + EV (+IV + nature). Standard Gen-9 formula."""
+    inner = (2 * base + iv + ev // 4) * 50 // 100 + 5
+    return int(inner * nature_mult)
+
+
+def _largest_spe_ev_at_or_below(base: int, ceiling: int) -> int | None:
+    """Largest EV in [0, 252] (step 4) whose neutral-nature, IV-31 Speed is
+    ≤ ceiling. Returns None when even EV 0 already exceeds the ceiling (an
+    inconsistent observation — skip rather than corrupt the bound).
+
+    Convention: we store the *neutral-equivalent* Spe EV, exactly like the
+    damage path stores neutral/IV-31-equivalent atk/def/etc. bounds. This
+    is provably valid: the ceiling is the faster mon's MAXIMUM possible
+    effective Speed (+nature), so the slower mon's true Speed ≤ ceiling;
+    its neutral-equivalent EV is therefore ≤ this returned bound, so we
+    never exclude the true value. Matching the damage convention keeps a
+    single EV-space across all six stats rather than mixing nature
+    assumptions within one entry.
+    """
+    if _speed_stat(base, 0, iv=31, nature_mult=1.0) > ceiling:
+        return None
+    last = 0
+    ev = 0
+    while ev <= 252:
+        if _speed_stat(base, ev, iv=31, nature_mult=1.0) <= ceiling:
+            last = ev
+            ev += 4
+        else:
+            break
+    return last
+
+
+def _slot_active_map(snap: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for side in ("p1", "p2"):
+        for a in (snap.get(side, {}) or {}).get("active", []) or []:
+            sl = a.get("slot")
+            if sl:
+                out[f"{side}{sl}"] = a
+    return out
+
+
+def _mark(state: KnowledgeState, key: str, universe: set[str] | None) -> None:
+    if universe is not None and key not in universe:
+        return  # transformed Ditto / Illusion — not a real roster spread
+    entry = state.setdefault(key, init_knowledge_entry())
+    entry["observed"] = True
+
+
+def mark_observed_from_events(
+    snap_pre: dict[str, Any],
+    events: list[dict[str, Any]],
+    p1_knowledge: KnowledgeState,
+    p2_knowledge: KnowledgeState,
+    *,
+    p1_universe: set[str] | None = None,
+    p2_universe: set[str] | None = None,
+) -> None:
+    """Flip `observed` for every roster mon that acted or was hit this turn."""
+    slot_map = _slot_active_map(snap_pre)
+
+    def state_for(side: str) -> tuple[KnowledgeState, set[str] | None]:
+        return (p1_knowledge, p1_universe) if side == "p1" else (p2_knowledge, p2_universe)
+
+    for ev in events:
+        if not isinstance(ev, dict) or ev.get("type") != "move":
+            continue
+        atk_slot = ev.get("attacker_slot", "")
+        atk = slot_map.get(atk_slot)
+        if atk and atk_slot[:2] in ("p1", "p2"):
+            st, uni = state_for(atk_slot[:2])
+            _mark(st, species_key(atk.get("species", "")), uni)
+        for hit in ev.get("hits") or []:
+            if hit.get("outcome") != "damage":
+                continue
+            dslot = hit.get("defender_slot", "")
+            d = slot_map.get(dslot)
+            if d and dslot[:2] in ("p1", "p2"):
+                st, uni = state_for(dslot[:2])
+                _mark(st, species_key(d.get("species", "")), uni)
+
+
+async def infer_speed_from_move_order(
+    snap_pre: dict[str, Any],
+    events: list[dict[str, Any]],
+    p1_knowledge: KnowledgeState,
+    p2_knowledge: KnowledgeState,
+    *,
+    session: aiohttp.ClientSession,
+    base_url: str,
+    p1_universe: set[str] | None = None,
+    p2_universe: set[str] | None = None,
+) -> None:
+    """Conservative move-order → Spe-upper-bound pass (see block comment)."""
+    field = snap_pre.get("field") or {}
+    pw = field.get("pseudoWeather") or {}
+    if any("trickroom" in species_key(k) for k in pw):
+        return
+    if field.get("tailwindP1") or field.get("tailwindP2"):
+        return
+    for side in ("p1", "p2"):
+        sc = (snap_pre.get(side, {}) or {}).get("sideConditions") or {}
+        if any("stickyweb" in species_key(k) for k in sc):
+            return
+
+    move_names = {
+        species_key(ev.get("move_name", ""))
+        for ev in events if isinstance(ev, dict) and ev.get("type") == "move"
+    }
+    if move_names & _ORDER_MANIPULATION_MOVES:
+        return
+
+    slot_map = _slot_active_map(snap_pre)
+
+    # Ordered sequence of clean, priority-0, damaging, natural move actions.
+    seq: list[dict[str, Any]] = []
+    for ev in events:
+        if not isinstance(ev, dict) or ev.get("type") != "move":
+            continue
+        if ev.get("called_via"):
+            continue
+        slot = ev.get("attacker_slot", "")
+        pkm = slot_map.get(slot)
+        if not pkm or slot[:2] not in ("p1", "p2"):
+            continue
+        info = await _get_move_info(session, base_url, ev.get("move_name", ""))
+        if info is None:
+            continue
+        if info.get("priority", 0) != 0:
+            continue
+        if info.get("category") not in ("Physical", "Special"):
+            continue
+        seq.append({"slot": slot, "side": slot[:2], "pkm": pkm})
+
+    # Every (earlier, later) cross-side pair within this single priority
+    # bracket is a valid faster/slower observation.
+    for i in range(len(seq)):
+        for j in range(i + 1, len(seq)):
+            faster, slower = seq[i], seq[j]
+            if faster["side"] == slower["side"]:
+                continue
+            if (slower["pkm"].get("status") or "") == "par":
+                continue  # para is a speed reduction — can't bound a slow para'd mon
+            await _apply_speed_upper_bound(
+                faster, slower, session, base_url,
+                p1_knowledge, p2_knowledge, p1_universe, p2_universe,
+            )
+
+
+async def _apply_speed_upper_bound(
+    faster: dict[str, Any],
+    slower: dict[str, Any],
+    session: aiohttp.ClientSession,
+    base_url: str,
+    p1_knowledge: KnowledgeState,
+    p2_knowledge: KnowledgeState,
+    p1_universe: set[str] | None,
+    p2_universe: set[str] | None,
+) -> None:
+    f_base = await get_base_stats(session, base_url, faster["pkm"].get("species", ""))
+    s_base = await get_base_stats(session, base_url, slower["pkm"].get("species", ""))
+    if not f_base or not s_base:
+        return  # unknown species (transformed) — skip
+
+    f_state = p1_knowledge if faster["side"] == "p1" else p2_knowledge
+    s_state = p1_knowledge if slower["side"] == "p1" else p2_knowledge
+    f_uni = p1_universe if faster["side"] == "p1" else p2_universe
+    s_uni = p1_universe if slower["side"] == "p1" else p2_universe
+    f_key = species_key(faster["pkm"].get("species", ""))
+    s_key = species_key(slower["pkm"].get("species", ""))
+    if (f_uni is not None and f_key not in f_uni) or (s_uni is not None and s_key not in s_uni):
+        return  # transformed / illusion — don't pollute roster spreads
+    f_entry = f_state.setdefault(f_key, init_knowledge_entry())
+    s_entry = s_state.setdefault(s_key, init_knowledge_entry())
+
+    # Ceiling = the faster mon's MAXIMUM possible effective Speed (its current
+    # max Spe EV, max IV, +nature). The slower mon is genuinely below this.
+    f_max_ev = f_entry["max_evs"]["spe"]
+    ceiling = _speed_stat(int(f_base["spe"]), int(f_max_ev), iv=31, nature_mult=1.1)
+    new_upper = _largest_spe_ev_at_or_below(int(s_base["spe"]), ceiling)
+
+    # Mark both involved regardless of whether the bound tightened.
+    f_entry["observed"] = True
+    s_entry["observed"] = True
+
+    if new_upper is None:
+        return  # inconsistent (priority/ability we couldn't see) — leave untouched
+    if new_upper < s_entry["max_evs"]["spe"]:
+        s_entry["max_evs"]["spe"] = new_upper
+        if s_entry["min_evs"]["spe"] > new_upper:
+            s_entry["min_evs"]["spe"] = new_upper
+
+
+async def update_observed_and_speed(
+    snap_pre: dict[str, Any],
+    events: list[dict[str, Any]],
+    p1_knowledge: KnowledgeState,
+    p2_knowledge: KnowledgeState,
+    *,
+    session: aiohttp.ClientSession,
+    base_url: str = DEFAULT_CALC_BASE_URL,
+    p1_universe: set[str] | None = None,
+    p2_universe: set[str] | None = None,
+) -> None:
+    """Run observed-marking + conservative speed inference for one turn.
+    Mutates both knowledge states in place. Best-effort: never raises into
+    the caller's per-turn loop (failures are swallowed by the caller's
+    try/except, but we also guard the speed pass internally)."""
+    mark_observed_from_events(
+        snap_pre, events, p1_knowledge, p2_knowledge,
+        p1_universe=p1_universe, p2_universe=p2_universe,
+    )
+    await infer_speed_from_move_order(
+        snap_pre, events, p1_knowledge, p2_knowledge,
+        session=session, base_url=base_url,
+        p1_universe=p1_universe, p2_universe=p2_universe,
+    )
+
+
 __all__ = [
     "TOTAL_EV_BUDGET",
     "DEFAULT_CALC_BASE_URL",
@@ -574,10 +887,13 @@ __all__ = [
     "FUZZY_HP_TOLERANCE",
     "KnowledgeState",
     "STATS",
+    "get_base_stats",
     "get_move_category",
     "init_knowledge",
     "init_knowledge_entry",
+    "mark_observed_from_events",
     "observed_damage_range",
     "species_key",
     "update_knowledge",
+    "update_observed_and_speed",
 ]

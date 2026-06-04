@@ -101,13 +101,7 @@ Total wall-clock: ~30 min. No API keys needed.
    cd pipeline && .venv/bin/python replay_parser.py
    ```
 
-6. **Bootstrap the canonical priors** (one-off, ~10 sec each):
-   ```bash
-   .venv/bin/python canonical_priors.py --format-id gen9vgc2026regi
-   .venv/bin/python canonical_priors.py --format-id gen9vgc2026regibo3
-   ```
-
-7. **Generate the dry-run previews** (~6 min Bo3, ~14 min Bo1 at
+6. **Generate the dry-run previews** (~6 min Bo3, ~14 min Bo1 at
    concurrency 8; can run in parallel):
    ```bash
    nohup .venv/bin/python master_pipeline.py \
@@ -176,7 +170,6 @@ source control:
 | `data_scraper/data/replays/` | Raw Showdown replays | ~134 MB | Scrape or ask Boyd for tarball |
 | `pipeline/parsed_data/bo{1,3}.jsonl` | Per-turn snapshots + events | ~290 MB | `replay_parser.py` (~15 sec) |
 | `pipeline/parsed_data/sft_preview_dry_run_bo{1,3}.jsonl` | Pre-rendered prompts | ~770 MB | `master_pipeline.py --dry-run` (~20 min) |
-| `pipeline/data/smogon_chaos_*.json` | Canonical priors caches | ~12 MB | `canonical_priors.py` (~10 sec) |
 
 ## Questions
 

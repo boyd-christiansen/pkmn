@@ -34,7 +34,7 @@ project, add it there too.**
 3. **Pipeline modules are leaf-isolated.** Sibling modules in `pipeline/`
    never import from each other. Only `master_pipeline.py` imports from
    the rest. This is what lets us swap the teacher LLM, the calc engine,
-   or the canonical-priors source without rewriting anything else.
+   or the spread-inference source without rewriting anything else.
 
 ## How to run things
 
@@ -47,14 +47,12 @@ cd calc_microservice && npm run dev   # → http://localhost:3000
 # 2. Scraper (one-off; produces data_scraper/data/replays/{format_id}/*.json)
 cd data_scraper && .venv/bin/python scrape.py
 
-# 3. Bootstrap canonical priors (one-off per format)
-cd pipeline && .venv/bin/python canonical_priors.py --format-id gen9vgc2026regi
-                                                    --format-id gen9vgc2026regibo3
-
-# 4. Parse + stitch replays → per-turn snapshots + events stream
+# 3. Parse + stitch replays → per-turn snapshots + events stream
 cd pipeline && .venv/bin/python replay_parser.py
+#    (Smogon canonical-priors bootstrap is GONE — Plan v9 removed the meta
+#     machinery; `unknown` is the spread fallback now.)
 
-# 5. Generate SFT training JSONL  (set GOOGLE_API_KEY — Gemini is the prod default since Plan v8)
+# 4. Generate SFT training JSONL  (set GOOGLE_API_KEY — Gemini is the prod default since Plan v8)
 cd pipeline && .venv/bin/python master_pipeline.py
 # Smoke-test without the LLM call:
 cd pipeline && .venv/bin/python master_pipeline.py --limit 1 --dry-run
@@ -106,8 +104,8 @@ pipeline/parsed_data/sft_training_data.jsonl   # one fine-tuning example per tur
 ## Known artifacts on disk (gitignored)
 
 - `data_scraper/data/replays/` — ~140 MB, 16,537 cached replay JSONs.
-- `pipeline/data/smogon_chaos_*.json` — Smogon usage data per format
-  (regi: 492 species; regibo3: 426 species, both as of 2026-04).
+- (`pipeline/data/smogon_chaos_*.json` — REMOVED in Plan v9 with the
+  rest of the Smogon meta machinery.)
 - `pipeline/parsed_data/{bo1,bo3}.jsonl` — parsed snapshots + events stream
   (TurnEvent discriminated union: move / switch / cant_move / tera / faint /
   item_event).
@@ -124,9 +122,11 @@ pipeline/parsed_data/sft_training_data.jsonl   # one fine-tuning example per tur
 - **Calc service must be running.** Almost everything in `pipeline/` calls
   `http://localhost:3000`. Start it first; both `replay_parser` and
   `master_pipeline` do a `/health` ping and bail with a clear message.
-- **Bootstrap canonical priors before generating SFT.** Otherwise
-  `threat_matrix` falls back to the curated table + heuristic for the
-  Probable track — still works, just less accurate for off-meta species.
+- **No Smogon meta machinery (Plan v9).** `canonical_priors.py` and the
+  chaos JSONs were deleted; the threat matrix renders ONLY the Absolute
+  envelope (no `| meta` / `(off-meta)` second track), and a spread with
+  no observation renders as `unknown` — not a canonical fallback. Don't
+  reintroduce a usage-prior into the per-turn prompt.
 - **Re-parse if `/parse_log` schema changes.** `replay_parser` is resumable
   — to force regeneration, delete `pipeline/parsed_data/{bo1,bo3}.jsonl`
   and rerun, or pass `--refetch`.
@@ -160,7 +160,7 @@ pipeline/parsed_data/sft_training_data.jsonl   # one fine-tuning example per tur
   type are known from turn 1 for both players. The Bo3 system prompt
   shows both teams in full with ★ markers on P1's brought 4, **no
   Masking Rule**. EVs / IVs / Nature stay hidden in OTS too, so the
-  dual-track inferencer continues to do the heavy spread-bound lifting.
+  damage + speed inferencer continues to do the heavy spread-bound lifting.
 - **Bench rendering: parser is symmetric, perspective is applied in
   Python.** The Node parser emits `bench` for BOTH sides as the full
   pre-scanned brought-set (every species ever switched in across the
@@ -174,6 +174,40 @@ pipeline/parsed_data/sft_training_data.jsonl   # one fine-tuning example per tur
   learns the opponent's selection as they switch in). Symmetric
   parser output makes `flip_match_to_winner` clean — no asymmetric
   data to reconstruct after the swap.
+- **Six-roster model (Plan v9).** Both SPREADS blocks render the FULL
+  known roster per side (all 6 in Bo3 from team sheets; revealed-so-far
+  in Bo1), not just the active pair — YOUR SPREADS previously dropped
+  the bench. The only spread states are: bounds, `unknown` (the single
+  fallback; replaces "(no observations yet)"), and an unknown-brought-
+  slot placeholder. Reg I brings 4, but the brought-4 is NEVER in the
+  data (only usage is), so when identifiable brings < 4 the BENCH renders
+  an explicit placeholder ("brought, never sent" for P1; "identity not
+  yet revealed" for P2). Never emit a "not-brought" state. See
+  `prompt_formatting._brought_placeholder_lines` + `REG_I_BRING_COUNT`.
+- **Field state lives ONLY in the ledger (Plan v9).** The user-prompt
+  header no longer carries a `Field:` line; weather / terrain / Trick
+  Room / per-side Tailwind / screens render once, in the GAME-STATE
+  LEDGER, each as `(N turns left)`. Don't reintroduce a header field
+  token — it's a second representation to drift.
+- **Speed (move-order) + observed inference (Plan v9).** Damage only
+  tightens atk/spa/def/spd/hp; `damage_inferencer.update_observed_and_speed`
+  adds (a) an `observed` flag per mon (True once it deals/takes damage
+  or reveals move order — the causal definition of NOT-`unknown`), and
+  (b) a conservative Spe upper-bound from "moved-after a known mon"
+  (Scarf-safe: a Choice Scarf only speeds a mon up, so moved-after ⇒
+  genuinely slower). Needs base stats via the new `/dex/species` Node
+  endpoint; skips Trick Room / tailwind / sticky-web / paralysis /
+  After-You-Quash-Instruct turns; only trusts priority-0 damaging pairs.
+  Called from both `_safe_update_knowledge` copies + the match-final
+  pass, gated by per-side roster-key sets so a transformed Ditto can't
+  pollute a real slot.
+- **Action-legality validator (Plan v9).** `validate_action_legality.py`
+  scans the corpus for labels that contradict their own state
+  (choice-lock, tera-after-used, OTS moveset-membership). Labels are
+  real human plays, so any hit is a DATA BUG. It found a small
+  choice-lock false-positive (`snapshotChoiceLock` over-eager) + an OTS
+  moveset-decode mismatch — both tracked in notes/TODO.md. Encore/Disable
+  (boolean only) + trapping (uncaptured) can't be hard-masked yet.
 - **Series-winner-as-P1.** Every SFT example is generated from the
   perspective of the player who won the series. `flip_match_to_winner`
   in `master_pipeline.py` rewrites the entire match record (players,

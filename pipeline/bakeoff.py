@@ -35,7 +35,6 @@ from typing import Any
 import aiohttp
 import click
 
-import canonical_priors  # noqa: F401  — imported for symmetry with master_pipeline
 import damage_inferencer
 import threat_matrix
 from master_pipeline import (
@@ -528,8 +527,8 @@ def cli(input_paths, match_id, limit, providers_csv, output_dir, calc_base_url, 
         sys.exit(1)
 
     # Build target list across all --input files. Each element is
-    # (match_record, format_id) — the format_id is per-file so that
-    # Bo3 and Bo1 inputs get different canonical_priors lookups.
+    # (match_record, format_id) — the format_id is per-file (Bo3 vs Bo1)
+    # and rides along on each saved SFT row.
     target_records: list[tuple[dict[str, Any], str]] = []
     for ipath in input_paths:
         ipath = Path(ipath)

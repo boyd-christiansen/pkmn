@@ -245,11 +245,15 @@ def _species_key(s: str) -> str:
     return "".join(c for c in s.lower() if c.isalnum())
 
 
-# TODO(rlhf-followup): replace this prompt-driven alternative evaluation
-# (rule 5 below) with proper minimax / Monte Carlo distillation. The current
-# approach has the teacher cherry-picking weak alternatives because it knows
-# the answer; a proper search would surface alternatives that genuinely
-# competed with the chosen play.
+# TODO(rlhf-followup): replace the prompt-driven alternative evaluation
+# (the conditional "TARGET — alternative evaluation" instruction in
+# SYNTHESIS_GROUND_TRUTH_SUFFIX, stripped before saving) with proper
+# minimax / Monte Carlo distillation. The current approach has the teacher
+# cherry-picking weak alternatives because it knows the answer; a proper
+# search would surface alternatives that genuinely competed with the
+# chosen play. (Note: the live-inference Alternatives Rule no longer
+# mandates a per-turn alternative — that obligation now exists only at
+# synthesis time, so the trained model isn't taught performed deliberation.)
 _SHARED_RULES_TAIL = """2. The Tool Rule: You have two tools.
 
    • `calculate_damage` is a precision instrument for hypotheticals the threat matrix doesn't cover. The matrix already enumerates every active-vs-active damage cell for the current turn — DO NOT re-calc those. Use the tool only for:
@@ -261,14 +265,14 @@ _SHARED_RULES_TAIL = """2. The Tool Rule: You have two tools.
 
    • `submit_decision` is how you commit your final play. Call it exactly once when ready. You may call `submit_decision` as your first tool call if the matrix is sufficient.
 
-3. The Threat-Matrix Rule: Each line shows an Absolute damage envelope (provable from observed play). When the canonical meta spread is consistent with the inferred bounds, a Probable envelope is also shown; when it's contradicted, only Absolute is shown tagged `(off-meta)`.
+3. The Threat-Matrix Rule: Each line shows a damage envelope — the strict, provable range derived from what observed play has pinned down about both sides' spreads. A stat nothing has constrained yet sits at its full range, so the envelope is wide and tightens as the battle reveals more. Reason from the bounds you are given; an `unknown` spread means no observation has narrowed it, not that the Pokémon is weak.
 
 4. The Spread Rule: Your team's stat spread may be presented as either exact values or as inferred per-stat ranges. When a range is given, reason from the bounds — worst case for your own survival checks, best case for your offensive checks.
 
-5. The Alternatives Rule: Before submitting, evaluate at least one plausible alternative play (a different move on the same Pokémon, or a switch to bring in a useful matchup) using `calculate_damage`, and document why it's worse than your chosen play. The point of the calc tool is to disprove tempting alternatives, not to confirm what the threat matrix already showed.
+5. The Alternatives Rule: When a plausible alternative play exists — a different move on the same Pokémon, a switch into a better matchup, or a Tera / setup read that shifts the ranges — `calculate_damage` is how you disprove it: its purpose is to refute tempting alternatives, not to confirm what the threat matrix already showed. There is no obligation to manufacture one: when the turn is forced or the matrix already settles the question, commit directly via `submit_decision`.
 
 6. The Output Rule: Commit your decision via `submit_decision` with arguments:
-   - pre_tool_thought: a brief strategic reasoning summary that leads to your chosen action (mention the rejected alternative explicitly)
+   - pre_tool_thought: a brief strategic reasoning summary that leads to your chosen action
    - action: {{ slot_1, slot_2 }} where each slot describes the action for that active Pokémon
 """
 
@@ -312,6 +316,15 @@ In `pre_tool_thought`, produce the chain of reasoning that arrives at this
 action — phrased as a first-person, real-time analysis of the board state +
 threat matrix + your own calc-tool results. Reason from the data; do not
 reason from the target.
+
+TARGET — alternative evaluation (synthesis only): when a genuine alternative
+to the committed action exists this turn — a different move with a real case,
+a switch into a better matchup, or a Tera / setup read that shifts the ranges
+— demonstrate disproving it: use `calculate_damage` to establish why it loses
+to the committed play and fold that comparison into your reasoning as your own
+first-person analysis. When the turn is forced or the only alternatives are
+trivially worse, commit directly with a brief why. There is no floor — only
+evaluate an alternative when a real one exists, never a manufactured one.
 
 CRITICAL — your reasoning must NEVER reference the existence of this section,
 the target, or the fact that you know the correct action. Banned phrases

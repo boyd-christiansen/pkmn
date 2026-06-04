@@ -14,8 +14,8 @@ without touching the others.
 | Directory | Runtime | What it does |
 |---|---|---|
 | [`data_scraper/`](data_scraper/) | Python 3.11+ | Pulls top-500 ladder users + all their saved replays from Pokémon Showdown. |
-| [`calc_microservice/`](calc_microservice/) | Node 20+ / TS | HTTP service wrapping `@smogon/calc` (`POST /calc`), `@pkmn/client` + `@pkmn/sets` (`POST /parse_log` — per-turn snapshots, `events` stream, and Bo3 OTS `teamSheets`), and `@pkmn/dex` (`GET /dex/move/:name`). |
-| [`pipeline/`](pipeline/) | Python 3.11+ | Atomic modules that turn raw replays into SFT-ready conversational training data. Inference modules (`replay_parser`, `canonical_priors`, `damage_inferencer`, `threat_matrix`); orchestration helpers split out of the orchestrator (`team_reconstruction`, `action_extraction`, `prompt_formatting`); the orchestrator + CLI (`master_pipeline` with `--mode {sync,batch,hybrid}`); a [`teacher/`](pipeline/teacher/README.md) sub-package holding the `TeacherProvider` ABC plus OpenAI / Anthropic / Google adapters, a `judge.py` model-judge validator, and a `batch_openai.py` Batch API adapter; a `batch_runner.py` sibling implementing the per-cycle state machine for batch mode; and a head-to-head `bakeoff` runner (OpenAI won — see status below). |
+| [`calc_microservice/`](calc_microservice/) | Node 20+ / TS | HTTP service wrapping `@smogon/calc` (`POST /calc`), `@pkmn/client` + `@pkmn/sets` (`POST /parse_log` — per-turn snapshots, `events` stream, and Bo3 OTS `teamSheets`), and `@pkmn/dex` (`GET /dex/move/:name`, `GET /dex/species/:name`). |
+| [`pipeline/`](pipeline/) | Python 3.11+ | Atomic modules that turn raw replays into SFT-ready conversational training data. Inference modules (`replay_parser`, `damage_inferencer`, `threat_matrix`); a read-only corpus validator (`validate_action_legality`); orchestration helpers split out of the orchestrator (`team_reconstruction`, `action_extraction`, `prompt_formatting`); the orchestrator + CLI (`master_pipeline` with `--mode {sync,batch,hybrid}`); a [`teacher/`](pipeline/teacher/README.md) sub-package holding the `TeacherProvider` ABC plus OpenAI / Anthropic / Google adapters, a `judge.py` model-judge validator, and a `batch_openai.py` Batch API adapter; a `batch_runner.py` sibling implementing the per-cycle state machine for batch mode; and a head-to-head `bakeoff` runner (OpenAI won — see status below). |
 | [`inspector/`](inspector/) | Python 3.11+ (FastAPI) | Local read-only web UI for browsing saved SFT rows + their source data. Splits prompts into structured sections, shows the calc-tool loop step-by-step, and cross-references by `(match_id, game_index, turn)` against `pipeline/parsed_data/`. Listens on port 8001 — doesn't talk to the calc service. |
 | [`notes/`](notes/) | — | The project's writing surface. [`pipeline_walkthrough.md`](notes/pipeline_walkthrough.md) is the long-form design doc; [`TODO.md`](notes/TODO.md) is the master tracker for non-shipped work (active workstreams, code-level TODOs, long-horizon plans, data-sourcing options). |
 
@@ -37,20 +37,18 @@ Pokémon Showdown
 │         │                                                                │
 │         ▼  per-turn snapshots (JSONL)                                    │
 │                                                                          │
-│  canonical_priors.py  (pure data lookup, no network)                     │
-│         │                                                                │
-│         ▼                                                                │
-│  damage_inferencer.py ── /calc, /dex/move ▶  calc_microservice           │
+│  damage_inferencer.py ── /calc, /dex/move, /dex/species ▶ calc_microsvc  │
 │         ▲ │   (two-way binary search → tightens                          │
 │         │ │    KnowledgeState (p1) AND KnowledgeState (p2) atomically;   │
 │         │ │    `infer_match_final_bounds` runs across the full match     │
-│         │ │    once to surface "match-final P1 bounds" in YOUR SPREADS)  │
+│         │ │    once to surface "match-final P1 bounds" in YOUR SPREADS;  │
+│         │ │    `update_observed_and_speed` sets per-mon `observed` +     │
+│         │ │    a move-order Speed upper-bound)                           │
 │         │ ▼                                                              │
 │  threat_matrix.py     ── /calc, /dex/move ▶  calc_microservice           │
-│         │   (Absolute envelope from asymmetric (p1_final, p2_running);   │
-│         │    Probable envelope from canonical_priors;                    │
-│         │    when the prior is ≥40-EV-clipped, drop the meta             │
-│         │    column and tag the line `(off-meta)`)                       │
+│         │   (Absolute envelope only — strict provable range from both    │
+│         │    sides' inferred KnowledgeState bounds; an unconstrained     │
+│         │    stat renders the word `unknown`)                            │
 │         ▼                                                                │
 │  teacher/             ── HTTP ────────────▶  frontier model              │
 │   (base + openai/anthropic/google adapters behind one ABC;               │
@@ -123,23 +121,7 @@ python3 -m venv .venv
 
 → writes to `pipeline/parsed_data/{bo1,bo3}.jsonl`
 
-### 4. Bootstrap canonical priors *(one-off, ~10 seconds per format)*
-
-Before generating training data, populate the local Smogon Chaos cache so
-the threat matrix's Probable track uses real ladder usage data:
-
-```bash
-cd pipeline
-.venv/bin/python canonical_priors.py --format-id gen9vgc2026regi
-.venv/bin/python canonical_priors.py --format-id gen9vgc2026regibo3
-```
-
-Walks back from the current month until a 200 OK chaos file is found; saves
-to `pipeline/data/smogon_chaos_<format_id>.json`. Run again whenever you want
-fresher data. Without this, `canonical_priors` falls back to a curated table
-+ heuristic (still works, just less accurate for off-meta species).
-
-### 5. Generate the SFT training dataset
+### 4. Generate the SFT training dataset
 
 For each turn in each match, the orchestrator chains the library modules:
 
@@ -157,11 +139,10 @@ For each turn in each match, the orchestrator chains the library modules:
    reverse-engineer P1's two-slot decision from the `events` stream
    (`move` / `switch` / `cant_move` events; `forced_by` filtering for
    intentional vs forced switches). Skip the turn if ambiguous.
-4. **`threat_matrix.generate_threat_matrix(snap, "p1", p1_final, p2_running, format_id=…)`**
-   — dual-track text block: Absolute envelope from the **asymmetric**
-   (match-final-P1, chronological-P2) pair, Probable envelope from
-   canonical priors. When the prior is ≥40-EV-clipped, the meta column
-   is dropped and the line tagged `(off-meta)`.
+4. **`threat_matrix.generate_threat_matrix(snap, "p1", p1_final, p2_running)`**
+   — Absolute-only text block: the strict provable damage envelope from
+   the **asymmetric** (match-final-P1, chronological-P2) KnowledgeState
+   pair. An unconstrained stat renders the word `unknown`.
 5. **`format_user_prompt(...)`** — composes the full user prompt:
    board state, GAME-STATE LEDGER (faints / Tera-used / Cumulative
    damage / volatiles / choice locks), TURN-BY-TURN (full prior
@@ -223,7 +204,7 @@ ANTHROPIC_API_KEY=sk-... .venv/bin/python master_pipeline.py \
 (keyed by `(match_id, game_index, turn)`). Per-match atomic commit:
 a match either lands complete or not at all.
 
-### 6. (Optional) Inspect the generated SFT data
+### 5. (Optional) Inspect the generated SFT data
 
 The inspector is a local read-only web UI that browses every JSONL file
 under `pipeline/parsed_data/` — prompts split into structured sections,
@@ -248,11 +229,11 @@ endpoints, schema-awareness notes, and the "what it doesn't do" list.
 | Component | State |
 |---|---|
 | `data_scraper` | Working. 16,537 replays cached locally across both Reg I formats. |
-| `calc_microservice` | Working. Three endpoints: `POST /calc` (damage math), `POST /parse_log` (Showdown log → turn snapshots), `GET /dex/move/:name` (move metadata). |
+| `calc_microservice` | Working. Four endpoints: `POST /calc` (damage math), `POST /parse_log` (Showdown log → turn snapshots), `GET /dex/move/:name` (move metadata incl. `priority`), `GET /dex/species/:name` (base stats / types / weight). |
 | `pipeline/replay_parser.py` | Working. ETL CLI; captures per-turn `events` (TurnEvent[]) from `/parse_log` straight into `parsed_data/{bo1,bo3}.jsonl`. |
-| `pipeline/canonical_priors.py` | Working. Library + bootstrap CLI. Real Smogon Chaos JSON when cached on disk; curated table + heuristic fallback. |
-| `pipeline/damage_inferencer.py` | Working. Dual-state, two-way binary search, atomic application, 508-EV constraint pass, crit-aware (via `/calc isCrit`), multi-hit filter, `events_to_damage_events()` filter that excludes non-own-move callers (Metronome / Copycat / Sketch / Snatch / Me First / Dancer / Instruct / Mirror Move / Assist / Nature Power; Sleep Talk allowed). Plus `infer_match_final_bounds()` for the match-final P1 spreads surfaced in YOUR SPREADS. |
-| `pipeline/threat_matrix.py` | Working. Dual-track Absolute + Probable output, driven by the **asymmetric** (match-final-P1, chronological-P2) knowledge pair. When canonical priors are ≥40-EV-clipped by the inferred bounds, the Probable column is dropped and the line tagged `(off-meta)`. Optional `format_id` drives chaos-backed priors. |
+| `pipeline/damage_inferencer.py` | Working. Dual-state, two-way binary search, atomic application, 508-EV constraint pass, crit-aware (via `/calc isCrit`), multi-hit filter, `events_to_damage_events()` filter that excludes non-own-move callers (Metronome / Copycat / Sketch / Snatch / Me First / Dancer / Instruct / Mirror Move / Assist / Nature Power; Sleep Talk allowed). Plus `infer_match_final_bounds()` for the match-final P1 spreads surfaced in YOUR SPREADS, and `update_observed_and_speed()` (per-mon `observed` flag + move-order Speed upper-bound, base stats via `/dex/species`). |
+| `pipeline/threat_matrix.py` | Working. Absolute-only output — the strict provable damage envelope driven by the **asymmetric** (match-final-P1, chronological-P2) knowledge pair. An unconstrained stat renders the word `unknown`. |
+| `pipeline/validate_action_legality.py` | Working. Read-only corpus validator. Scans SFT labels for actions that contradict their own turn state (choice-lock, tera-after-used, OTS moveset-membership) — since labels are real human plays, any violation is a data bug. Run `python validate_action_legality.py`. |
 | `pipeline/teacher/` (sub-package: `base.py` + `openai.py` / `anthropic.py` / `google.py` / `judge.py` / `batch_openai.py`, re-exported via `__init__.py`) | Working. Provider-agnostic `TeacherProvider` ABC; tool-use loop with `calculate_damage` + `submit_decision`. The model has only one output channel — tool calls — so it can't bypass the calc tool. Two system-prompt templates: Bo1 CTS (Masking Rule + reconstructed team) vs Bo3 OTS (full sheets + ★ brought-flag). Present-tense framing throughout. Plus `judge.py` (match-level model-judge validator) and `batch_openai.py` (`BatchTeacherProvider` ABC + OpenAI Batch API adapter). |
 | `pipeline/batch_runner.py` | Working. Per-iteration state machine for `--mode batch`: bundles all in-flight turns at iter=K into one batch upload, runs calc microservice calls synchronously between cycles, persists `BatchWorkItem` state in `batch_state/{match_id}.json`. Supports `--resume` via `active_batch_id` breadcrumbs. Also hosts `_prepare_match_turns()`, the shared sync-and-batch prep helper. |
 | `pipeline/master_pipeline.py` | Working. CLI orchestrator with `--mode {sync,batch,hybrid}` dispatcher. `flip_match_to_winner` makes every example come from the series winner's perspective. Three historical-context blocks in the user prompt (GAME-STATE LEDGER / TURN-BY-TURN / SERIES STATE). YOUR SPREADS surfaces match-final P1 bounds (Plan v3). Per-match buffered write + judge integration (Plan v4). Empty-slot annotation. Perspective-aware bench gating. `--provider {openai,anthropic,google}` flag; batch is OpenAI-only in v1. Resumable. |

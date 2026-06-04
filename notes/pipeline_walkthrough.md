@@ -77,13 +77,14 @@ The reasons are real game mechanics, not laziness:
 Smogon publishes the official TS state machine (`@pkmn/client`). It costs
 us one Node service to use it instead of reinventing it.
 
-The service exposes three endpoints:
+The service exposes four endpoints:
 
 | Endpoint | Backed by | Purpose |
 |---|---|---|
 | `POST /calc` | `@smogon/calc` | Damage range for one (attacker, move, defender, field). Accepts `isCrit`. |
 | `POST /parse_log` | `@pkmn/protocol` + `@pkmn/client` + `@pkmn/sets` | Raw log → per-turn snapshots + per-turn `events` (TurnEvent discriminated union: move / switch / cant_move / tera / faint / item_event) + Bo3 `teamSheets` (Open Team Sheet decoded from `\|showteam\|`). |
-| `GET /dex/move/:name` | `@pkmn/dex` | Move metadata (category, type, base power). Used to skip Status moves. |
+| `GET /dex/move/:name` | `@pkmn/dex` | Move metadata (category, type, base power, `priority`). Used to skip Status moves. |
+| `GET /dex/species/:name` | `@pkmn/dex` | Species base stats / types / weight (`{name, id, baseStats, types, weightkg}`). Added in Plan v9 for move-order Speed inference. |
 
 ---
 
@@ -408,7 +409,8 @@ that hasn't narrowed below an arbitrary width:
 - Both sides tightened → `Stat lo–hi`
 - Pinned to a single value → `Stat N`
 - Fully open `[0, 252]` → not shown; trailing `, others ?` summarizes them
-- Mon with no observations yet → `(no observations yet)`
+- Mon with no constraints at all → `unknown` (the single fallback state;
+  Plan v9 replaced the old `(no observations yet)` string)
 
 Concrete example from a real bake-off Bo3:
 `Calyrex-Ice: Hp ≥244, Atk ≤8, Def 28–36, Spa ≤8, Spd 228–236, Spe ≤8`
@@ -424,30 +426,36 @@ team-builder JSON instead of inferred ranges; the trained model is
 robust to either form.
 
 **Acknowledged implicit leak.** Mons that never took damage in the
-match render as `(no observations yet)`. A student model could in
-principle learn "if Kingambit shows '(no observations yet)' in YOUR
-SPREADS, then Kingambit never took damage in this match." Plan v3
-flagged this as accepted risk; a follow-up workstream
-(canonical-prior substitution for fully-open stats) would mask the
-signal at the cost of slightly fictional spreads in some cases.
+match render as `unknown`. A student model could in principle learn
+"if Kingambit shows `unknown` in YOUR SPREADS, then Kingambit never
+took damage in this match." Plan v3 flagged this as accepted risk.
+Plan v9 addresses it **structurally** rather than by substituting a
+fictional spread: the full six-roster render plus the
+unknown-brought-slot placeholders mean `unknown` is now the expected
+baseline for any mon that simply hasn't been hit yet, so its presence
+carries far less signal than it did when only the 2 active mons were
+shown. (The old canonical-prior-substitution idea is moot — the
+canonical-priors machinery was deleted in v9.)
 
-### Step 6 — Threat matrix: dual-track damage envelope
+### Step 6 — Threat matrix: the Absolute damage envelope
 
 For each turn, we render the damage landscape between the active
-Pokémon. Two damage tracks per matchup-move:
+Pokémon. One damage track per matchup-move:
 
 - **Absolute** — strict math from KnowledgeState bounds. Wide, but
   provable.
-- **Probable (meta)** — single calc result assuming both Pokémon run
-  their canonical Smogon meta spread (from `canonical_priors`). Narrow,
-  fast — but only as good as the prior.
 
-**When the prior is wrong, we drop it.** When the canonical spread is
-clipped from the inferred bounds by **≥ 40 EVs** on any relevant stat
-(off-stat for the attacker prior, HP / def-stat for the defender), we
-skip the Probable calc entirely and tag the line `(off-meta)`. Showing
-a "Probable" range we've already disproven would actively mislead the
-LLM. The 40-EV threshold avoids firing on edge-case clips of 1–10 EVs.
+**No meta track (Plan v9).** Earlier versions carried a second
+"Probable (meta)" track — a single calc assuming both Pokémon ran their
+canonical Smogon spread (from `canonical_priors`), with a `(off-meta)`
+tag when the inferred bounds had already disproven that prior. Plan v9
+deleted the whole Smogon meta machinery: `canonical_priors.py` and the
+`smogon_chaos_*.json` caches are gone, and the matrix now renders the
+Absolute envelope only. An unconstrained stat shows the word `unknown`
+rather than a canonical guess. The motivation: the Absolute range is the
+only thing we can actually *prove*, and a "Probable" range we hadn't yet
+disproven was a soft form of the oracle leak we work so hard to avoid
+elsewhere.
 
 **Chip filter and spread grouping.** Two presentation tweaks make the
 matrix decision-relevant rather than exhaustive:
@@ -462,38 +470,34 @@ matrix decision-relevant rather than exhaustive:
   `field.gameType: "Doubles"`.
 
 **Real example** (turn 3 of a Bo3 game where Chi-Yu has been Snarl'd
-to -2 SpA and the inferencer has therefore proven the prior wrong on
-all of Chi-Yu's offensive plays):
+to -2 SpA, which the inferencer reflects directly in the Absolute
+bounds):
 
 ```
 === THREAT MATRIX  (turn 3, us=p1) ===
 
 --- OUTGOING (us → opp) ---
 [us Miraidon]  (boosts={spa: -2})
-  Electro Drift → Chi-Yu      29.5%–44.6%  | meta 35.8%–42.3%  [guaranteed 3HKO]
-  Electro Drift → Lunala       7.8%–15.1%  | meta 11.3%–13.3%  [possible 8HKO]
-  Volt Switch  → Chi-Yu      20.5%–32.3%  | meta 24.8%–30.7%  [99.9% chance to 4HKO]
-  Draco Meteor → Chi-Yu      29.5%–44.6%  | meta 35.8%–42.3%  [guaranteed 3HKO]
+  Electro Drift → Chi-Yu      29.5%–44.6%  [guaranteed 3HKO]
+  Electro Drift → Lunala       7.8%–15.1%  [possible 8HKO]
+  Volt Switch  → Chi-Yu      20.5%–32.3%  [99.9% chance to 4HKO]
+  Draco Meteor → Chi-Yu      29.5%–44.6%  [guaranteed 3HKO]
   …plus 1 chip move(s): Snarl
 
 --- INCOMING (opp → us) ---
 [opp Chi-Yu]  (boosts={spe: -1, spa: -2})
-  Dark Pulse  → Miraidon       17.3%–22.3%  [possible 5HKO]  (off-meta)
-  Heat Wave [spread]: Miraidon 11.7%–13.7%, Iron Bundle 47.8%–62.6%  [Iron Bundle: guaranteed 2HKO]  (off-meta)
-  Overheat   → Iron Bundle    85.5%–116.8%  [87.5% chance to OHKO]  (off-meta)
+  Dark Pulse  → Miraidon       17.3%–22.3%  [possible 5HKO]
+  Heat Wave [spread]: Miraidon 11.7%–13.7%, Iron Bundle 47.8%–62.6%  [Iron Bundle: guaranteed 2HKO]
+  Overheat   → Iron Bundle    85.5%–116.8%  [87.5% chance to OHKO]
 [opp Lunala]
-  Moongeist Beam → Iron Bundle  76.1%–119.8%  | meta 109.1%–129.5%  [guaranteed OHKO]
-  Meteor Beam   → Iron Bundle  179.7%–287.0%  | meta 260.6%–307.6%  [guaranteed OHKO]
+  Moongeist Beam → Iron Bundle  76.1%–119.8%  [guaranteed OHKO]
+  Meteor Beam   → Iron Bundle  179.7%–287.0%  [guaranteed OHKO]
 ```
 
-Notice four things at once:
+Notice three things at once:
 - **Volatile state in the calc** — Miraidon's `spa: -2` from Snarl is
   threaded through Electro Drift / Volt Switch / Draco Meteor; numbers
   are real-board numbers, not sterile-lab.
-- **`(off-meta)` on Chi-Yu's outgoing** — the inferencer has proven
-  Chi-Yu's SpA is clipped well below the canonical "max SpA Modest"
-  prior (Snarl-stacking does this fast), so the Probable column is
-  dropped entirely.
 - **`Heat Wave [spread]` as one line** — the 0.75× spread modifier is
   baked into the per-defender numbers, and both Miraidon and Iron
   Bundle's ranges sit on a single row.
@@ -510,33 +514,28 @@ game, every attacker's `revealedMoves` is empty — the threat matrix
 section for that turn is therefore basically empty too, and gets
 gradually fleshed out as moves come into view.
 
-### Step 7 — Canonical priors: what does "meta" mean?
+### Step 7 — Canonical priors: removed in Plan v9
 
-The Probable track is only useful if "the canonical spread" is real. We
-fetch monthly Smogon usage stats:
+This step used to describe the **Probable (meta)** track — a monthly
+Smogon usage cache (`canonical_priors.py` + `smogon_chaos_*.json`) that
+gave each species its most-used spread so the threat matrix could show
+a narrow "meta" range alongside the wide Absolute one, dropping it with
+an `(off-meta)` tag once the inferred bounds clipped the prior by ≥ 40
+EVs.
 
-```
-https://www.smogon.com/stats/{YYYY-MM}/chaos/{format_id}-0.json
-```
-
-…walk back month by month until we find a 200, save to disk, and look up
-the per-species `Spreads` dict at runtime. Take the single most-used
-spread (`"Nature:hp/atk/def/spa/spd/spe"`), parse it, return.
-
-**A non-obvious example from our 2026-04 cache:**
-
-> `Iron Hands` → **Brave 76 / 180 / 12 / 0 / 236 / 0**
-
-That's a Trick Room set (Brave nature = -Spe, 0 Spe EVs). NOT the obvious
-"max Atk / max HP" you'd get from a base-stat heuristic. This is signal
-you can't synthesize — it requires actual usage data.
-
-For the running example's Iron Valiant: Smogon's most-used is **Jolly
-0/252/0/0/4/248** (a physical sweeper). But our human player's Iron
-Valiant used Quick Guard — pointing at a *support* build, not the standard
-sweeper. That's exactly the kind of off-meta call the threat matrix's
-`(off-meta)` tag will eventually fire on once enough evidence builds
-up to clip the prior by ≥ 40 EVs.
+**Plan v9 deleted the whole thing.** The Probable track always carried a
+tension: it was a *guess*, not a proof, and the moment the model leaned
+on it we were teaching it to reason from canonical assumptions the board
+hadn't actually established — a soft cousin of the oracle leak. The
+running example made the tension concrete: Smogon's most-used Iron
+Valiant is the Jolly `0/252/0/0/4/248` physical sweeper, but our human
+player's Iron Valiant used Quick Guard, a *support* build the meta prior
+would have mis-described until enough damage accrued to clip it. Rather
+than keep tuning the clip threshold, v9 dropped the prior entirely. The
+matrix now shows only what it can prove from the dual-state inferencer,
+and an unconstrained stat reads `unknown`. The machinery that *does*
+narrow spreads — the binary-search inferencer of Step 5, plus the new
+move-order Speed bound (Step 13) — stays.
 
 ---
 
@@ -619,9 +618,10 @@ adapters all behind one `TeacherProvider` ABC.)
 system: "You are a top-tier competitive VGC Reg I player…
          [format-specific rule 1] [Tool] [Threat-Matrix] [Spread] [Alternatives] [Output]"
 
-user:   [board state: turn N, field, P1/P2 active+bench]
-        [YOUR SPREADS (inferred per-stat ranges)]
-        [threat matrix: Absolute + Probable, off-meta lines drop Probable]
+user:   [board state: turn N, P1/P2 active+bench]
+        [GAME-STATE LEDGER: faints, field effects w/ turns-left, volatiles, …]
+        [YOUR SPREADS / OPP SPREADS (full roster, per-stat ranges)]
+        [threat matrix: Absolute envelope only, unconstrained stats = unknown]
         ────── EXPERT'S DECISION (oracle truth) ──────
         { "slot_1": {"action_type": "move", "move": "Volt Switch", ...},
           "slot_2": {"action_type": "move", "move": "quickguard", ...} }
@@ -656,16 +656,20 @@ only on rule 1):
    minimum was dropped — it was creating redundant calc calls.
    `MAX_CALC_CALLS_BEFORE_FORCE_SUBMIT = 5` is the upper cap; past 5
    calc calls the next iteration forces `submit_decision`.
-3. **Threat-Matrix Rule** — each line shows Absolute (provable) and,
-   when not contradicted, Probable (meta). Off-meta lines tagged
-   `(off-meta)` show only Absolute.
+3. **Threat-Matrix Rule** — each line is the Absolute (provable) damage
+   envelope. (Plan v9 removed the old Probable / `(off-meta)` track.)
 4. **Spread Rule** — your spreads may be exact values or inferred
    ranges. With ranges: worst-case for survival, best-case for offense.
-5. **Alternatives Rule** *(known limitation)* — briefly evaluate 1–2
-   plausible alternatives (other moves, switches) before committing.
-   `# TODO(rlhf-followup)`: this prompt-driven approach lets the
-   teacher cherry-pick weak alternatives because it knows the answer;
-   real fix is minimax / MCTS distillation in a separate workstream.
+5. **Alternatives Rule** *(split in Plan v9)* — the live-inference rule
+   no longer mandates evaluating an alternative every turn; that
+   contradicted the Tool Rule's "no per-turn minimum", and at live
+   inference the model should commit immediately when the matrix settles
+   the question. The mandatory-alternative obligation moved into
+   `SYNTHESIS_GROUND_TRUTH_SUFFIX` as a **conditional, synthesis-only**
+   instruction (stripped before saving). `# TODO(rlhf-followup)`: even
+   at synthesis time this prompt-driven approach lets the teacher
+   cherry-pick weak alternatives because it knows the answer; the real
+   fix is minimax / MCTS distillation in a separate workstream.
 6. **Output Rule** — commit via `submit_decision` tool with arguments
    `{pre_tool_thought, action: {slot_1, slot_2}}`.
 
@@ -724,25 +728,36 @@ tool loop.
 The user prompt is composed turn-by-turn from the snapshot + threat
 matrix + accumulated KnowledgeStates. In order of appearance:
 
-1. **Turn / field header** — turn number, weather, terrain, tailwind
-   booleans.
+1. **Turn header** — just `=== TURN N ===`. Plan v9 removed the old
+   `Field: weather=…, terrain=…, P1-tailwind=…, P2-tailwind=…` line;
+   field state now lives only in the ledger (section 4).
 2. **YOUR (P1) ACTIVE / BENCH** — current actives with HP %, status,
    item, ability, Tera state, boosts, revealed moves; bench is the
    full brought-set (the player knows their selection from team
    preview). When a slot is genuinely vacant (last Pokémon, no
    replacement), it's annotated as `[b] (empty — no Pokémon
-   remaining)` so the model doesn't have to infer slot vacancy.
+   remaining)` so the model doesn't have to infer slot vacancy. Plan v9
+   adds **unknown-brought-slot placeholders** when fewer than 4 brought
+   mons are identifiable — Reg I always brings 4, but the brought-4 is
+   never in the replay data (only usage is), so the player's own side
+   fills the gap with `(brought, never sent this game ...)`.
 3. **OPP (P2) ACTIVE / BENCH** — same shape, but bench is gated
    chronologically by `seenSpecies` (the player only learns opp's
-   selection as they switch in).
+   selection as they switch in). Its brought-slot placeholders read
+   `(brought, identity not yet revealed ...)`.
 4. **`=== GAME-STATE LEDGER ===`** — only-when-active rows: faints
-   (always), Tera used per side (when fired), field/pseudo-weather
-   with turns-left, side conditions (screens / spikes / safeguard /
-   tailwind), volatiles on actives (substitute / encore / taunt /
-   etc.), choice locks (when item + lastMove imply one), recent item
-   events, and a **Cumulative damage** row showing per-active total
-   damage taken across past turns and turns-on-field. Empty rows
-   omit; the section is dense but compact.
+   (always), Tera used per side (when fired), and (Plan v9) **all timed
+   field effects** — weather, terrain, Trick Room, per-side Tailwind,
+   screens (Reflect / Light Screen / Aurora Veil) — each with an
+   `(N turns left)` count; side conditions (spikes / safeguard);
+   volatiles on actives (substitute / encore / taunt / etc.) — Encore
+   now renders as "Encore-locked (can only repeat its last move, or
+   switch)" and Disable as "has a move Disabled (...)" (the parser
+   carries only a boolean, no move name — a known gap in TODO.md);
+   choice locks (when item + lastMove imply one); recent item events;
+   and a **Cumulative damage** row showing per-active total damage
+   taken across past turns and turns-on-field. Empty rows omit; the
+   section is dense but compact.
 5. **`=== TURN-BY-TURN (game N) ===`** — every prior turn this game
    rendered as one-liners, indented continuation. No length cap.
    Sequence-aware reasoning is the entire point — we don't truncate.
@@ -756,16 +771,21 @@ matrix + accumulated KnowledgeStates. In order of appearance:
    marker — distilling priors via a learned summarizer would
    conserve attention, but until that's built, raw is the right
    move.
-7. **`=== YOUR SPREADS ===`** — per-active P1 mon, every tightened EV
-   bound (one-sided constraints surface real signal that earlier
-   render thresholds hid). Plan v3 changed this from per-turn
-   chronological bounds to **match-final** bounds (the inferencer
-   runs across the whole match once at the start). At deploy time
-   the operator surfaces exact spreads from team-builder JSON here.
-8. **`=== THREAT MATRIX (turn N, us=p1) ===`** — dual-track damage
-   envelope from `threat_matrix.py`. Plan v3 drove this with the
-   **asymmetric** `(p1_final, p2_running)` knowledge pair: tight on
-   our side, chronologically loose on the opponent's.
+7. **`=== YOUR SPREADS ===`** / **`=== OPP SPREADS (inferred) ===`** —
+   every tightened EV bound (one-sided constraints surface real signal
+   that earlier render thresholds hid). Plan v3 changed YOUR SPREADS
+   from per-turn chronological bounds to **match-final** bounds (the
+   inferencer runs across the whole match once at the start). Plan v9
+   renders the **full known roster** per side (all 6 in Bo3 from the
+   team sheets, the revealed-so-far set in Bo1) rather than only the 2
+   active mons — and a mon with no constraints reads `unknown`. At
+   deploy time the operator surfaces exact spreads from team-builder
+   JSON here.
+8. **`=== THREAT MATRIX (turn N, us=p1) ===`** — the Absolute-only
+   damage envelope from `threat_matrix.py` (Plan v9 removed the Probable
+   track). Plan v3 drove this with the **asymmetric** `(p1_final,
+   p2_running)` knowledge pair: tight on our side, chronologically loose
+   on the opponent's.
 
 The total prompt is ~2,500–4,500 tokens depending on game length.
 
@@ -801,7 +821,6 @@ Tera'd-Water Calyrex-Ice active and 2 unrevealed bench mons:
 
 ```
 === TURN 23 ===
-Field: weather=Rain, P1-tailwind=no, P2-tailwind=no
 
 YOUR (P1) ACTIVE:
   [a] Amoonguss     | HP 30% | revealed=Spore,Rage Powder
@@ -838,12 +857,12 @@ T22: P1[a] Spore → P2[a] sleep
 
 --- OUTGOING (us → opp) ---
 [us Calyrex-Ice]  (boosts={atk: +3, spa: -1})
-  Glacial Lance → Kyogre  20.5%–48.6%  | meta 38.3%–45.3%  [guaranteed 2HKO]
+  Glacial Lance → Kyogre  20.5%–48.6%  [guaranteed 2HKO]
   …plus 2 chip moves: Protect, Leech Seed
 
 --- INCOMING (opp → us) ---
 [opp Kyogre]
-  Water Spout → Calyrex-Ice  6.8%–11.2%  | meta 8.4%–10.0%  [possible 9HKO]
+  Water Spout → Calyrex-Ice  6.8%–11.2%  [possible 9HKO]
   …plus 2 chip moves: Origin Pulse, Ice Beam
 ```
 
@@ -1074,6 +1093,71 @@ Numbers from the actual corpus (default `min_game_turns=2`):
 Net: ~99.5% of the corpus is retained; the dropped half-percent was
 truly-low-context rows that wouldn't have moved the model meaningfully.
 
+### Step 14 — Roster/spread model, speed inference, field consolidation, rule split (Plan v9)
+
+Plan v9 is a cleanup-and-tighten pass that removes a guess, adds a
+proof, and fixes three rendering bugs. Four changes:
+
+**1. Six-roster spreads + speed/observed inference, meta removed.** Two
+things landed together on the inference side:
+
+- *Full-roster rendering.* Both `=== YOUR SPREADS ===` and `=== OPP
+  SPREADS (inferred) ===` now render the full known roster per side —
+  all 6 in Bo3 from the team sheets, the revealed-so-far set in Bo1.
+  Previously YOUR SPREADS only showed the 2 active mons, a bug. The
+  BENCH section gained explicit **unknown-brought-slot placeholders**
+  when fewer than 4 brought mons are identifiable (Reg I always brings
+  4, but the brought-4 is never in the replay data — only usage is):
+  `(brought, never sent this game ...)` for the player's own side,
+  `(brought, identity not yet revealed ...)` for the opponent. There is
+  no "not-brought" state.
+- *Speed / move-order inference.* `damage_inferencer.update_observed_and_speed()`
+  sets a per-mon `observed` flag the moment a mon deals/takes damage or
+  reveals move order — the causal definition of when a mon stops
+  rendering as `unknown` — and derives a conservative Speed upper-bound
+  from move order ("a mon that moved *after* a known mon is genuinely
+  slower"; Choice-Scarf-safe). It pulls base stats from a new Node
+  endpoint `GET /dex/species/:name` (`{name, id, baseStats, types,
+  weightkg}`), which lives in `calc_microservice/src/dex.ts`'s
+  `lookupSpecies` + `src/server.ts`. The existing `/dex/move/:name` now
+  also exposes `priority`.
+- *Meta removal.* `canonical_priors.py` and the `smogon_chaos_*.json`
+  caches are deleted; the threat matrix renders the Absolute envelope
+  only, with `unknown` as the fallback for an unconstrained stat (it had
+  been `(no observations yet)`). See Steps 6 and 7 for why the Probable
+  track was a soft oracle leak we were better off without.
+
+**2. Volatile audit + action-legality validator.** A new read-only tool,
+`pipeline/validate_action_legality.py`, scans the SFT labels for actions
+that contradict their own turn state — choice-lock, tera-after-used, OTS
+moveset-membership. Since every label is a real human play, a violation
+is a *data bug*, not a model error, so this is a corpus integrity check
+(`python validate_action_legality.py`). The audit also fixed a dead
+ledger branch: the Encore/Disable display used to check a nonexistent
+`encoredInto` key; it now renders Encore as "Encore-locked (can only
+repeat its last move, or switch)" and Disable as "has a move Disabled
+(...)". (The parser carries only a boolean, no move name — a known gap
+noted in TODO.md.)
+
+**3. Field state consolidated to the ledger.** The per-turn user-prompt
+header used to carry a `Field: weather=…, terrain=…, P1-tailwind=…,
+P2-tailwind=…` line. That line is gone; the header is now just
+`=== TURN N ===`. All timed field effects — weather, terrain, Trick
+Room, per-side Tailwind, screens (Reflect / Light Screen / Aurora Veil)
+— render only in the `=== GAME-STATE LEDGER ===`, each with a
+`(N turns left)` count. One place, with countdowns, instead of two
+representations to keep in sync.
+
+**4. Alternatives Rule split.** The live-inference system prompt's rule 5
+no longer mandates evaluating an alternative every turn — that
+contradicted the Tool Rule's "no per-turn minimum", and at live
+inference the model should commit immediately when the matrix settles
+the question. The mandatory-alternative obligation moved into
+`SYNTHESIS_GROUND_TRUTH_SUFFIX` as a conditional, synthesis-only
+instruction (stripped before saving), so the *training* CoTs still weigh
+alternatives while the *deployed* model doesn't waste tokens
+second-guessing a settled call.
+
 ---
 
 ## Where we are, what's next
@@ -1139,14 +1223,26 @@ The judge layer adds ~$5–40. OpenAI synthesis would cost ~$3.3K via
   Fragment-game filter (`action_extraction.filter_fragment_games`,
   `--min-game-turns 2` default) drops ~470 truly-low-context rows
   before synthesis (~0.5% of corpus).
+- **Plan v9:** deleted the Smogon meta machinery (`canonical_priors.py`
+  + `smogon_chaos_*.json`) — threat matrix is Absolute-only, fallback
+  reads `unknown`; full six-roster YOUR/OPP SPREADS with
+  unknown-brought-slot placeholders (fixed a bug that showed only the 2
+  active mons); `damage_inferencer.update_observed_and_speed()` (per-mon
+  `observed` flag + move-order Speed upper-bound) backed by the new
+  `GET /dex/species/:name` endpoint; field state consolidated into the
+  ledger with `(N turns left)` counts (per-turn `Field:` header line
+  removed); Encore/Disable ledger display fixed (dead `encoredInto`
+  branch); Alternatives Rule split (live-inference rule no longer
+  mandatory, obligation moved to the synthesis-only suffix); new
+  read-only `validate_action_legality.py` corpus validator.
 
 **What we still want:** the full list lives in
 [`TODO.md`](TODO.md) — active workstreams (real corpus run on hybrid
 mode, holdout eval, Vertex Batch adapter, Anthropic Message Batches),
-the three `# TODO(...)` markers in source (`rlhf-followup`,
-series-state summarizer, canonical-prior substitution), Plan v4
-follow-ups (judge-rate dashboard, regex-filter retirement),
-long-horizon workstreams (selection-model SFT, RLHF), inspector
-enhancements, and further data-sourcing options.
+the `# TODO(...)` markers in source (`rlhf-followup`, series-state
+summarizer), the Disable-move-name parser gap, Plan v4 follow-ups
+(judge-rate dashboard, regex-filter retirement), long-horizon
+workstreams (selection-model SFT, RLHF), inspector enhancements, and
+further data-sourcing options.
 
 But the floor is the hard part. That's what's done.

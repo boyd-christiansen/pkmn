@@ -15,9 +15,10 @@ Pipeline role:
          feeds them to `damage_inferencer.update_knowledge` to tighten
          both KnowledgeStates for the next turn.
 
-    KnowledgeStates start at fully-open `[0, 252]` bounds — the canonical
-    priors are used by `threat_matrix` for its Probable track only,
-    preserving the Absolute track's strict-math guarantee.
+    KnowledgeStates start at fully-open `[0, 252]` bounds and tighten as
+    observed damage + move-order events accumulate. The threat matrix
+    renders the strict Absolute envelope from those bounds — there is no
+    canonical-meta second track (Smogon priors were removed).
 
 Isolation contract:
     The only file allowed to import from every other pipeline module.
@@ -36,7 +37,6 @@ import aiohttp
 import click
 from tqdm.asyncio import tqdm
 
-import canonical_priors  # noqa: F401  — imported for symmetry; future use in seeding
 import damage_inferencer
 import threat_matrix
 from action_extraction import (
@@ -411,6 +411,11 @@ async def process_match(
 
     p1_running = damage_inferencer.init_knowledge(p1_species_universe)
     p2_running = damage_inferencer.init_knowledge(p2_species_universe)
+    # Roster-key sets gate the observed-flag + speed inference so a
+    # transformed Ditto (snapshot species = the copied mon) can't pollute
+    # a real roster slot's spread.
+    p1_universe_keys = {damage_inferencer.species_key(s) for s in p1_species_universe}
+    p2_universe_keys = {damage_inferencer.species_key(s) for s in p2_species_universe}
     # The match-final offline pass touches every damage event in every
     # game of the match. If any one event causes a /calc failure (most
     # commonly a malformed Pokémon entry on the Node side), we don't
@@ -474,6 +479,7 @@ async def process_match(
                 await _safe_update_knowledge(
                     snap_pre, snap_post, events_stream, p1_running, p2_running,
                     session=aiohttp_session, base_url=calc_base_url,
+                    p1_universe=p1_universe_keys, p2_universe=p2_universe_keys,
                 )
                 continue
 
@@ -493,12 +499,15 @@ async def process_match(
                 await _safe_update_knowledge(
                     snap_pre, snap_post, events_stream, p1_running, p2_running,
                     session=aiohttp_session, base_url=calc_base_url,
+                    p1_universe=p1_universe_keys, p2_universe=p2_universe_keys,
                 )
                 continue
 
             # YOUR SPREADS surfaces match-final P1 bounds (the player's
             # own-team knowledge stand-in).
-            p1_spreads = format_p1_known_spreads_block(snap_pre, p1_final)
+            p1_spreads = format_p1_known_spreads_block(
+                snap_pre, p1_final, species_universe=p1_species_universe
+            )
             # OPP SPREADS uses chronological P2 inference. Bo3 OTS lets
             # us list all 6 (player saw them at team preview); Bo1 CTS
             # gates by snapshot.p2.seenSpecies inside the renderer.
@@ -569,6 +578,7 @@ async def process_match(
             await _safe_update_knowledge(
                 snap_pre, snap_post, events_stream, p1_running, p2_running,
                 session=aiohttp_session, base_url=calc_base_url,
+                p1_universe=p1_universe_keys, p2_universe=p2_universe_keys,
             )
 
     # ------------------------------------------------------------------
@@ -609,20 +619,31 @@ async def process_match(
 
 
 async def _safe_update_knowledge(
-    snap_pre, snap_post, events_stream, p1_knowledge, p2_knowledge, *, session, base_url
+    snap_pre, snap_post, events_stream, p1_knowledge, p2_knowledge, *, session, base_url,
+    p1_universe=None, p2_universe=None,
 ):
-    """Filter the new TurnEvent stream for damage observations and feed
-    them to the binary-search inferencer. Drops Metronome / Copycat /
-    Sketch / Snatch / Me First / Dancer / Instruct / Mirror Move /
-    Assist / Nature Power call-throughs (those can hit moves not in the
-    user's actual kit) but keeps Sleep Talk (calls own moves only)."""
+    """Feed the new TurnEvent stream to the inferencer. Two passes:
+
+      1. Damage-bound inference (atk/spa/def/spd/hp). Drops Metronome /
+         Copycat / Sketch / Snatch / Me First / Dancer / Instruct /
+         Mirror Move / Assist / Nature Power call-throughs (those can hit
+         moves not in the user's actual kit) but keeps Sleep Talk (own
+         moves only).
+      2. Observed-flag marking + conservative speed (move-order) inference,
+         which runs EVERY turn — including damage-free turns, since status
+         moves still reveal move order. `p1_universe` / `p2_universe` are
+         roster-key sets gating against transformed-Ditto pollution."""
     damage_events = damage_inferencer.events_to_damage_events(events_stream)
-    if not damage_events:
-        return
     try:
-        await damage_inferencer.update_knowledge(
-            snap_pre, snap_post, damage_events, p1_knowledge, p2_knowledge,
+        if damage_events:
+            await damage_inferencer.update_knowledge(
+                snap_pre, snap_post, damage_events, p1_knowledge, p2_knowledge,
+                session=session, base_url=base_url,
+            )
+        await damage_inferencer.update_observed_and_speed(
+            snap_pre, events_stream, p1_knowledge, p2_knowledge,
             session=session, base_url=base_url,
+            p1_universe=p1_universe, p2_universe=p2_universe,
         )
     except Exception as e:
         _log_error(f"update_knowledge failed: {e}")
@@ -1211,7 +1232,7 @@ async def run(
 @click.option(
     "--format-id",
     default=None,
-    help="Format ID for canonical-priors lookup. Auto-detected from input filename if omitted.",
+    help="Format ID stamped on each SFT row (Bo1 vs Bo3). Auto-detected from input filename if omitted.",
 )
 @click.option("--limit", type=int, default=None, help="Process only the first N matches (test batch).")
 @click.option("--concurrency", default=1, show_default=True,
