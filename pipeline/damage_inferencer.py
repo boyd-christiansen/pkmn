@@ -330,6 +330,18 @@ def events_to_damage_events(events: list[dict[str, Any]]) -> list[DamageEvent]:
     return out
 
 
+def _clamp_consistent(entry: dict[str, Any]) -> None:
+    """Guarantee min_evs ≤ max_evs on every stat. Contradictory observations
+    (crit/roll noise, the fuzzy-HP tolerance) can have a min-update push a
+    stat's min above its existing max, which inverts the threat matrix's
+    abs_low/abs_high calcs and renders nonsensical '62%–58%' ranges. We
+    resolve the inconsistency conservatively by trusting the upper bound
+    (clamp min down to max)."""
+    for s in STATS:
+        if entry["min_evs"][s] > entry["max_evs"][s]:
+            entry["min_evs"][s] = entry["max_evs"][s]
+
+
 def _apply_total_ev_constraint(entry: dict[str, dict[str, int]]) -> None:
     """Tighten max_evs using the 508-total constraint.
 
@@ -581,6 +593,8 @@ async def _process_event(
     # locked in (e.g. Speed=252 + Atk=252 forces HP/Def/SpD/SpA all ≤ 4).
     _apply_total_ev_constraint(a_state[a_key])
     _apply_total_ev_constraint(d_state[d_key])
+    _clamp_consistent(a_state[a_key])
+    _clamp_consistent(d_state[d_key])
 
 
 # ===========================================================================
@@ -852,6 +866,7 @@ async def _apply_speed_upper_bound(
         s_entry["max_evs"]["spe"] = new_upper
         if s_entry["min_evs"]["spe"] > new_upper:
             s_entry["min_evs"]["spe"] = new_upper
+    _clamp_consistent(s_entry)
 
 
 async def update_observed_and_speed(

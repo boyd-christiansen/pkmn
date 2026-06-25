@@ -78,12 +78,20 @@ DEFAULT_JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "gemini-3.1-pro-preview")
 DEFAULT_JUDGE_MODEL_OPENAI = "gpt-5.5"
 
 DEFAULT_JUDGE_RETRIES = 2
-DEFAULT_JUDGE_TIMEOUT = 60.0
+# Correctness grounding (state + matrix + calc results per turn) makes the
+# per-match prompt much larger than the leak-only judge, and the pro model
+# reasons through every turn — 60s was too tight for long matches (13–19
+# turns timed out). 180s is a generous ceiling; typical matches finish in
+# 10–30s, and the judge call overlaps the (minutes-long) synthesis anyway.
+DEFAULT_JUDGE_TIMEOUT = 180.0
 
 # Per-call cap on CoT chars rendered into the prompt. The model commits in
 # ~500–4000ch of pre_tool_thought; we truncate exceptionally long ones to
 # keep judge cost predictable. Truncation marker tells the judge we cut it.
 _MAX_COT_CHARS_PER_TURN = 6000
+# Grounding (state + matrix + calc results) is bounded too — a Bo3 mid-game
+# matrix is ~2–3k chars; 6k leaves headroom without ballooning judge cost.
+_MAX_GROUNDING_CHARS_PER_TURN = 6000
 _TRUNC_MARKER = "\n…[truncated for judge]…"
 
 
@@ -140,12 +148,19 @@ _OPENAI_JUDGE_RESPONSE_SCHEMA: dict[str, Any] = {
                             "type": "integer",
                             "description": "0-based index into the input turn list.",
                         },
+                        "category": {
+                            "type": "string",
+                            "enum": ["leak", "correctness"],
+                            "description": "'leak' = training-framing meta-reference; "
+                                           "'correctness' = a quantitative claim that "
+                                           "contradicts the grounding.",
+                        },
                         "reason": {
                             "type": "string",
-                            "description": "Short phrase identifying the leak (≤120 chars).",
+                            "description": "Short phrase + the quoted offending claim (≤120 chars).",
                         },
                     },
-                    "required": ["turn_idx", "reason"],
+                    "required": ["turn_idx", "category", "reason"],
                     "additionalProperties": False,
                 },
             }
@@ -170,12 +185,19 @@ _GEMINI_JUDGE_RESPONSE_SCHEMA: dict[str, Any] = {
                         "type": "integer",
                         "description": "0-based index into the input turn list.",
                     },
+                    "category": {
+                        "type": "string",
+                        "enum": ["leak", "correctness"],
+                        "description": "'leak' = training-framing meta-reference; "
+                                       "'correctness' = a quantitative claim that "
+                                       "contradicts the grounding.",
+                    },
                     "reason": {
                         "type": "string",
-                        "description": "Short phrase identifying the leak (≤120 chars).",
+                        "description": "Short phrase + the quoted offending claim (≤120 chars).",
                     },
                 },
-                "required": ["turn_idx", "reason"],
+                "required": ["turn_idx", "category", "reason"],
             },
         }
     },
@@ -250,20 +272,66 @@ quoted phrase in the `reason` field."""
 JUDGE_USER_TEMPLATE = """Match: {match_id}  ({n_turns} turns)
 
 Each block below is one turn's pre_tool_thought verbatim. Flag any that \
-violate the hygiene rules. `turn_idx` in your response refers to the \
+violate the rules. `turn_idx` in your response refers to the \
 0-indexed position in this list (NOT the in-game turn number).
 
 {turn_block}
 """
 
 
-def _render_turn_block(records: list[dict[str, Any]]) -> str:
+# Appended to the system prompt when correctness-checking is on. The
+# negative rules below are the exact false-positive classes a regex
+# verifier could not handle — direction (who KOs whom), tool-computed
+# hypotheticals (boosted / Tera'd), and conditional reasoning — so the
+# judge is explicitly told NOT to flag them.
+JUDGE_CORRECTNESS_ADDENDUM = """
+
+=== ALSO CHECK: factual correctness of the reasoning ===
+
+Each turn block also carries a GROUNDING section: the active Pokémon with \
+their CURRENT HP, the THREAT MATRIX (provable damage ranges + hits-to-KO, \
+computed at FULL HP across the opponent's bulk uncertainty), and CALC \
+RESULTS (extra damage calcs the teacher ran for boosted / Tera'd / \
+hypothetical scenarios — already verified; treat them as ground truth).
+
+ALSO flag a turn — with category "correctness" — when its pre_tool_thought \
+makes a QUANTITATIVE claim that clearly contradicts that grounding:
+  • A KO claim ("guaranteed OHKO/KO", "secures the KO", "it faints") on an \
+OPPONENT where OUR move's damage LOW roll is below that target's CURRENT HP, \
+so the low roll leaves it alive. (Example to flag: "guarantees the KO on the \
+35% Koraidon" when the matrix shows Ice Beam 31.9–68.6% — 31.9% < 35%.)
+  • A damage number that contradicts the matrix or the calc results.
+  • A speed / turn-order claim that contradicts the stated speed bounds or \
+the observed move order.
+
+CRITICAL — these are CORRECT and must NOT be flagged:
+  • Damage for a BOOSTED, Tera'd, or otherwise hypothetical scenario the \
+teacher COMPUTED — verify it against CALC RESULTS, not the current-state \
+matrix. "+1 Tera Fairy Moonblast is a guaranteed OHKO (106–127%)" backed by a \
+calc result is correct even though the matrix's current-state number is lower.
+  • Claims about the OPPONENT KO-ing US ("their Moongeist Beam OHKOs my \
+Treads") — that is an incoming threat, not our KO claim. Only check the effect \
+of OUR moves on the opponent.
+  • Conditional reasoning ("if they switch in X we KO it, if they stay we \
+don't") — only flag if the arithmetic of a stated branch is actually wrong.
+
+Set "category":"leak" for hygiene violations and "category":"correctness" for \
+these. Stay conservative: flag only a clear contradiction you can quote."""
+
+
+def _judge_system_prompt(judge_correctness: bool) -> str:
+    return JUDGE_SYSTEM_PROMPT + (JUDGE_CORRECTNESS_ADDENDUM if judge_correctness else "")
+
+
+def _render_turn_block(records: list[dict[str, Any]], *, include_grounding: bool = False) -> str:
     """Render the per-turn CoTs as a single text block for the judge prompt.
 
     Each turn gets a clearly-bounded section so the judge can refer to
     `turn_idx=K` unambiguously. Long CoTs are truncated to keep the
-    judge prompt under O(20K) tokens regardless of how chatty the
-    teacher got.
+    judge prompt bounded regardless of how chatty the teacher got. When
+    `include_grounding` is set, each turn's `grounding` (state + matrix +
+    calc results, built by the caller) is appended so the judge can
+    fact-check quantitative claims.
     """
     parts: list[str] = []
     for i, rec in enumerate(records):
@@ -272,8 +340,14 @@ def _render_turn_block(records: list[dict[str, Any]]) -> str:
             cot = cot[:_MAX_COT_CHARS_PER_TURN] + _TRUNC_MARKER
         gi = rec.get("game_idx", "?")
         tn = rec.get("turn", "?")
-        parts.append(f"[turn_idx={i}  game={gi}  turn={tn}]\n{cot}")
-    return "\n\n".join(parts)
+        block = f"[turn_idx={i}  game={gi}  turn={tn}]\npre_tool_thought:\n{cot}"
+        if include_grounding and rec.get("grounding"):
+            g = rec["grounding"]
+            if len(g) > _MAX_GROUNDING_CHARS_PER_TURN:
+                g = g[:_MAX_GROUNDING_CHARS_PER_TURN] + _TRUNC_MARKER
+            block += f"\n\nGROUNDING (fact-check the CoT against this):\n{g}"
+        parts.append(block)
+    return "\n\n======================\n\n".join(parts)
 
 
 def _parse_flagged(parsed: dict[str, Any], n_turns: int) -> tuple[list[int], dict[int, str]]:
@@ -294,7 +368,8 @@ def _parse_flagged(parsed: dict[str, Any], n_turns: int) -> tuple[list[int], dic
         if idx in reasons:
             continue
         indices.append(idx)
-        reasons[idx] = (entry.get("reason") or "")[:120]
+        cat = entry.get("category") or "flag"
+        reasons[idx] = f"[{cat}] " + (entry.get("reason") or "")[:120]
     return indices, reasons
 
 
@@ -310,6 +385,7 @@ async def judge_match_cots(
     provider: str = DEFAULT_JUDGE_PROVIDER,
     model: str = DEFAULT_JUDGE_MODEL,
     timeout: float = DEFAULT_JUDGE_TIMEOUT,
+    judge_correctness: bool = True,
 ) -> JudgeResult:
     """Score a match's CoTs in one call; return turns that should be retried.
 
@@ -342,10 +418,12 @@ async def judge_match_cots(
         return JudgeResult(flagged_turn_indices=[])
     if provider == "google":
         return await _judge_via_gemini(turn_records, client=client,
-                                       model=model, timeout=timeout)
+                                       model=model, timeout=timeout,
+                                       judge_correctness=judge_correctness)
     if provider == "openai":
         return await _judge_via_openai(turn_records, client=client,
-                                       model=model, timeout=timeout)
+                                       model=model, timeout=timeout,
+                                       judge_correctness=judge_correctness)
     return JudgeResult(
         flagged_turn_indices=[],
         error=f"unknown judge provider: {provider!r}",
@@ -363,13 +441,15 @@ async def _judge_via_openai(
     client: AsyncOpenAI,
     model: str,
     timeout: float,
+    judge_correctness: bool = True,
 ) -> JudgeResult:
     t0 = time.monotonic()
     match_id = turn_records[0].get("match_id", "?")
-    turn_block = _render_turn_block(turn_records)
+    turn_block = _render_turn_block(turn_records, include_grounding=judge_correctness)
     user_msg = JUDGE_USER_TEMPLATE.format(
         match_id=match_id, n_turns=len(turn_records), turn_block=turn_block,
     )
+    system_prompt = _judge_system_prompt(judge_correctness)
 
     # NOTE: The current OpenAI reasoning-class models (gpt-5.5 family)
     # reject `max_tokens` and `temperature` outright — only the legacy
@@ -382,7 +462,7 @@ async def _judge_via_openai(
             client.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_msg},
                 ],
                 response_format={
@@ -445,13 +525,15 @@ async def _judge_via_gemini(
     client: genai.Client,
     model: str,
     timeout: float,
+    judge_correctness: bool = True,
 ) -> JudgeResult:
     t0 = time.monotonic()
     match_id = turn_records[0].get("match_id", "?")
-    turn_block = _render_turn_block(turn_records)
+    turn_block = _render_turn_block(turn_records, include_grounding=judge_correctness)
     user_msg = JUDGE_USER_TEMPLATE.format(
         match_id=match_id, n_turns=len(turn_records), turn_block=turn_block,
     )
+    system_prompt = _judge_system_prompt(judge_correctness)
 
     # Gemini structured-output: response_mime_type="application/json" +
     # response_schema in OpenAPI 3.0 dialect (the same dialect
@@ -468,7 +550,7 @@ async def _judge_via_gemini(
                     )
                 ],
                 config=genai_types.GenerateContentConfig(
-                    system_instruction=JUDGE_SYSTEM_PROMPT,
+                    system_instruction=system_prompt,
                     response_mime_type="application/json",
                     response_schema=_GEMINI_JUDGE_RESPONSE_SCHEMA,
                 ),

@@ -32,6 +32,7 @@ Isolation contract:
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Mapping
 
 import aiohttp
@@ -120,6 +121,11 @@ def _fmt_pct(p: float) -> str:
 
 
 def _fmt_range(lo: float, hi: float) -> str:
+    # Defensive: the inferencer clamps bounds so abs_low ≤ abs_high, but guard
+    # the display too so a stray inversion never reaches the prompt as a
+    # nonsensical "62%–58%" range.
+    if lo > hi:
+        lo, hi = hi, lo
     return f"{_fmt_pct(lo)}–{_fmt_pct(hi)}"
 
 
@@ -246,16 +252,69 @@ async def _calc_one_move_one_defender(
     return {"abs_low": abs_low, "abs_high": abs_high}
 
 
-def _ko_chance(result: dict[str, Any]) -> str:
-    """KO-chance string from the high-roll boundary calc."""
-    return result["abs_high"].get("koChance") or ""
+def _hko_n(kochance: str | None) -> int | None:
+    """The N in an NHKO string (OHKO→1, 2HKO→2, …). None when there is no KO
+    within the calc's horizon (e.g. 'no damage')."""
+    if not kochance:
+        return None
+    if "OHKO" in kochance:
+        return 1
+    m = re.search(r"(\d+)HKO", kochance)
+    return int(m.group(1)) if m else None
+
+
+def _hko_best_worst(kochance: str | None) -> tuple[int | None, int | None]:
+    """(best-case, guaranteed-worst-case) hits-to-KO for one calc's koChance.
+
+    Crucially distinguishes a GUARANTEED KO from a PROBABLE one:
+      • 'guaranteed OHKO'      → (1, 1)   — always 1 hit
+      • '92% chance to OHKO'   → (1, 2)   — usually 1, but guaranteed by 2
+      • 'guaranteed 2HKO'      → (2, 2)
+      • '41% chance to 2HKO'   → (2, 3)
+      • None / 'no damage'     → (None, None)
+    Conflating the two (treating '92% chance to OHKO' as a plain OHKO) is what
+    let an optimistic label collapse onto a sub-100% low roll."""
+    n = _hko_n(kochance)
+    if n is None:
+        return (None, None)
+    guaranteed = "guaranteed" in (kochance or "").lower()
+    return (n, n) if guaranteed else (n, n + 1)
+
+
+def _ko_label(result: dict[str, Any]) -> str:
+    """Honest hits-to-KO label spanning the defender's bulk uncertainty AND
+    the damage-roll uncertainty.
+
+    The damage range already spans bulkiest→frailest defender, so the KO label
+    must too. The FEWEST hits is the best case at the frailest defender
+    (`abs_high`); the MOST hits is the guaranteed-worst case at the bulkiest
+    defender (`abs_low`). We show that range — `OHKO–3HKO` — and collapse to a
+    single `NHKO` only when both ends truly agree (e.g. a guaranteed-OHKO at
+    both ends, which only happens when the low roll genuinely KOs). This
+    refinement (vs. an earlier version that ignored probability) is what stops
+    a *possible* OHKO from rendering as a *guaranteed* one."""
+    fewest, _ = _hko_best_worst(result["abs_high"].get("koChance"))   # frail: best case
+    _, most = _hko_best_worst(result["abs_low"].get("koChance"))      # bulky: guaranteed-worst
+
+    def hk(n: int) -> str:
+        return "OHKO" if n == 1 else f"{n}HKO"
+
+    if fewest is None and most is None:
+        return ""
+    if most is None:        # bulky end never KOs within the calc's horizon
+        return f"{hk(fewest)}+"
+    if fewest is None:      # defensive — shouldn't happen (more dmg ⇒ ≤ hits)
+        return f"{hk(most)}+"
+    if most < fewest:
+        fewest, most = most, fewest
+    return hk(fewest) if fewest == most else f"{hk(fewest)}–{hk(most)}"
 
 
 def _format_single_target_line(
     move: str, defender: dict[str, Any], result: dict[str, Any]
 ) -> str:
     abs_str = _fmt_range(result["abs_low"]["minPercent"], result["abs_high"]["maxPercent"])
-    ko = _ko_chance(result)
+    ko = _ko_label(result)
     ko_part = f"  [{ko}]" if ko else ""
     return f"  {move} → {defender['species']:<14} {abs_str}{ko_part}"
 
@@ -269,7 +328,7 @@ def _format_spread_line(
     for defender, res in results_by_def:
         abs_str = _fmt_range(res["abs_low"]["minPercent"], res["abs_high"]["maxPercent"])
         parts.append(f"{defender['species']} {abs_str}")
-        ko = _ko_chance(res)
+        ko = _ko_label(res)
         if ko:
             ko_parts.append(f"{defender['species']}: {ko}")
     body = ", ".join(parts)

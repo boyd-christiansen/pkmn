@@ -127,6 +127,40 @@ def load_seen_keys(output_path: Path) -> set[tuple[str, int, int]]:
 # ---------------------------------------------------------------------------
 
 
+def _google_auth_configured() -> bool:
+    """True when the google-genai SDK has a usable auth path. Two mutually
+    exclusive modes — and the choice is a BILLING decision, not just auth:
+
+      • AI Studio (Gemini Developer API): GOOGLE_API_KEY / GEMINI_API_KEY set.
+        Bills to whatever is attached to that key — NOT a GCP credit grant.
+      • Vertex AI: GOOGLE_GENAI_USE_VERTEXAI truthy + GOOGLE_CLOUD_PROJECT set
+        (Application Default Credentials supply the token via
+        `gcloud auth application-default login`). This is the path that draws
+        down GCP committed-use / credit grants — use it to spend the credits.
+
+    `genai.Client()` (constructed with no args in GoogleProvider + the judge)
+    auto-selects: with GOOGLE_GENAI_USE_VERTEXAI=true it uses Vertex and
+    ignores the API key. So switching to the credits is config-only; this
+    helper just stops the pre-flight guard from rejecting the (keyless) Vertex
+    path.
+    """
+    if os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY"):
+        return True
+    use_vertex = str(os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "")).strip().lower() in (
+        "1", "true", "yes",
+    )
+    return use_vertex and bool(os.environ.get("GOOGLE_CLOUD_PROJECT"))
+
+
+_GOOGLE_AUTH_HINT = (
+    "Configure Google auth one of two ways:\n"
+    "  • AI Studio (personal/non-credit billing): set GEMINI_API_KEY or GOOGLE_API_KEY.\n"
+    "  • Vertex AI (draws GCP credits — recommended): set GOOGLE_GENAI_USE_VERTEXAI=true, "
+    "GOOGLE_CLOUD_PROJECT=<project>, GOOGLE_CLOUD_LOCATION=<region>, and run "
+    "`gcloud auth application-default login`."
+)
+
+
 def _build_teacher(provider: str, model: str | None) -> TeacherProvider:
     """Instantiate the requested provider, validating that its API key is present."""
     if provider == "openai":
@@ -142,9 +176,9 @@ def _build_teacher(provider: str, model: str | None) -> TeacherProvider:
         from teacher import AnthropicProvider
         return AnthropicProvider(model=model) if model else AnthropicProvider()
     if provider == "google":
-        if not (os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")):
+        if not _google_auth_configured():
             raise click.ClickException(
-                "GOOGLE_API_KEY (or GEMINI_API_KEY) env var is required for --provider google"
+                "No Google auth configured for --provider google.\n" + _GOOGLE_AUTH_HINT
             )
         from teacher import GoogleProvider
         return GoogleProvider(model=model) if model else GoogleProvider()
@@ -225,6 +259,54 @@ async def _synthesize_with_leak_retry(
         )
 
 
+def _build_judge_grounding(user_prompt: str, messages: list[dict[str, Any]]) -> str:
+    """Ground truth the correctness judge fact-checks the CoT against: a lean
+    slice of the turn (current HP + boosts from the TURN/ACTIVE header, plus
+    the THREAT MATRIX) and a compact digest of every `calculate_damage` the
+    teacher ran. The calc digest is what stops the judge from flagging
+    legitimate boosted / Tera'd hypotheticals as if they were current-state
+    errors. Sending the lean slice (not the full prompt) keeps judge input —
+    and cost — down."""
+    head_end = user_prompt.find("=== GAME-STATE")
+    state = user_prompt[:head_end].rstrip() if head_end > 0 else ""
+    mi = user_prompt.find("=== THREAT MATRIX")
+    matrix = user_prompt[mi:].rstrip() if mi >= 0 else ""
+
+    id_args: dict[str, dict[str, Any]] = {}
+    calc_lines: list[str] = []
+    for m in messages:
+        for tc in (m.get("tool_calls") or []):
+            if (tc.get("function") or {}).get("name") == "calculate_damage":
+                try:
+                    id_args[tc.get("id")] = json.loads(tc["function"]["arguments"])
+                except (KeyError, TypeError, json.JSONDecodeError):
+                    pass
+        if m.get("role") == "tool" and m.get("tool_call_id") in id_args:
+            a = id_args[m["tool_call_id"]]
+            try:
+                res = json.loads(m.get("content") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                res = {}
+            atk, dfn = (a.get("attacker") or {}), (a.get("defender") or {})
+            mv = a.get("move")
+            mv = mv.get("name") if isinstance(mv, dict) else mv
+            tags = [t for t, on in (("atk-boosts", atk.get("boosts")),
+                                    ("atk-tera", atk.get("isTera")),
+                                    ("def-tera", dfn.get("isTera"))) if on]
+            lo, hi, ko = res.get("minPercent"), res.get("maxPercent"), res.get("koChance")
+            if lo is not None:
+                tagstr = f" [{','.join(tags)}]" if tags else ""
+                calc_lines.append(
+                    f"  {mv} {atk.get('species','?')}→{dfn.get('species','?')}{tagstr}: "
+                    f"{lo}–{hi}%" + (f"  [{ko}]" if ko else "")
+                )
+    grounding = (state + "\n\n" + matrix).strip()
+    if calc_lines:
+        grounding += ("\n\nCALC RESULTS (teacher-computed hypotheticals — verified, "
+                      "treat as ground truth):\n" + "\n".join(calc_lines))
+    return grounding
+
+
 async def _run_judge_with_retries(
     match_buffer: list[dict[str, Any]],
     turn_contexts: list[dict[str, Any]],
@@ -239,6 +321,7 @@ async def _run_judge_with_retries(
     leak_retries: int,
     stats: dict[str, int],
     match_id: str,
+    judge_correctness: bool = True,
 ) -> list[dict[str, Any]]:
     """Buffered match-level judge: flag turns, re-synthesize them, repeat.
 
@@ -272,6 +355,13 @@ async def _run_judge_with_retries(
                 "game_idx": row["game_index"],
                 "turn": row["turn"],
                 "pre_tool_thought": (extract_pre_tool_thought(row["messages"]) or ""),
+                # Grounding (state + matrix + the teacher's calc results) lets
+                # the judge fact-check quantitative claims; only built when
+                # correctness-checking is on, since it ~doubles judge input.
+                "grounding": (
+                    _build_judge_grounding(turn_contexts[i].get("user_prompt", ""), row["messages"])
+                    if judge_correctness else ""
+                ),
             }
             for i, row in enumerate(match_buffer)
         ]
@@ -280,6 +370,7 @@ async def _run_judge_with_retries(
             client=judge_client,
             provider=judge_provider,
             model=judge_model,
+            judge_correctness=judge_correctness,
         )
         stats["judge_cost_micro_usd"] += int(jr.cost_usd * 1_000_000)
         if jr.error:
@@ -355,6 +446,7 @@ async def process_match(
     judge_provider: str = DEFAULT_JUDGE_PROVIDER,
     judge_model: str = DEFAULT_JUDGE_MODEL,
     judge_retries: int = DEFAULT_JUDGE_RETRIES,
+    judge_correctness: bool = True,
     min_game_turns: int = DEFAULT_MIN_GAME_TURNS,
 ) -> dict[str, int]:
     # Series-winner-as-P1: every SFT example is generated from the perspective
@@ -602,6 +694,7 @@ async def process_match(
             leak_retries=leak_retries,
             stats=stats,
             match_id=match_id,
+            judge_correctness=judge_correctness,
         )
     else:
         survivors = match_buffer
@@ -733,6 +826,27 @@ def _read_match_records(input_path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def _load_excluded_match_ids(path: Path | None) -> set[str]:
+    """Match-ids the synthesis run must NOT touch — the eval holdout.
+
+    Accepts the `eval_split.json` produced by `make_eval_split.py` (uses its
+    `holdout` list) or a plain JSON/newline list of match-ids. Keeping the
+    holdout out of training is what makes the downstream action-match eval
+    honest (no train/test leakage)."""
+    if path is None:
+        return set()
+    text = path.read_text()
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return set(obj.get("holdout") or [])
+        if isinstance(obj, list):
+            return set(obj)
+    except json.JSONDecodeError:
+        pass
+    return {ln.strip() for ln in text.splitlines() if ln.strip()}
+
+
 def _build_judge_client(use_judge: bool, dry_run: bool, judge_provider: str) -> Any:
     """Construct the judge client. Provider dispatch (Plan v8):
 
@@ -751,12 +865,11 @@ def _build_judge_client(use_judge: bool, dry_run: bool, judge_provider: str) -> 
     if dry_run or not use_judge:
         return None
     if judge_provider == "google":
-        if not (os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")):
+        if not _google_auth_configured():
             raise click.ClickException(
-                "GOOGLE_API_KEY (or GEMINI_API_KEY) env var is required for "
-                "--use-judge with the default Gemini judge. Pass --no-judge "
-                "to skip the judge layer, or --judge-provider openai to use "
-                "the OpenAI judge instead."
+                "No Google auth configured for --use-judge (default Gemini judge).\n"
+                + _GOOGLE_AUTH_HINT
+                + "\nOr pass --no-judge, or --judge-provider openai."
             )
         from google import genai
         return genai.Client()
@@ -790,6 +903,7 @@ async def _run_sync(
     judge_provider: str,
     judge_model: str,
     judge_retries: int,
+    judge_correctness: bool,
     min_game_turns: int,
 ) -> dict[str, int]:
     """Sync runner: original `process_match` flow over the given records."""
@@ -820,6 +934,7 @@ async def _run_sync(
                     judge_provider=judge_provider,
                     judge_model=judge_model,
                     judge_retries=judge_retries,
+                    judge_correctness=judge_correctness,
                     min_game_turns=min_game_turns,
                 )
             except Exception as e:
@@ -857,6 +972,7 @@ async def _run_batch(
     judge_provider: str,
     judge_model: str,
     judge_retries: int,
+    judge_correctness: bool,
     state_dir: Path,
     poll_interval_seconds: float,
     max_cycle_wait_seconds: float,
@@ -898,6 +1014,7 @@ async def _run_batch(
         judge_provider=judge_provider,
         judge_model=judge_model,
         judge_retries=judge_retries,
+        judge_correctness=judge_correctness,
         teacher_for_judge_retry=teacher,
         resume=resume,
         min_game_turns=min_game_turns,
@@ -961,6 +1078,7 @@ async def _run_hybrid(
     judge_provider: str,
     judge_model: str,
     judge_retries: int,
+    judge_correctness: bool,
     state_dir: Path,
     poll_interval_seconds: float,
     max_cycle_wait_seconds: float,
@@ -1000,6 +1118,7 @@ async def _run_hybrid(
         judge_provider=judge_provider,
         judge_model=judge_model,
         judge_retries=judge_retries,
+        judge_correctness=judge_correctness,
         min_game_turns=min_game_turns,
     )
     passed, gate_msg = _hybrid_gate_passed(
@@ -1029,6 +1148,7 @@ async def _run_hybrid(
         judge_provider=judge_provider,
         judge_model=judge_model,
         judge_retries=judge_retries,
+        judge_correctness=judge_correctness,
         state_dir=state_dir,
         poll_interval_seconds=poll_interval_seconds,
         max_cycle_wait_seconds=max_cycle_wait_seconds,
@@ -1060,6 +1180,7 @@ async def run(
     judge_provider: str = DEFAULT_JUDGE_PROVIDER,
     judge_model: str = DEFAULT_JUDGE_MODEL,
     judge_retries: int = DEFAULT_JUDGE_RETRIES,
+    judge_correctness: bool = True,
     mode: str = "sync",
     state_dir: Path = DEFAULT_BATCH_STATE_DIR,
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
@@ -1069,6 +1190,7 @@ async def run(
     hybrid_min_match_rate: float = DEFAULT_HYBRID_MIN_MATCH_RATE,
     hybrid_max_leak_rate: float = DEFAULT_HYBRID_MAX_LEAK_RATE,
     min_game_turns: int = DEFAULT_MIN_GAME_TURNS,
+    exclude_match_ids: set[str] | None = None,
 ) -> None:
     """Top-level dispatcher. Picks `_run_sync` / `_run_batch` / `_run_hybrid`
     based on `mode`."""
@@ -1096,6 +1218,14 @@ async def run(
 
         records = _read_match_records(input_path)
         click.echo(f"loaded {len(records)} match records from {input_path}")
+
+        if exclude_match_ids:
+            before = len(records)
+            records = [r for r in records if r.get("match_id") not in exclude_match_ids]
+            click.echo(
+                f"  --exclude-match-file: dropped {before - len(records)} holdout "
+                f"matches ({len(records)} remain for training synthesis)"
+            )
 
         seen_keys = load_seen_keys(output_path)
         if seen_keys:
@@ -1126,6 +1256,7 @@ async def run(
                 judge_provider=judge_provider,
                 judge_model=judge_model,
                 judge_retries=judge_retries,
+                judge_correctness=judge_correctness,
                 min_game_turns=min_game_turns,
             )
         elif mode == "batch":
@@ -1166,6 +1297,7 @@ async def run(
                     judge_provider=judge_provider,
                     judge_model=judge_model,
                     judge_retries=judge_retries,
+                    judge_correctness=judge_correctness,
                     state_dir=state_dir,
                     poll_interval_seconds=poll_interval_seconds,
                     max_cycle_wait_seconds=max_cycle_wait_seconds,
@@ -1195,6 +1327,7 @@ async def run(
                 judge_provider=judge_provider,
                 judge_model=judge_model,
                 judge_retries=judge_retries,
+                judge_correctness=judge_correctness,
                 state_dir=state_dir,
                 poll_interval_seconds=poll_interval_seconds,
                 max_cycle_wait_seconds=max_cycle_wait_seconds,
@@ -1283,11 +1416,27 @@ async def run(
          "the flagged turns; the rest of the match commits cleanly.",
 )
 @click.option(
+    "--judge-correctness/--no-judge-correctness", default=True, show_default=True,
+    help="Also have the per-match judge fact-check each CoT's quantitative claims "
+         "(damage / KO / speed) against the threat matrix + the teacher's own calc "
+         "results, not just oracle-leak hygiene. Flagged turns are re-synthesized "
+         "(not dropped), so good CoT isn't thrown away. Negligible added cost.",
+)
+@click.option(
     "--min-game-turns", type=int, default=DEFAULT_MIN_GAME_TURNS, show_default=True,
     help="Drop games whose snapshot count produces fewer than this many "
          "turn-pairs (= max possible SFT rows from the game). Default 2 "
          "removes ghost games + single-decision sweeps that lack meaningful "
          "history context. Set 0 to disable; set 4+ for richer-context-only.",
+)
+@click.option(
+    "--exclude-match-file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Hold these match-ids OUT of synthesis (the eval holdout). Accepts "
+         "make_eval_split.py's eval_split.json (uses its `holdout` list) or a "
+         "plain id list. Required for the pilot so the action-match eval has "
+         "no train/test leakage.",
 )
 @click.option(
     "--mode",
@@ -1340,9 +1489,11 @@ async def run(
 )
 def cli(input_path, output_path, calc_base_url, format_id, limit, concurrency, dry_run,
         provider, model, leak_retries, use_judge, judge_provider, judge_model, judge_retries,
-        min_game_turns, mode, state_dir, poll_interval_seconds, max_cycle_wait_seconds, resume,
+        judge_correctness, min_game_turns, exclude_match_file, mode, state_dir,
+        poll_interval_seconds, max_cycle_wait_seconds, resume,
         hybrid_sync_n, hybrid_min_match_rate, hybrid_max_leak_rate):
     """Generate the SFT training JSONL from parsed replay data."""
+    exclude_match_ids = _load_excluded_match_ids(exclude_match_file)
     resolved_format = _resolve_format_id(input_path, format_id)
     click.echo(
         f"using format_id={resolved_format}  dry_run={dry_run}  "
@@ -1369,6 +1520,7 @@ def cli(input_path, output_path, calc_base_url, format_id, limit, concurrency, d
             judge_provider=judge_provider,
             judge_model=judge_model,
             judge_retries=judge_retries,
+            judge_correctness=judge_correctness,
             mode=mode,
             state_dir=state_dir,
             poll_interval_seconds=poll_interval_seconds,
@@ -1378,6 +1530,7 @@ def cli(input_path, output_path, calc_base_url, format_id, limit, concurrency, d
             hybrid_min_match_rate=hybrid_min_match_rate,
             hybrid_max_leak_rate=hybrid_max_leak_rate,
             min_game_turns=min_game_turns,
+            exclude_match_ids=exclude_match_ids,
         )
     )
 

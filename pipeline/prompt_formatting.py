@@ -361,9 +361,14 @@ def format_p2_inferred_spreads_block(
     the player built themselves.
 
     Same one-sided constraint formatting as YOUR SPREADS via the shared
-    `_render_spread_line` helper. Returns empty string if there are no
-    species to render (e.g. Bo1 turn 1 before any opponent mon has
-    activated).
+    `_render_spread_line` helper, with one difference: a mon we've inferred
+    NOTHING about (its line would be `unknown`) is OMITTED rather than
+    printed. Empirically ~3/4 of opponent spread lines were `unknown` —
+    a wall of filler that cost tokens and taught little. This block now
+    surfaces only what we've actually inferred about the opponent so far;
+    everything else is simply absent (the roster/bench section still shows
+    which opponent mons exist, so omission isn't a backward-leak). Returns
+    "" when nothing has been inferred about any opponent mon yet.
     """
     p2 = snapshot.get("p2") or {}
     if species_universe is None:
@@ -379,11 +384,16 @@ def format_p2_inferred_spreads_block(
                 added.add(k)
     if not species_universe:
         return ""
-    lines: list[str] = ["=== OPP SPREADS (inferred) ==="]
+    body: list[str] = []
     for species in species_universe:
         entry = p2_knowledge.get(_species_key(species))
-        lines.append("  " + _render_spread_line(species, entry))
-    return "\n".join(lines)
+        rendered = _render_spread_line(species, entry)
+        if rendered.endswith(": unknown"):
+            continue  # nothing inferred yet — omit (don't print a wall of `unknown`)
+        body.append("  " + rendered)
+    if not body:
+        return ""
+    return "=== OPP SPREADS (inferred) ===\n" + "\n".join(body)
 
 
 # =============================================================================
