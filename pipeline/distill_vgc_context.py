@@ -1,42 +1,47 @@
-"""Distill champion-commentary transcripts → a tight teacher VGC context doc.
+"""Distill champion VGC commentary + analysis → a tight teacher context doc.
 
 Goal (per the project owner):
-    Compress raw transcripts of expert VGC commentary (Pokémon Company casts,
-    WolfeyVGC, etc.) into a SHORT, actionable strategic document that teaches
-    the CoT teacher to JUSTIFY decisions like a champion — not to recite
-    facts. Two layers are extracted:
+    Compress expert VGC sources into a SHORT, actionable strategy document that
+    teaches the CoT teacher to JUSTIFY decisions like a champion. THREE layers
+    are extracted:
 
-      1. **Decision framework** — the ordered sequence of questions a champion
-         works through each turn (e.g. identify win condition → assess threats
-         → check worst case → commit). This becomes a reasoning SCAFFOLD.
+      1. **Decision framework** — the ordered questions a champion works through
+         each turn (win condition → threats → worst case → speed/positioning →
+         commit). A reasoning SCAFFOLD.
       2. **Durable principles** — format-agnostic heuristics (positioning,
-         speed control, tempo, sacrifice timing, information denial). The
-         WHY matters more than the WHAT.
+         speed control, tempo, sacrifice timing, information denial).
+      3. **Strategic roles & archetypes** — the *synthesized* understanding of
+         WHY roles/Pokémon-types matter (Intimidate pivots, redirection,
+         Trick Room enablers, speed-control modes, win-condition types).
+         Captured at the durable level, not as a pick list.
 
-Pipeline (map-reduce so it scales past one context window):
-    • load + clean transcripts (strip VTT/SRT timestamps + caption-roll dups),
-    • MAP: chunk each transcript, extract candidate framework-steps + principles
-      from each chunk as structured JSON (concurrent),
-    • REDUCE: synthesize ALL candidates into one tight, deduped `vgc_context.md`.
+Sources (two, very different):
+    • Pokémon Company live-event commentary (transcripts_txt/*VGC*.txt) — play-
+      by-play; we keep the "what are they thinking" reads, drop match-specifics.
+    • WolfeyVGC video transcripts (wolfey_transcripts/*.json) — a large, MIXED
+      channel (~half is Nuzlockes / reactions / non-VGC). An LLM RELEVANCE GATE
+      keeps only competitive-VGC strategy OR strategic analysis.
 
-Cost: small — a handful of Gemini calls proportional to transcript length;
-effectively $0 on the GCP credits. This is NOT the large synthesis job.
+Format-staleness guard (important):
+    The Wolfey corpus spans years and formats (Dynamax, old regs). Per-Pokémon
+    tier claims and obsolete mechanics do NOT transfer to Reg I 2026. Every
+    prompt is told to extract the DURABLE, mechanism-grounded "why" and to drop
+    dated tier lists / obsolete-format specifics (Dynamax, Z-moves, etc.).
 
-Output is for HUMAN REVIEW before it's wired into the system prompt — a
-curated doc rides on every one of ~93K training rows, so a wrong/generic
-principle would propagate everywhere.
+Pipeline: load → relevance-gate (flash) → MAP 3 layers (pro, concurrent) →
+hierarchical REDUCE (pro) → tight vgc_context.md for HUMAN REVIEW.
+
+Cost: small (a few $ on credits). NOT the large per-row synthesis job.
 
 Isolation contract:
-    Reads `teacher/transcripts/*`, calls Gemini via the google-genai SDK
-    (Vertex when GOOGLE_GENAI_USE_VERTEXAI=true), writes one markdown file.
-    No calc service, no pipeline-module imports.
+    Reads teacher/transcripts/*, calls Gemini via google-genai (Vertex when
+    GOOGLE_GENAI_USE_VERTEXAI=true), writes one markdown file. No pipeline imports.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-import re
 from pathlib import Path
 from typing import Any
 
@@ -45,55 +50,54 @@ from google import genai
 from google.genai import types as genai_types
 
 TEACHER_DIR = Path(__file__).resolve().parent / "teacher"
-DEFAULT_INPUT_DIR = TEACHER_DIR / "transcripts"
+TRANSCRIPTS = TEACHER_DIR / "transcripts"
 DEFAULT_OUTPUT = TEACHER_DIR / "vgc_context.md"
-DEFAULT_MODEL = os.environ.get("TEACHER_MODEL_GOOGLE", "gemini-3.1-pro-preview")
 
-# ~30k chars ≈ 7.5k tokens per map chunk — small enough for fast, focused
-# extraction, large enough to keep each chunk's strategic thread intact.
+MAP_MODEL = os.environ.get("TEACHER_MODEL_GOOGLE", "gemini-3.1-pro-preview")
+GATE_MODEL = os.environ.get("GATE_MODEL_GOOGLE", "gemini-3.5-flash")  # cheap; global-endpoint OK
+
 CHUNK_CHARS = 30_000
-MAP_CONCURRENCY = 6
-
-_VTT_TS = re.compile(r"^\d{2}:\d{2}:\d{2}[.,]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[.,]\d{3}.*$")
-_SRT_IDX = re.compile(r"^\d+$")
-_INLINE_TS = re.compile(r"<\d{2}:\d{2}:\d{2}[.,]\d{3}>")
-_TAGS = re.compile(r"</?c[^>]*>")
+MAP_CONCURRENCY = 8
+GATE_CONCURRENCY = 16
+GATE_SNIPPET_CHARS = 2400      # title + this much transcript is plenty to classify
+REDUCE_BATCH = 40             # chunk-extracts per intermediate reduce
 
 
-def _clean_caption_text(text: str) -> str:
-    """Strip VTT/SRT timestamps, cue indices, inline tags, and collapse the
-    rolling-caption duplication YouTube auto-captions produce (each line
-    repeats the previous line plus a few new words)."""
-    lines: list[str] = []
-    for raw in text.splitlines():
-        ln = _TAGS.sub("", _INLINE_TS.sub("", raw)).strip()
-        if not ln or ln in ("WEBVTT",) or _VTT_TS.match(ln) or _SRT_IDX.match(ln):
-            continue
-        if ln.startswith(("Kind:", "Language:", "NOTE ")):
-            continue
-        lines.append(ln)
-    # Drop a line that is a prefix of the next (rolling caption), and
-    # consecutive exact duplicates.
-    out: list[str] = []
-    for i, ln in enumerate(lines):
-        if i + 1 < len(lines) and lines[i + 1].startswith(ln):
-            continue
-        if out and out[-1] == ln:
-            continue
-        out.append(ln)
-    return " ".join(out)
+# ---------------------------------------------------------------------------
+# Loading
+# ---------------------------------------------------------------------------
 
 
-def load_transcripts(input_dir: Path) -> list[tuple[str, str]]:
-    out: list[tuple[str, str]] = []
-    for p in sorted(input_dir.iterdir()):
-        if p.suffix.lower() not in (".txt", ".vtt", ".srt", ".md") or p.name == "README.txt":
+def load_commentary(d: Path) -> list[dict[str, Any]]:
+    """Pokémon Company commentary — VGC files only (TCG/GO excluded by name)."""
+    out = []
+    sub = d / "transcripts_txt"
+    if not sub.is_dir():
+        return out
+    for p in sorted(sub.glob("*.txt")):
+        if "VGC" not in p.name:
             continue
-        text = p.read_text(errors="ignore")
-        if p.suffix.lower() in (".vtt", ".srt"):
-            text = _clean_caption_text(text)
-        if text.strip():
-            out.append((p.name, text))
+        # Strip "[HH:MM:SS] Speaker N:" prefixes to flowing text.
+        import re
+        text = re.sub(r"\[\d{2}:\d{2}:\d{2}\]\s*Speaker\s*\d+:\s*", " ", p.read_text(errors="ignore"))
+        out.append({"id": p.stem, "title": p.stem, "text": " ".join(text.split()), "source": "pokemon-company"})
+    return out
+
+
+def load_wolfey(d: Path) -> list[dict[str, Any]]:
+    out = []
+    sub = d / "wolfey_transcripts"
+    if not sub.is_dir():
+        return out
+    for p in sorted(sub.glob("*.json")):
+        try:
+            j = json.loads(p.read_text(errors="ignore"))
+        except json.JSONDecodeError:
+            continue
+        text = (j.get("transcript_text") or "").strip()
+        if text:
+            out.append({"id": j.get("video_id", p.stem), "title": j.get("title", ""),
+                        "text": text, "source": "wolfey"})
     return out
 
 
@@ -103,7 +107,7 @@ def _chunks(text: str, size: int = CHUNK_CHARS) -> list[str]:
     parts, i = [], 0
     while i < len(text):
         end = min(i + size, len(text))
-        if end < len(text):  # back up to a sentence boundary
+        if end < len(text):
             dot = text.rfind(". ", i + size // 2, end)
             if dot != -1:
                 end = dot + 1
@@ -112,124 +116,208 @@ def _chunks(text: str, size: int = CHUNK_CHARS) -> list[str]:
     return parts
 
 
-# Structured output for the MAP step.
-_MAP_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "decision_steps": {
-            "type": "array",
-            "description": "Ordered questions/checks a strong player works through on a turn.",
-            "items": {"type": "object", "properties": {
-                "step": {"type": "string", "description": "Short name, e.g. 'Identify the win condition'."},
-                "questions": {"type": "string", "description": "The concrete question(s) they ask."},
-                "why": {"type": "string"},
-            }, "required": ["step", "questions", "why"]},
-        },
-        "principles": {
-            "type": "array",
-            "description": "Durable, format-agnostic strategic principles.",
-            "items": {"type": "object", "properties": {
-                "principle": {"type": "string"},
-                "why": {"type": "string"},
-                "applies_when": {"type": "string"},
-            }, "required": ["principle", "why", "applies_when"]},
-        },
-    },
-    "required": ["decision_steps", "principles"],
-}
+# ---------------------------------------------------------------------------
+# Relevance gate (flash) — keep VGC strategy OR strategic analysis
+# ---------------------------------------------------------------------------
 
-_MAP_SYS = """You are extracting reusable VGC (Gen 9 doubles) strategy from a \
-chunk of expert commentary/coaching transcript. Pull out TWO things:
+_GATE_SYS = """You decide if a video is useful for distilling COMPETITIVE \
+Pokémon VGC (doubles) strategic knowledge.
 
-1. decision_steps — the ordered questions a champion asks themselves on a turn \
-(win condition, threat assessment, worst-case / what-loses-me-the-game, speed \
-& positioning, then commit). Capture the THOUGHT PROCESS, not match-specific facts.
-2. principles — durable, FORMAT-AGNOSTIC heuristics (positioning, speed control, \
-tempo, sacrificing, information denial, preserving win conditions). The WHY matters.
+INCLUDE (relevant=true) if it contains any transferable competitive substance:
+  • turn-by-turn decision-making / match analysis / tournament games,
+  • team building, EV/spread reasoning, damage/speed benchmarks,
+  • strategic principles (positioning, speed control, tempo, sacrificing),
+  • the strategic ROLE or VALUE of Pokémon/archetypes — e.g. "top 10", tier
+    talk, "why X is good". We want the SYNTHESIZED reasoning (why a role
+    matters), even if the specific Pokémon is format-dated.
 
-Ignore: specific team lists, specific games, banter, sponsor reads, anything \
-tied to one match or one season's metagame. Only timeless decision-making. If a \
-chunk has nothing reusable, return empty arrays. Be concise."""
+EXCLUDE (relevant=false) pure entertainment with no transferable VGC strategy:
+  Nuzlockes, randomizers, ROM hacks, non-VGC games (Snap, Legends Arceus, etc.),
+  franchise/character rankings, reactions to unrelated content, IRL vlogs,
+  unboxings, music. When unsure, lean INCLUDE — the downstream extractor drops
+  fluff per chunk."""
 
-_REDUCE_SYS = """You are the editor producing the FINAL distilled strategy doc \
-that will be injected into an AI's system prompt to teach it to reason like a \
-champion VGC (Gen 9 doubles) player. You are given many candidate decision-steps \
-and principles extracted from expert commentary.
-
-Produce a TIGHT markdown document (target 400–800 words MAX — it rides on every \
-training example) with exactly two sections:
-
-## How a champion reasons each turn
-A single, canonical, ordered decision sequence (merge/dedupe the candidates into \
-~4–7 steps). For each step: the question(s) to ask and a one-line why. This is a \
-way of THINKING to internalize, not a checklist to recite.
-
-## Durable principles
-~6–12 of the strongest, most generalizable principles (merge/dedupe). One line \
-each: the principle + its why.
-
-Rules: ruthless deduplication; drop anything format-specific, anything tied to a \
-single game, and any fact a damage calculator already provides. Prefer crisp, \
-imperative phrasing. Output ONLY the markdown, no preamble."""
+_GATE_SCHEMA = {"type": "object", "properties": {
+    "relevant": {"type": "boolean"},
+    "reason": {"type": "string", "description": "≤12 words"},
+}, "required": ["relevant", "reason"]}
 
 
-async def _map_chunk(client: genai.Client, model: str, chunk: str, sem: asyncio.Semaphore) -> dict[str, Any]:
+async def _gate_one(client: genai.Client, item: dict, sem: asyncio.Semaphore) -> bool:
+    async with sem:
+        prompt = f"TITLE: {item['title']}\n\nTRANSCRIPT START:\n{item['text'][:GATE_SNIPPET_CHARS]}"
+        try:
+            r = await client.aio.models.generate_content(
+                model=GATE_MODEL,
+                contents=[genai_types.Content(role="user", parts=[genai_types.Part(text=prompt)])],
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=_GATE_SYS, response_mime_type="application/json",
+                    response_schema=_GATE_SCHEMA, temperature=0.0),
+            )
+            return bool(json.loads(r.text or "{}").get("relevant", True))
+        except Exception:  # noqa: BLE001 — fail-open (keep) on gate errors
+            return True
+
+
+# ---------------------------------------------------------------------------
+# MAP — 3-layer extraction
+# ---------------------------------------------------------------------------
+
+_MAP_SCHEMA = {"type": "object", "properties": {
+    "decision_steps": {"type": "array", "items": {"type": "object", "properties": {
+        "step": {"type": "string"}, "questions": {"type": "string"}, "why": {"type": "string"},
+    }, "required": ["step", "questions", "why"]}},
+    "principles": {"type": "array", "items": {"type": "object", "properties": {
+        "principle": {"type": "string"}, "why": {"type": "string"}, "applies_when": {"type": "string"},
+    }, "required": ["principle", "why", "applies_when"]}},
+    "roles": {"type": "array", "items": {"type": "object", "properties": {
+        "role": {"type": "string", "description": "e.g. 'Intimidate pivot', 'redirector', 'Trick Room setter'"},
+        "why_it_matters": {"type": "string"}, "durable": {"type": "boolean", "description": "true if format-agnostic (NOT Dynamax/old-gen-specific)"},
+    }, "required": ["role", "why_it_matters", "durable"]}},
+}, "required": ["decision_steps", "principles", "roles"]}
+
+_MAP_SYS = """Extract reusable VGC (Gen 9 doubles) strategic knowledge from this \
+transcript chunk, in THREE layers:
+
+1. decision_steps — the ordered questions a champion asks on a turn (win
+   condition, threats, worst-case / what loses me the game, speed & positioning,
+   then commit). The THOUGHT PROCESS, not match facts.
+2. principles — durable, FORMAT-AGNOSTIC heuristics (positioning, speed control,
+   tempo, sacrificing, information denial). The WHY matters.
+3. roles — the strategic ROLE/value of an archetype and WHY it matters
+   (Intimidate pivots, redirection, Trick Room enablers, speed-control modes,
+   win-condition types, disruption). Set durable=false if it depends on an
+   obsolete mechanic (Dynamax, Z-moves) or a specific dated metagame.
+
+CRITICAL: capture the timeless "WHY", not the dated "WHAT". Ignore: specific
+team lists, specific games/players, banter, sponsor reads, and any claim a
+damage calculator already provides. Empty arrays if nothing reusable."""
+
+
+async def _map_chunk(client: genai.Client, chunk: str, sem: asyncio.Semaphore) -> dict[str, Any]:
     async with sem:
         try:
-            resp = await client.aio.models.generate_content(
-                model=model,
+            r = await client.aio.models.generate_content(
+                model=MAP_MODEL,
                 contents=[genai_types.Content(role="user", parts=[genai_types.Part(text=chunk)])],
                 config=genai_types.GenerateContentConfig(
-                    system_instruction=_MAP_SYS,
-                    response_mime_type="application/json",
-                    response_schema=_MAP_SCHEMA,
-                    temperature=0.2,
-                ),
+                    system_instruction=_MAP_SYS, response_mime_type="application/json",
+                    response_schema=_MAP_SCHEMA, temperature=0.2),
             )
-            return json.loads(resp.text or "{}")
-        except Exception as e:  # noqa: BLE001 — one bad chunk shouldn't sink the run
-            click.echo(f"  [map] chunk failed: {type(e).__name__}: {e}", err=True)
-            return {"decision_steps": [], "principles": []}
+            return json.loads(r.text or "{}")
+        except Exception as e:  # noqa: BLE001
+            click.echo(f"  [map] chunk failed: {type(e).__name__}", err=True)
+            return {"decision_steps": [], "principles": [], "roles": []}
 
 
-async def _reduce(client: genai.Client, model: str, mapped: list[dict[str, Any]]) -> str:
-    steps = [s for m in mapped for s in (m.get("decision_steps") or [])]
-    principles = [p for m in mapped for p in (m.get("principles") or [])]
-    payload = json.dumps({"decision_steps": steps, "principles": principles}, indent=1)
-    resp = await client.aio.models.generate_content(
-        model=model,
-        contents=[genai_types.Content(role="user", parts=[genai_types.Part(
-            text=f"Candidate extractions ({len(steps)} steps, {len(principles)} principles):\n\n{payload}")])],
-        config=genai_types.GenerateContentConfig(system_instruction=_REDUCE_SYS, temperature=0.3),
+# ---------------------------------------------------------------------------
+# REDUCE — hierarchical (batch → intermediate → final)
+# ---------------------------------------------------------------------------
+
+_REDUCE_INTERMEDIATE_SYS = """Merge and DEDUPLICATE these candidate VGC strategy \
+extractions into a compact intermediate set. Keep the strongest, most general \
+decision-steps, principles, and roles; drop duplicates, match-specifics, and \
+anything tied to an obsolete mechanic (Dynamax/Z-moves) or a dated metagame. \
+Return the same JSON shape (decision_steps, principles, roles)."""
+
+_REDUCE_FINAL_SYS = """You are the editor producing the FINAL distilled strategy \
+doc, injected into an AI's system prompt to teach it to reason like a champion \
+VGC (Gen 9 doubles, Tera era) player.
+
+Produce TIGHT markdown (target 500–900 words MAX — it rides on every training \
+row) with exactly three sections:
+
+## How a champion reasons each turn
+One canonical, ordered decision sequence (~4–7 steps). Each: the question(s) to \
+ask + a one-line why. A way of THINKING to internalize, NOT a checklist to recite.
+
+## Durable principles
+~6–12 strongest, most generalizable principles. One line each: principle + why.
+
+## Strategic roles & archetypes
+~6–12 archetype roles and WHY each matters (Intimidate pivot, redirector, Trick \
+Room setter/attacker, speed control, win-condition, disruption). Mechanism-level \
+and FORMAT-AGNOSTIC.
+
+Hard rules: ruthless dedup; Gen-9 Tera era only — DROP anything Dynamax/Z-move/ \
+old-gen-specific and any dated tier list or specific-pick claim; drop anything a \
+damage calculator already gives. Crisp imperative phrasing. Output ONLY the \
+markdown."""
+
+
+def _flatten(maps: list[dict]) -> dict[str, list]:
+    return {k: [x for m in maps for x in (m.get(k) or [])] for k in ("decision_steps", "principles", "roles")}
+
+
+async def _reduce_batch(client: genai.Client, sys: str, payload: dict, schema=_MAP_SCHEMA) -> dict:
+    r = await client.aio.models.generate_content(
+        model=MAP_MODEL,
+        contents=[genai_types.Content(role="user", parts=[genai_types.Part(text=json.dumps(payload))])],
+        config=genai_types.GenerateContentConfig(system_instruction=sys,
+                                                 response_mime_type="application/json",
+                                                 response_schema=schema, temperature=0.3),
     )
-    return (resp.text or "").strip()
+    return json.loads(r.text or "{}")
+
+
+async def _reduce(client: genai.Client, maps: list[dict]) -> str:
+    # Stage 1: batch-reduce to keep each call's input bounded.
+    intermediates: list[dict] = []
+    for i in range(0, len(maps), REDUCE_BATCH):
+        intermediates.append(await _reduce_batch(client, _REDUCE_INTERMEDIATE_SYS, _flatten(maps[i:i + REDUCE_BATCH])))
+    merged = _flatten(intermediates)
+    click.echo(f"  reduced to {len(merged['decision_steps'])} steps, "
+               f"{len(merged['principles'])} principles, {len(merged['roles'])} roles → final pass")
+    # Stage 2: final markdown.
+    r = await client.aio.models.generate_content(
+        model=MAP_MODEL,
+        contents=[genai_types.Content(role="user", parts=[genai_types.Part(text=json.dumps(merged))])],
+        config=genai_types.GenerateContentConfig(system_instruction=_REDUCE_FINAL_SYS, temperature=0.3),
+    )
+    return (r.text or "").strip()
 
 
 @click.command()
-@click.option("--input-dir", type=click.Path(file_okay=False, path_type=Path), default=str(DEFAULT_INPUT_DIR), show_default=True)
+@click.option("--input-dir", type=click.Path(file_okay=False, path_type=Path), default=str(TRANSCRIPTS), show_default=True)
 @click.option("--output", "output_path", type=click.Path(dir_okay=False, path_type=Path), default=str(DEFAULT_OUTPUT), show_default=True)
-@click.option("--model", default=DEFAULT_MODEL, show_default=True)
-def cli(input_dir: Path, output_path: Path, model: str) -> None:
-    """Distill the transcripts in --input-dir into a tight vgc_context.md."""
-    transcripts = load_transcripts(input_dir)
-    if not transcripts:
-        raise click.ClickException(
-            f"no transcripts in {input_dir} (drop .txt/.vtt/.srt/.md files there)")
-    all_chunks = [(name, c) for name, text in transcripts for c in _chunks(text)]
-    total_chars = sum(len(c) for _, c in all_chunks)
-    click.echo(f"loaded {len(transcripts)} transcript(s) → {len(all_chunks)} chunks "
-               f"(~{total_chars//4:,} tokens) | model={model}")
+@click.option("--gate/--no-gate", default=True, show_default=True, help="LLM relevance gate on the Wolfey corpus.")
+@click.option("--gate-only", is_flag=True, help="Run only the relevance gate + report kept/dropped (no map/reduce).")
+@click.option("--max-videos", type=int, default=None, help="Cap Wolfey videos (after gate) — for a cheap trial run.")
+def cli(input_dir: Path, output_path: Path, gate: bool, gate_only: bool, max_videos: int | None) -> None:
+    """Distill the transcripts into a tight teacher/vgc_context.md."""
+    commentary = load_commentary(input_dir)
+    wolfey = load_wolfey(input_dir)
+    click.echo(f"loaded: {len(commentary)} VGC commentary files, {len(wolfey)} Wolfey videos "
+               f"| gate_model={GATE_MODEL} map_model={MAP_MODEL}")
 
-    async def run() -> str:
+    async def run() -> str | None:
         client = genai.Client()
+        kept_wolfey = wolfey
+        if gate and wolfey:
+            sem = asyncio.Semaphore(GATE_CONCURRENCY)
+            flags = await asyncio.gather(*(_gate_one(client, v, sem) for v in wolfey))
+            kept_wolfey = [v for v, ok in zip(wolfey, flags) if ok]
+            click.echo(f"  relevance gate: kept {len(kept_wolfey)}/{len(wolfey)} Wolfey videos")
+        if max_videos:
+            kept_wolfey = kept_wolfey[:max_videos]
+            click.echo(f"  --max-videos: trimmed to {len(kept_wolfey)} Wolfey videos")
+        if gate_only:
+            return None
+
+        items = commentary + kept_wolfey
+        all_chunks = [c for it in items for c in _chunks(it["text"])]
+        click.echo(f"  mapping {len(all_chunks)} chunks (~{sum(len(c) for c in all_chunks)//4:,} tokens)…")
         sem = asyncio.Semaphore(MAP_CONCURRENCY)
-        mapped = await asyncio.gather(*(_map_chunk(client, model, c, sem) for _, c in all_chunks))
-        ns = sum(len(m.get("decision_steps") or []) for m in mapped)
-        npr = sum(len(m.get("principles") or []) for m in mapped)
-        click.echo(f"  mapped: {ns} candidate steps, {npr} candidate principles → reducing…")
-        return await _reduce(client, model, list(mapped))
+        maps = await asyncio.gather(*(_map_chunk(client, c, sem) for c in all_chunks))
+        f = _flatten(list(maps))
+        click.echo(f"  mapped: {len(f['decision_steps'])} steps, {len(f['principles'])} principles, "
+                   f"{len(f['roles'])} roles → reducing…")
+        return await _reduce(client, list(maps))
 
     doc = asyncio.run(run())
+    if doc is None:
+        click.echo("gate-only: done (no doc written).")
+        return
     output_path.write_text(doc + "\n")
     click.echo(f"\nwrote {output_path}  ({len(doc)} chars ≈ {len(doc)//4} tokens)")
     click.echo("REVIEW it before wiring into the system prompt — it rides on every training row.")

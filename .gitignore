@@ -21,3 +21,6 @@ data_scraper/scrape_full.log
 # Pipeline output
 pipeline/parsed_data/
 pipeline/data/
+
+# Teacher VGC-context source transcripts (large; distilled into teacher/vgc_context.md, which IS tracked)
+pipeline/teacher/transcripts/
