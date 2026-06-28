@@ -15,11 +15,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import time
+from pathlib import Path
 from typing import Any
 
 import aiohttp
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 
 from .base import (
@@ -38,6 +41,77 @@ from .base import (
 )
 
 DEFAULT_MODEL_GOOGLE = os.environ.get("TEACHER_MODEL_GOOGLE", "gemini-3.1-pro-preview")
+
+# Vertex quota on a fresh project is tight; 429 RESOURCE_EXHAUSTED (and the
+# transient 503 UNAVAILABLE) are expected under concurrent load. Without
+# backoff a single 429 kills the whole match (per-match atomic commit → 0
+# rows). Exponential backoff + jitter rides them out. Tunable via env so a
+# corpus-scale run can widen the budget without a code change.
+_BACKOFF_MAX_RETRIES = int(os.environ.get("GEMINI_BACKOFF_RETRIES", "6"))
+_BACKOFF_BASE_SECONDS = float(os.environ.get("GEMINI_BACKOFF_BASE", "2.0"))
+_BACKOFF_CAP_SECONDS = 60.0
+_RETRYABLE_STATUS = (429, 503)
+
+
+def _is_retryable_api_error(exc: Exception) -> bool:
+    """True for rate-limit (429) / transient-unavailable (503) Gemini errors."""
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if code in _RETRYABLE_STATUS:
+        return True
+    text = str(exc)
+    return "RESOURCE_EXHAUSTED" in text or "UNAVAILABLE" in text
+
+
+# --- Quality levers for the flash teacher -----------------------------------
+# Provisioned Throughput for pro-preview is economically absurd ($93.6K/wk), so
+# the production teacher is gemini-3.5-flash on (free) Dynamic Shared Quota.
+# Flash's raw CoTs run ~40% thinner than pro's; two cheap levers close the gap:
+#   1. THINKING BUDGET — flash defaults to shallow thinking. Forcing a budget
+#      (~pro's observed ~1.7K thoughts) restores reasoning depth. Note the
+#      budget counts toward output, so max_output_tokens must clear budget +
+#      the function-call response (the bug that made the first probe emit no
+#      submit_decision: budget 4096 == max 4096 left no room for the call).
+#   2. FEW-SHOT EXEMPLARS — prepend curated pro turn-analyses so flash imitates
+#      the calc-grounding + alternative-evaluation it otherwise drops.
+# All env-tunable so pro runs (budget 0 → model default, no exemplars) are
+# unaffected unless explicitly opted in.
+_THINKING_BUDGET = int(os.environ.get("GEMINI_THINKING_BUDGET", "0"))  # 0=model default; >0 forces depth; -1=dynamic
+_MAX_OUTPUT_TOKENS = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", "4096"))
+_EXEMPLARS_PATH = Path(__file__).resolve().parent / "synthesis_exemplars.json"
+
+
+def _load_fewshot_preamble() -> str:
+    """Build the multi-shot exemplar preamble, or '' when disabled/absent.
+
+    Exemplars live in synthesis_exemplars.json as [{"user","cot"}]. They MUST
+    come from holdout matches (never the training corpus) so a synthesized turn
+    can't see a near-neighbor's answer. Toggle off with VGC_FEWSHOT_ENABLED=0.
+    """
+    if os.environ.get("VGC_FEWSHOT_ENABLED", "1").strip().lower() in ("0", "false", "no"):
+        return ""
+    try:
+        exemplars = json.loads(_EXEMPLARS_PATH.read_text(encoding="utf-8"))
+    except OSError:
+        return ""
+    if not exemplars:
+        return ""
+    blocks = [
+        f"=== EXAMPLE EXPERT ANALYSIS ===\n{ex['user']}\n"
+        f"--- Expert's reasoning (match this depth: exact damage %s, disproves the rejected line) ---\n"
+        f"{ex['cot']}\n=== END EXAMPLE ==="
+        for ex in exemplars
+    ]
+    return (
+        "Below are worked examples of expert turn analysis from UNRELATED games. Match their "
+        "analytical depth, their grounding in exact damage percentages, and their habit of "
+        "disproving the rejected alternative — then analyze the CURRENT turn the same way. Reason "
+        "ONLY about the current board; the examples are for style, not content.\n\n"
+        + "\n\n".join(blocks)
+        + "\n\n=== CURRENT TURN (analyze this one) ===\n"
+    )
+
+
+_FEWSHOT_PREAMBLE = _load_fewshot_preamble()
 
 
 def _to_function_declaration(openai_tool: dict[str, Any]) -> dict[str, Any]:
@@ -184,6 +258,8 @@ class GoogleProvider(TeacherProvider):
         api_user_content = user_prompt + SYNTHESIS_GROUND_TRUTH_SUFFIX.format(
             ground_truth_json=json.dumps(human_action, indent=2)
         )
+        if _FEWSHOT_PREAMBLE:
+            api_user_content = _FEWSHOT_PREAMBLE + api_user_content
         # Gemini-native conversation buffer (list of Content)
         contents: list[Any] = [
             genai_types.Content(
@@ -224,22 +300,39 @@ class GoogleProvider(TeacherProvider):
                 function_calling_config=genai_types.FunctionCallingConfig(**fc_kwargs)
             )
 
-            try:
-                response = await asyncio.wait_for(
-                    self.client.aio.models.generate_content(
-                        model=self.model,
-                        contents=contents,
-                        config=genai_types.GenerateContentConfig(
-                            system_instruction=system_prompt,
-                            tools=[tool],
-                            tool_config=tool_config,
-                            max_output_tokens=4096,
-                        ),
-                    ),
-                    timeout=PER_CALL_TIMEOUT,
+            cfg_kwargs: dict[str, Any] = dict(
+                system_instruction=system_prompt,
+                tools=[tool],
+                tool_config=tool_config,
+                max_output_tokens=_MAX_OUTPUT_TOKENS,
+            )
+            if _THINKING_BUDGET != 0:
+                cfg_kwargs["thinking_config"] = genai_types.ThinkingConfig(
+                    thinking_budget=_THINKING_BUDGET
                 )
-            except asyncio.TimeoutError:
-                result.error = f"per-call timeout at iter {iter_idx} after {PER_CALL_TIMEOUT}s"
+            cfg = genai_types.GenerateContentConfig(**cfg_kwargs)
+            response = None
+            delay = _BACKOFF_BASE_SECONDS
+            for attempt in range(_BACKOFF_MAX_RETRIES + 1):
+                try:
+                    response = await asyncio.wait_for(
+                        self.client.aio.models.generate_content(
+                            model=self.model, contents=contents, config=cfg),
+                        timeout=PER_CALL_TIMEOUT,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    result.error = f"per-call timeout at iter {iter_idx} after {PER_CALL_TIMEOUT}s"
+                    return result
+                except genai_errors.APIError as e:
+                    if not _is_retryable_api_error(e) or attempt >= _BACKOFF_MAX_RETRIES:
+                        result.error = f"teacher API error at iter {iter_idx}: {type(e).__name__}: {e}"
+                        return result
+                    # 429/503 — back off (exponential + jitter) and retry the same turn.
+                    await asyncio.sleep(min(delay, _BACKOFF_CAP_SECONDS) + random.uniform(0.0, 1.0))
+                    delay *= 2
+            if response is None:  # defensive; loop either breaks or returns
+                result.error = f"teacher API: no response after retries at iter {iter_idx}"
                 return result
             result.iterations += 1
 

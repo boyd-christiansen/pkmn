@@ -53,12 +53,20 @@ TEACHER_DIR = Path(__file__).resolve().parent / "teacher"
 TRANSCRIPTS = TEACHER_DIR / "transcripts"
 DEFAULT_OUTPUT = TEACHER_DIR / "vgc_context.md"
 
-MAP_MODEL = os.environ.get("TEACHER_MODEL_GOOGLE", "gemini-3.1-pro-preview")
+# Extraction (map) is a fast-tier job — pull candidate steps/principles/roles
+# out of a chunk; flash is plenty and ~10× faster than pro. Synthesis (reduce)
+# is where judgment matters, so that stays on pro.
+MAP_MODEL = os.environ.get("MAP_MODEL_GOOGLE", "gemini-3.5-flash")
+REDUCE_MODEL = os.environ.get("TEACHER_MODEL_GOOGLE", "gemini-3.1-pro-preview")
 GATE_MODEL = os.environ.get("GATE_MODEL_GOOGLE", "gemini-3.5-flash")  # cheap; global-endpoint OK
 
 CHUNK_CHARS = 30_000
-MAP_CONCURRENCY = 8
-GATE_CONCURRENCY = 16
+MAP_CONCURRENCY = 16
+GATE_CONCURRENCY = 24
+# Per-call timeouts so one slow/hung call can't stall the whole asyncio.gather
+# (the bug that made the first run sit at >60 min).
+MAP_TIMEOUT = 90.0
+GATE_TIMEOUT = 45.0
 GATE_SNIPPET_CHARS = 2400      # title + this much transcript is plenty to classify
 REDUCE_BATCH = 40             # chunk-extracts per intermediate reduce
 
@@ -147,15 +155,15 @@ async def _gate_one(client: genai.Client, item: dict, sem: asyncio.Semaphore) ->
     async with sem:
         prompt = f"TITLE: {item['title']}\n\nTRANSCRIPT START:\n{item['text'][:GATE_SNIPPET_CHARS]}"
         try:
-            r = await client.aio.models.generate_content(
+            r = await asyncio.wait_for(client.aio.models.generate_content(
                 model=GATE_MODEL,
                 contents=[genai_types.Content(role="user", parts=[genai_types.Part(text=prompt)])],
                 config=genai_types.GenerateContentConfig(
                     system_instruction=_GATE_SYS, response_mime_type="application/json",
                     response_schema=_GATE_SCHEMA, temperature=0.0),
-            )
+            ), timeout=GATE_TIMEOUT)
             return bool(json.loads(r.text or "{}").get("relevant", True))
-        except Exception:  # noqa: BLE001 — fail-open (keep) on gate errors
+        except Exception:  # noqa: BLE001 — fail-open (keep) on gate error/timeout
             return True
 
 
@@ -197,15 +205,15 @@ damage calculator already provides. Empty arrays if nothing reusable."""
 async def _map_chunk(client: genai.Client, chunk: str, sem: asyncio.Semaphore) -> dict[str, Any]:
     async with sem:
         try:
-            r = await client.aio.models.generate_content(
+            r = await asyncio.wait_for(client.aio.models.generate_content(
                 model=MAP_MODEL,
                 contents=[genai_types.Content(role="user", parts=[genai_types.Part(text=chunk)])],
                 config=genai_types.GenerateContentConfig(
                     system_instruction=_MAP_SYS, response_mime_type="application/json",
                     response_schema=_MAP_SCHEMA, temperature=0.2),
-            )
+            ), timeout=MAP_TIMEOUT)
             return json.loads(r.text or "{}")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001 — fail-open (drop chunk) on error/timeout
             click.echo(f"  [map] chunk failed: {type(e).__name__}", err=True)
             return {"decision_steps": [], "principles": [], "roles": []}
 
@@ -251,7 +259,7 @@ def _flatten(maps: list[dict]) -> dict[str, list]:
 
 async def _reduce_batch(client: genai.Client, sys: str, payload: dict, schema=_MAP_SCHEMA) -> dict:
     r = await client.aio.models.generate_content(
-        model=MAP_MODEL,
+        model=REDUCE_MODEL,
         contents=[genai_types.Content(role="user", parts=[genai_types.Part(text=json.dumps(payload))])],
         config=genai_types.GenerateContentConfig(system_instruction=sys,
                                                  response_mime_type="application/json",
@@ -261,19 +269,28 @@ async def _reduce_batch(client: genai.Client, sys: str, payload: dict, schema=_M
 
 
 async def _reduce(client: genai.Client, maps: list[dict]) -> str:
-    # Stage 1: batch-reduce to keep each call's input bounded.
-    intermediates: list[dict] = []
-    for i in range(0, len(maps), REDUCE_BATCH):
-        intermediates.append(await _reduce_batch(client, _REDUCE_INTERMEDIATE_SYS, _flatten(maps[i:i + REDUCE_BATCH])))
-    merged = _flatten(intermediates)
+    # Stage 1: batch-reduce (CONCURRENT, timeout-guarded) to bound each call's input.
+    batches = [maps[i:i + REDUCE_BATCH] for i in range(0, len(maps), REDUCE_BATCH)]
+    sem = asyncio.Semaphore(8)
+
+    async def _one(b: list[dict]) -> dict:
+        async with sem:
+            try:
+                return await asyncio.wait_for(
+                    _reduce_batch(client, _REDUCE_INTERMEDIATE_SYS, _flatten(b)), timeout=120)
+            except Exception:  # noqa: BLE001 — drop a batch rather than stall
+                return {"decision_steps": [], "principles": [], "roles": []}
+
+    intermediates = await asyncio.gather(*(_one(b) for b in batches))
+    merged = _flatten(list(intermediates))
     click.echo(f"  reduced to {len(merged['decision_steps'])} steps, "
                f"{len(merged['principles'])} principles, {len(merged['roles'])} roles → final pass")
-    # Stage 2: final markdown.
-    r = await client.aio.models.generate_content(
-        model=MAP_MODEL,
+    # Stage 2: final markdown (single critical call — generous timeout).
+    r = await asyncio.wait_for(client.aio.models.generate_content(
+        model=REDUCE_MODEL,
         contents=[genai_types.Content(role="user", parts=[genai_types.Part(text=json.dumps(merged))])],
         config=genai_types.GenerateContentConfig(system_instruction=_REDUCE_FINAL_SYS, temperature=0.3),
-    )
+    ), timeout=180)
     return (r.text or "").strip()
 
 

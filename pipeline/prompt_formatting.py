@@ -5,12 +5,18 @@ Pipeline role:
     threat matrix block, the running KnowledgeState, and the full game
     history. Splits cleanly into:
 
-      - **Current frame** — board state, actives, benches (with
-        empty-slot annotation when a slot is genuinely vacant).
-      - **GAME-STATE LEDGER** — faints, Tera-used, field /
-        pseudo-weather / side conditions with turns-left, on-active
-        volatiles, choice locks, recent item events, and a
-        per-active Cumulative damage row.
+      - **GAME STATE** — a single unified board-state section: a
+        consolidated FIELD line (weather / terrain / pseudo-weather /
+        per-side conditions with turns-left), per-side `YOUR (P1):` /
+        `OPP (P2):` blocks with ACTIVE rows (HP / item / ability / tera /
+        moves, plus an indented `· `-suffix for volatiles + choice
+        locks) and BENCH rows (HP + item/ability/tera/moves), empty-slot
+        annotation when a slot is genuinely vacant, and a tail RECENT
+        ITEM EVENTS line. Replaces the old board-state header AND the
+        separate GAME-STATE LEDGER — per-mon HP carries cumulative
+        damage, the `(fainted)` flag carries faint counts, and per-mon
+        `tera`/`TERA-ACTIVE` carries Tera-used, so those ledger rows are
+        gone.
       - **TURN-BY-TURN** — every prior turn's events as
         compact one-liners.
       - **SERIES STATE** *(Bo3, game ≥ 2)* — per prior game header +
@@ -22,13 +28,17 @@ Pipeline role:
 
 Isolation contract:
     Pure data → string transforms. Imports `_species_key` from
-    `team_reconstruction` for opponent-bench filtering and Cumulative
-    damage attribution; no other sibling-module imports.
+    `team_reconstruction` (species normalizer) and the META-build lookups
+    from `meta_builds` (leaf data module) for the META BUILDS section; no
+    other sibling-module imports.
 """
 from __future__ import annotations
 
-from typing import Any
+import json
+from pathlib import Path
+from typing import Any, Mapping
 
+from meta_builds import MetaBuilds, get_chaos_meta, get_meta_builds
 from team_reconstruction import _species_key
 
 
@@ -85,34 +95,56 @@ def _summarize_bench(b: dict[str, Any]) -> str:
     return f"{b['species']}{' (fainted)' if b.get('fainted') else ''}"
 
 
+def _bench_hp_status(bench_entry: dict[str, Any]) -> str:
+    """`HP 100%` / `HP 0% (fainted)` / `HP 62% [par]` — graceful on old schema.
+
+    The bench snapshot now carries `hpPercent` + `status` (new fields). When
+    `hpPercent` is absent (old-schema parsed data during the schema
+    transition) we render `HP ?%` rather than crashing. A fainted mon always
+    reads `HP 0% (fainted)` regardless of the stored percent. `[status]` is
+    appended only when a non-None status is present on a non-fainted mon.
+    """
+    fainted = bool(bench_entry.get("fainted"))
+    if fainted:
+        return "HP 0% (fainted)"
+    hp = bench_entry.get("hpPercent")
+    hp_str = f"HP {hp}%" if hp is not None else "HP ?%"
+    status = bench_entry.get("status")
+    if status:
+        hp_str += f" [{status}]"
+    return hp_str
+
+
 def _summarize_bench_rich(
     bench_entry: dict[str, Any],
     metadata: dict[str, Any] | None,
 ) -> str:
-    """Multi-line per-mon bench rendering with item / ability / tera / moves.
+    """Multi-line per-mon bench rendering with HP / item / ability / tera / moves.
 
     When `metadata` is available (Bo3 team sheet, or Bo1 forward-scan
     reconstruction), renders two lines:
-        - Whimsicott @ Focus Sash, ability=Prankster, tera=Ghost
+        - Whimsicott  HP 100% @ Focus Sash, ability=Prankster, tera=Ghost
           moves: Tailwind / Moonblast / Encore / [UNREVEALED_MOVE]
 
     When `metadata is None` (Bo1 P2 bench, mon seen but no metadata
     captured yet — rare):
-        - Whimsicott (unknown — not yet revealed)
+        - Whimsicott  HP 100% (unknown — not yet revealed)
 
-    Fainted flag appended to the species line in either case.
+    HP / status come from `_bench_hp_status` (graceful `HP ?%` on
+    old-schema data that predates the bench HP fields). The fainted flag
+    is carried by the HP token (`HP 0% (fainted)`).
     """
     species = bench_entry.get("species") or "?"
-    fainted = " (fainted)" if bench_entry.get("fainted") else ""
+    hp = _bench_hp_status(bench_entry)
     if metadata is None:
-        return f"  - {species}{fainted} (unknown — not yet revealed)"
+        return f"  - {species}  {hp} (unknown — not yet revealed)"
     item = metadata.get("item") or "?"
     ability = metadata.get("ability") or "?"
     tera = metadata.get("teraType") or "?"
     moves = metadata.get("moves") or []
     moves_str = " / ".join(moves) if moves else "?"
     return (
-        f"  - {species}{fainted} @ {item}, ability={ability}, tera={tera}\n"
+        f"  - {species}  {hp} @ {item}, ability={ability}, tera={tera}\n"
         f"    moves: {moves_str}"
     )
 
@@ -397,6 +429,135 @@ def format_p2_inferred_spreads_block(
 
 
 # =============================================================================
+# META BUILDS (Smogon usage) — pre-filled possibility-space block
+# =============================================================================
+
+_STAT_LABELS = {"hp": "HP", "atk": "Atk", "def": "Def", "spa": "SpA", "spd": "SpD", "spe": "Spe"}
+_DEX_NAMES_PATH = Path(__file__).resolve().parent / "data" / "dex_names.json"
+_DEX_NAMES_CACHE: dict[str, dict[str, str]] | None = None
+
+
+def _dex_names() -> dict[str, dict[str, str]]:
+    """Lazy-load the PS-id → display-name dump (gen9 moves/items/abilities)."""
+    global _DEX_NAMES_CACHE
+    if _DEX_NAMES_CACHE is None:
+        try:
+            _DEX_NAMES_CACHE = json.loads(_DEX_NAMES_PATH.read_text(encoding="utf-8"))
+        except OSError:
+            _DEX_NAMES_CACHE = {}
+    return _DEX_NAMES_CACHE
+
+
+def _pretty_name(kind: str, ident: str) -> str:
+    """Chaos PS-id ('fakeout') → display name ('Fake Out'); title-case fallback."""
+    names = _dex_names().get(kind) or {}
+    return names.get(ident) or names.get(_species_key(ident)) or ident.replace("-", " ").title()
+
+
+def _ev_string(evs: Mapping[str, int]) -> str:
+    parts = [f"{evs[s]} {_STAT_LABELS[s]}" for s in ("hp", "atk", "def", "spa", "spd", "spe") if evs.get(s)]
+    return " / ".join(parts) if parts else "0 EVs (default)"
+
+
+def _shares_inline(shares: tuple, kind: str, *, runner_min: float = 15.0) -> str:
+    """'Safety Goggles 32% (Assault Vest 30%)' — runner-up only when >= runner_min."""
+    if not shares:
+        return "unknown"
+    top = shares[0]
+    out = f"{_pretty_name(kind, top.name)} {top.usage_pct:.0f}%"
+    if len(shares) > 1 and shares[1].usage_pct >= runner_min:
+        out += f" ({_pretty_name(kind, shares[1].name)} {shares[1].usage_pct:.0f}%)"
+    return out
+
+
+def _tera_inline(shares: tuple, *, runner_min: float = 15.0) -> str:
+    if not shares:
+        return "unknown"
+    top = shares[0]
+    out = f"{top.name.title()} {top.usage_pct:.0f}%"
+    if len(shares) > 1 and shares[1].usage_pct >= runner_min:
+        out += f" ({shares[1].name.title()} {shares[1].usage_pct:.0f}%)"
+    return out
+
+
+def _render_one_meta(b: MetaBuilds) -> list[str]:
+    head = f"[{b.species}]" + ("" if b.source == "chaos" else f"  ({b.source} — no usage data)")
+    lines = [head]
+    for i, s in enumerate(b.spreads, 1):
+        pct = f" ({s.usage_pct:.0f}%)" if s.usage_pct > 0 else ""
+        lines.append(f"  Spread {i}{pct}: {s.nature}  {_ev_string(s.evs)}")
+    if b.moves:
+        lines.append("  Moves (top): " + " · ".join(
+            f"{_pretty_name('moves', m.name)} {m.usage_pct:.0f}%" for m in b.moves))
+        lines.append(
+            f"  Item: {_shares_inline(b.items, 'items')}"
+            f" | Ability: {_shares_inline(b.abilities, 'abilities')}"
+            f" | Tera: {_tera_inline(b.tera_types)}"
+        )
+    else:
+        lines.append("  Moves / Item / Ability / Tera: unknown")
+    return lines
+
+
+def format_meta_builds(
+    snapshot: dict[str, Any],
+    p2_knowledge: dict[str, dict[str, dict[str, int]]],
+    *,
+    format_id: str | None,
+    species_universe: list[str] | None = None,
+) -> str:
+    """Render `=== META BUILDS ===` — top-2 Smogon builds per opponent mon.
+
+    Visibility mirrors `format_p2_inferred_spreads_block` exactly (Bo3 OTS: full
+    roster via `species_universe`; Bo1 CTS: only `seenSpecies`), so the section
+    never leaks an opponent mon the player hasn't seen.
+
+    `p2_knowledge` is accepted for the future observation-narrowing seam (unused
+    in v1 — see `meta_builds`). The data is marginal popularity rankings, NOT one
+    team's set: the header NOTE + the system-prompt Meta-Builds Rule say so.
+    """
+    p2 = snapshot.get("p2") or {}
+    if species_universe is None:
+        seen_keys = {_species_key(s) for s in (p2.get("seenSpecies") or [])}
+        species_universe = []
+        added: set[str] = set()
+        for p in (p2.get("active") or []) + (p2.get("bench") or []):
+            sp = p.get("species") or ""
+            k = _species_key(sp)
+            if k and k in seen_keys and k not in added:
+                species_universe.append(sp)
+                added.add(k)
+    if not species_universe:
+        return ""
+
+    body: list[str] = []
+    for species in species_universe:
+        try:
+            b = get_meta_builds(species, format_id)
+        except Exception:  # noqa: BLE001 — a data hiccup must never kill a turn
+            b = None
+        if b is None:
+            body.append(f"[{species}]\n  (no Smogon meta data)")
+            continue
+        body.append("\n".join(_render_one_meta(b)))
+    if not body:
+        return ""
+
+    meta = get_chaos_meta(format_id)
+    prov = ""
+    if meta:
+        bits = [str(meta.get("format_id") or "")]
+        if meta.get("cutoff") is not None:
+            bits.append(f"@{meta['cutoff']}")
+        if meta.get("month"):
+            bits.append(str(meta["month"]))
+        prov = " (Smogon usage, " + " ".join(x for x in bits if x) + ")"
+    # Marginality caveat lives in the system-prompt Meta-Builds Rule (teacher/base.py),
+    # not here — no need to repeat it on every turn's user prompt.
+    return f"=== META BUILDS{prov} ===\n" + "\n".join(body)
+
+
+# =============================================================================
 # Historical-context blocks (game-state ledger / turn-by-turn / series state)
 # =============================================================================
 
@@ -500,12 +661,267 @@ def _walk_events_with_slot_species(
             _apply_event_to_slot_map(slot_species, ev)
 
 
+_FIELD_DISPLAY = {
+    "trickroom": "Trick Room", "gravity": "Gravity", "magicroom": "Magic Room",
+    "wonderroom": "Wonder Room", "lightscreen": "Light Screen", "reflect": "Reflect",
+    "auroraveil": "Aurora Veil", "tailwind": "Tailwind", "stealthrock": "Stealth Rock",
+    "spikes": "Spikes", "toxicspikes": "Toxic Spikes", "stickyweb": "Sticky Web",
+    "safeguard": "Safeguard", "mist": "Mist", "luckychant": "Lucky Chant",
+}
+
+
+def _pretty_field(ident: str) -> str:
+    """Pseudo-weather / side-condition id → display name; title-case fallback."""
+    return _FIELD_DISPLAY.get(ident, _FIELD_DISPLAY.get(_species_key(ident), ident.replace("_", " ").title()))
+
+
+def _field_line(snapshot: dict[str, Any]) -> str:
+    """Consolidated FIELD line: weather / terrain / pseudo-weather + per-side
+    conditions, each with turns-left where known. `FIELD: none` when empty.
+
+    Reuses the exact field / pseudo-weather / side-condition logic that
+    used to live in `format_game_state_ledger`, collapsed onto one line
+    separated by ` | `.
+    """
+    p1, p2 = snapshot.get("p1", {}), snapshot.get("p2", {})
+    field = snapshot.get("field", {}) or {}
+
+    # Weather / terrain / pseudo-weather aggregate into a single "field" group.
+    field_parts: list[str] = []
+    if field.get("weather"):
+        field_parts.append(f"{field['weather']}{_maybe_turns_left(field.get('weatherTurnsLeft'))}")
+    if field.get("terrain"):
+        field_parts.append(f"{field['terrain']}{_maybe_turns_left(field.get('terrainTurnsLeft'))}")
+    pw = field.get("pseudoWeather") or {}
+    for pwid, info in pw.items():
+        field_parts.append(f"{_pretty_field(pwid)}{_maybe_turns_left((info or {}).get('turnsLeft'))}")
+
+    groups: list[str] = []
+    if field_parts:
+        groups.append(", ".join(field_parts))
+
+    # Per-side conditions (tailwind / screens / spikes / safeguard).
+    for side, side_snap, twin_active, tw_left in (
+        ("P1", p1, field.get("tailwindP1"), field.get("tailwindP1TurnsLeft")),
+        ("P2", p2, field.get("tailwindP2"), field.get("tailwindP2TurnsLeft")),
+    ):
+        sc = side_snap.get("sideConditions") or {}
+        sc_parts: list[str] = []
+        if twin_active:
+            sc_parts.append(f"Tailwind{_maybe_turns_left(tw_left)}")
+        for sid, info in sc.items():
+            info = info or {}
+            level = info.get("level")
+            tl = info.get("turnsLeft")
+            label = _pretty_field(sid)
+            if level is not None:
+                label += f" L{level}"
+            sc_parts.append(f"{label}{_maybe_turns_left(tl)}")
+        if sc_parts:
+            groups.append(f"{side}: " + ", ".join(sc_parts))
+
+    if not groups:
+        return "FIELD: none"
+    return "FIELD: " + " | ".join(groups)
+
+
+def _active_state_suffix(active: dict[str, Any]) -> str:
+    """One-line ` · `-joined suffix of an active mon's volatiles + choice lock.
+
+    Returns "" when the mon carries no volatile and no choice lock. The
+    volatile rendering mirrors the old ledger's `vname` switch exactly
+    (Substitute / Encore / Disable / Taunt / Heal Block / Perish /
+    confusion / Leech Seed / passthrough), and the choice lock renders as
+    `locked into <move>`. Caller renders it as an indented continuation
+    line under the ACTIVE row. Boosts stay on the ACTIVE row itself (via
+    `_summarize_active`) and are intentionally NOT duplicated here.
+    """
+    bits: list[str] = []
+    vols = active.get("volatiles") or {}
+    for vname, vinfo in vols.items():
+        vinfo = vinfo or {}
+        if vname == "substitute":
+            hp = vinfo.get("hp")
+            bits.append("Substitute" + (f" ({hp} HP)" if hp is not None else ""))
+        elif vname == "encored":
+            bits.append("Encore-locked (can only repeat its last move, or switch)")
+        elif vname == "disabled":
+            bits.append("has a move Disabled (that move is unavailable this turn)")
+        elif vname == "taunt":
+            bits.append(f"Taunt{_maybe_turns_left(vinfo.get('turnsLeft'))}")
+        elif vname == "healBlock":
+            bits.append(f"Heal Block{_maybe_turns_left(vinfo.get('turnsLeft'))}")
+        elif vname == "perishCount":
+            bits.append(f"Perish {vinfo}")
+        elif vname == "confusion":
+            bits.append(f"confused{_maybe_turns_left(vinfo.get('turnsLeft'))}")
+        elif vname == "leechSeed":
+            bits.append("Leech-Seeded")
+        else:
+            bits.append(str(vname))
+    lock = active.get("choiceLockedInto")
+    if lock:
+        bits.append(f"locked into {lock}")
+    if not bits:
+        return ""
+    return "         · " + " · ".join(bits)
+
+
+def _recent_item_events_line(
+    snapshots_so_far: list[dict[str, Any]],
+    current_idx: int,
+) -> str:
+    """`RECENT ITEM EVENTS: ...` tail line — last 4 item events, or "" if none.
+
+    Walked with slot-species context so the per-event species at the time
+    of the consumption is rendered alongside the slot label (handles cases
+    where a switch earlier in the turn changed slot occupancy).
+    """
+    item_history: list[str] = []
+    for turn_num, ev, slot_species in _walk_events_with_slot_species(snapshots_so_far, current_idx):
+        if ev.get("type") != "item_event":
+            continue
+        slot = ev.get("slot", "?")
+        kind = ev.get("kind", "?")
+        item = ev.get("item", "?")
+        sl = _slot_label_with_species(slot, slot_species)
+        if kind == "consumed":
+            item_history.append(f"{sl} {item} consumed (T{turn_num})")
+        elif kind == "knocked_off":
+            item_history.append(f"{sl} {item} Knocked Off (T{turn_num})")
+        elif kind in ("tricked", "stolen", "flung", "incinerated", "popped", "harvested"):
+            item_history.append(f"{sl} {item} {kind} (T{turn_num})")
+    if not item_history:
+        return ""
+    return "RECENT ITEM EVENTS: " + "; ".join(item_history[-4:])
+
+
+def format_game_state(
+    snapshot: dict[str, Any],
+    snapshots_so_far: list[dict[str, Any]],
+    current_idx: int,
+    *,
+    p1_meta: dict[str, dict[str, Any]],
+    p2_meta: dict[str, dict[str, Any]],
+) -> str:
+    """=== GAME STATE ===  unified board-state section.
+
+    Replaces BOTH the old active/bench header AND `format_game_state_ledger`.
+    Single source of truth for the current frame: a consolidated FIELD line,
+    then per-side `YOUR (P1):` / `OPP (P2):` blocks (ACTIVE rows with inlined
+    volatile/choice-lock continuation lines, then BENCH rows), then a tail
+    RECENT ITEM EVENTS line.
+
+    Deliberately does NOT render the old ledger's redundant rows — per-mon
+    HP carries cumulative damage, the per-mon `(fainted)` flag carries the
+    faint count, and per-mon `tera=`/`TERA-ACTIVE` carries Tera-used.
+
+    `p1_meta` / `p2_meta` are the combined team-sheet + recon metadata
+    lookups (keyed by `_species_key`) the caller already builds for bench
+    enrichment — passed in so the gating/placeholder behavior stays
+    identical to the old header.
+    """
+    p1 = snapshot.get("p1", {})
+    p2 = snapshot.get("p2", {})
+
+    lines: list[str] = ["=== GAME STATE ===", "", _field_line(snapshot)]
+
+    # --- YOUR (P1): full brought-set bench (player knows own selection). ---
+    lines.append("")
+    lines.append("YOUR (P1):")
+
+    # P1 actives, with explicit empty-slot annotation when genuinely vacant.
+    p1_actives = p1.get("active") or []
+    p1_by_slot = {a.get("slot"): a for a in p1_actives}
+    p1_bench_entries = p1.get("bench") or []
+    p1_living_bench = sum(1 for b in p1_bench_entries if not b.get("fainted"))
+    for letter in ("a", "b"):
+        if letter in p1_by_slot:
+            active = p1_by_slot[letter]
+            lines.append("ACTIVE " + _summarize_active(active).lstrip())
+            suffix = _active_state_suffix(active)
+            if suffix:
+                lines.append(suffix)
+        elif p1_living_bench == 0:
+            # Genuine "last Pokémon" vacancy — no living replacement.
+            lines.append(f"ACTIVE [{letter}] (empty — no Pokémon remaining)")
+        # else: mid-replacement; the next snapshot fills the slot.
+
+    # P1 bench: every brought mon + unknown-brought-slot placeholders.
+    p1_bench_lines = [
+        _summarize_bench_rich(b, p1_meta.get(_species_key(b.get("species", ""))))
+        for b in p1_bench_entries
+    ]
+    p1_bench_lines += _brought_placeholder_lines(
+        _distinct_species_count(p1_actives, p1_bench_entries), side="p1"
+    )
+    for bl in p1_bench_lines:
+        lines.append(_bench_row(bl))
+
+    # --- OPP (P2): bench gated by seenSpecies (learned as switches reveal). ---
+    lines.append("")
+    lines.append("OPP (P2):")
+    p2_actives = p2.get("active") or []
+    for active in p2_actives:
+        lines.append("ACTIVE " + _summarize_active(active).lstrip())
+        suffix = _active_state_suffix(active)
+        if suffix:
+            lines.append(suffix)
+
+    p2_seen = {_species_key(s) for s in (p2.get("seenSpecies") or [])}
+    p2_bench_visible = [
+        b for b in (p2.get("bench") or [])
+        if _species_key(b.get("species", "")) in p2_seen
+    ]
+    p2_bench_lines = [
+        _summarize_bench_rich(b, p2_meta.get(_species_key(b.get("species", ""))))
+        for b in p2_bench_visible
+    ]
+    p2_bench_lines += _brought_placeholder_lines(
+        _distinct_species_count(p2_actives, p2_bench_visible), side="p2"
+    )
+    if p2_bench_lines:
+        for bl in p2_bench_lines:
+            lines.append(_bench_row(bl))
+    else:
+        lines.append("BENCH (unknown — opponent has not yet revealed any bench Pokémon)")
+
+    # --- Tail: recent item events (only when any). ---
+    item_line = _recent_item_events_line(snapshots_so_far, current_idx)
+    if item_line:
+        lines.append("")
+        lines.append(item_line)
+
+    return "\n".join(lines)
+
+
+def _bench_row(rich_line: str) -> str:
+    """Reformat a `_summarize_bench_rich` block under the `BENCH ` header.
+
+    `_summarize_bench_rich` returns its first line prefixed with `  - ` and
+    an optional indented `    moves: ...` continuation. We swap the `  - `
+    species-line marker for `BENCH ` and keep any continuation line
+    indented under it.
+    """
+    parts = rich_line.split("\n", 1)
+    head = parts[0]
+    head = head[4:] if head.startswith("  - ") else head.lstrip()
+    out = "BENCH      " + head
+    if len(parts) > 1:
+        out += "\n" + parts[1]
+    return out
+
+
 def format_game_state_ledger(
     snapshot: dict[str, Any],
     snapshots_so_far: list[dict[str, Any]],
     current_idx: int,
 ) -> str:
     """=== GAME-STATE LEDGER ===  block.
+
+    Superseded by `format_game_state` (the unified GAME STATE section) —
+    no longer called from `format_user_prompt`, kept for reference / any
+    out-of-band callers.
 
     Only-when-active rows: empty rows are omitted entirely.
     """
@@ -558,7 +974,7 @@ def format_game_state_ledger(
             info = info or {}
             level = info.get("level")
             tl = info.get("turnsLeft")
-            label = sid
+            label = _pretty_field(sid)
             if level is not None:
                 label += f" L{level}"
             sc_parts.append(f"{label}{_maybe_turns_left(tl)}")
@@ -683,6 +1099,11 @@ def _accumulate_active_stats(
     """Walk prior turns' events and accumulate damage / hits / turns-on-field
     for a specific (slot, species) combination.
 
+    NOTE: now unused — the unified GAME STATE section dropped the
+    `Cumulative:` damage row (per-mon HP carries the same signal). Kept
+    here for `format_game_state_ledger` (also superseded) and any future
+    per-mon damage-history rendering.
+
     Stops counting backwards once the target slot's species changes (i.e.
     walking back across a switch to a different mon). Damage is summed as
     integer percent (HP before − HP after) for every damage hit on the
@@ -762,8 +1183,20 @@ def _format_event_inline(
         prefix = f"{attacker_label}/{move_part}"
         hits = ev.get("hits") or []
         if not hits:
-            # Status / self-target move (Calm Mind, Protect, Rage Powder, ...).
-            return prefix
+            # Status / support move with no damage hit (Spore, Rage Powder,
+            # Leech Seed, Will-O-Wisp, Tailwind, Protect, ...). Surface the
+            # intended target if the parser recorded one.
+            targets = ev.get("target_slots") or []
+            attacker = ev.get("attacker_slot")
+            if targets and not (len(targets) == 1 and targets[0] == attacker):
+                tgt_lbls = ", ".join(_slot_label_with_species(s, sm) for s in targets)
+                tag = " (spread)" if ev.get("is_spread") else ""
+                return f"{prefix}{tag} → {tgt_lbls}"
+            if targets and len(targets) == 1 and targets[0] == attacker:
+                return f"{prefix} (self)"      # Rage Powder / Follow Me redirect
+            if ev.get("is_spread"):
+                return f"{prefix} (spread)"     # spread move, no explicit targets
+            return prefix                        # self/field move (Protect, Trick Room, ...)
         # Defender hits — slot/mon then space-separated damage/outcome.
         bits: list[str] = []
         for h in hits:
@@ -782,7 +1215,7 @@ def _format_event_inline(
                 bits.append(f"{tgt} {outcome}" + (f" by {cause}" if cause else ""))
             else:
                 bits.append(f"{tgt} {outcome}")
-        kind_tag = " (spread)" if len(hits) >= 2 else ""
+        kind_tag = " (spread)" if (ev.get("is_spread") or len(hits) >= 2) else ""
         return f"{prefix}{kind_tag} → " + ", ".join(bits)
     if t == "switch":
         side = ev.get("side", "?").upper()
@@ -985,12 +1418,14 @@ def format_user_prompt(
     team_sheets: dict[str, list[dict[str, Any]]] | None = None,
     p1_team_recon: dict[str, dict[str, Any]] | None = None,
     p2_team_recon: dict[str, dict[str, Any]] | None = None,
+    meta_builds_text: str = "",
 ) -> str:
     """Compose the user prompt for one turn.
 
-    Includes (in order): board state header, current actives + benches
-    (multi-line per mon with item/ability/tera/moves), GAME-STATE
-    LEDGER, TURN-BY-TURN (this game), SERIES STATE (Bo3 only,
+    Includes (in order): the unified GAME STATE section (FIELD line +
+    per-side ACTIVE/BENCH with inlined volatiles/choice-locks + recent
+    item events — replaces the old board-state header AND the GAME-STATE
+    LEDGER), TURN-BY-TURN (this game), SERIES STATE (Bo3 only,
     game_index > 0), YOUR SPREADS (P1 match-final), OPP SPREADS
     (chronological P2 inference), and the threat matrix block.
 
@@ -1003,20 +1438,10 @@ def format_user_prompt(
     P2 bench is gated by `snap.p2.seenSpecies` — the player only knows
     about opponent mons they have actually observed on field.
     """
-    # Field / timed-effect state is rendered exclusively in the GAME-STATE
-    # LEDGER below (weather, terrain, Trick Room, per-side Tailwind, screens
-    # — every duration as "(N turns left)"). The header used to duplicate a
-    # thinner version (weather/terrain names + binary tailwind) which the
-    # model had to reconcile against the ledger; that duplication is gone so
-    # the ledger is the single source of truth for field state.
-    p1 = snapshot.get("p1", {})
-    p2 = snapshot.get("p2", {})
-
-    p1_active_lines = _format_actives_with_empty_slots(p1)
-    p2_active_lines = "\n".join(_summarize_active(p) for p in p2.get("active", []))
-
     # Combined metadata lookups for bench enrichment. Sheet wins over
-    # recon when both are present (sheet always has complete moves).
+    # recon when both are present (sheet always has complete moves). Built
+    # here and threaded into `format_game_state` so the bench gating /
+    # placeholder behavior stays in one place.
     p1_meta = _build_meta_lookup(
         team_sheets["p1"] if team_sheets else None,
         p1_team_recon,
@@ -1026,46 +1451,14 @@ def format_user_prompt(
         p2_team_recon,
     )
 
-    # P1 bench: full brought-set (player knows their own selection from
-    # team preview), each mon rendered with full metadata. Any brought
-    # slot we can't identify from replay usage (a teammate that never took
-    # the field) is filled with an explicit placeholder so the bench reads
-    # as four brings, not a short roster.
-    p1_active_entries = p1.get("active") or []
-    p1_bench_entries = p1.get("bench") or []
-    p1_bench_lines = [
-        _summarize_bench_rich(b, p1_meta.get(_species_key(b.get("species", ""))))
-        for b in p1_bench_entries
-    ]
-    p1_bench_lines += _brought_placeholder_lines(
-        _distinct_species_count(p1_active_entries, p1_bench_entries), side="p1"
-    )
-    p1_bench = "\n".join(p1_bench_lines) if p1_bench_lines else "  (none)"
-
-    # P2 bench: chronologically gated by `seenSpecies` — the player only
-    # learns the opponent's brought selection as switches reveal them.
-    # Unrevealed brought slots become placeholders (existence known,
-    # identity hidden until they switch in).
-    p2_active_entries = p2.get("active") or []
-    p2_seen = {_species_key(s) for s in (p2.get("seenSpecies") or [])}
-    p2_bench_visible = [
-        b for b in (p2.get("bench") or [])
-        if _species_key(b.get("species", "")) in p2_seen
-    ]
-    p2_bench_lines = [
-        _summarize_bench_rich(b, p2_meta.get(_species_key(b.get("species", ""))))
-        for b in p2_bench_visible
-    ]
-    # Identified opponent brings = distinct on-field actives + revealed bench.
-    p2_bench_lines += _brought_placeholder_lines(
-        _distinct_species_count(p2_active_entries, p2_bench_visible), side="p2"
-    )
-    p2_bench = "\n".join(p2_bench_lines) if p2_bench_lines else \
-        "  (unknown — opponent has not yet revealed any bench Pokémon)"
-
-    # New historical context blocks.
     snaps = snapshots_so_far or []
-    ledger_block = format_game_state_ledger(snapshot, snaps, current_idx)
+    # GAME STATE replaced the old active/bench header AND the
+    # `format_game_state_ledger(...)` block — one unified section, no
+    # duplicated HP / faints / Tera / field facts. `format_game_state_ledger`
+    # is retained in this module but is no longer called from here.
+    game_state_block = format_game_state(
+        snapshot, snaps, current_idx, p1_meta=p1_meta, p2_meta=p2_meta
+    )
     rollup_block = format_turn_by_turn(snaps, current_idx, game_index=game_index)
     series_block = ""
     if match_format == "bo3" and prior_games:
@@ -1081,14 +1474,11 @@ def format_user_prompt(
 
     return (
         f"=== TURN {snapshot.get('turn', '?')} ===\n\n"
-        f"YOUR (P1) ACTIVE:\n{p1_active_lines}\n"
-        f"YOUR (P1) BENCH:\n{p1_bench}\n\n"
-        f"OPP (P2) ACTIVE:\n{p2_active_lines}\n"
-        f"OPP (P2) BENCH:\n{p2_bench}\n\n"
-        f"{ledger_block}\n\n"
+        f"{game_state_block}\n\n"
         f"{rollup_block}\n\n"
         f"{series_block_part}"
         f"{spreads_block}"
         f"{opp_spreads_block}"
         f"{threat_matrix_text}"
+        + (f"\n\n{meta_builds_text}" if meta_builds_text else "")
     )

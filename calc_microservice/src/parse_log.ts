@@ -34,6 +34,8 @@ export interface MoveEvent {
   attacker_slot: string;
   move_name: string;
   called_via: string | null;   // null for direct use; else 'Sleep Talk' / 'Metronome' / 'Copycat' / etc.
+  target_slots: string[];      // intended target slot(s), e.g. ['p1a'] or ['p1a','p1b']; [] for self/field/no-target
+  is_spread: boolean;          // true when the move hit a spread of targets ([spread] kwarg)
   hits: MoveHit[];
 }
 
@@ -135,6 +137,8 @@ export interface ActivePokemonSnapshot {
 export interface BenchPokemonSnapshot {
   species: string;
   fainted: boolean;
+  hpPercent: number;           // last-known HP% (100 for a brought mon never sent in)
+  status: string | null;       // 'brn' | 'par' | 'slp' | 'frz' | 'psn' | 'tox' | null
 }
 
 export interface SideConditionState {
@@ -359,9 +363,17 @@ function snapshotActive(
 }
 
 function snapshotBench(p: Pokemon): BenchPokemonSnapshot {
+  const maxhp = p.maxhp || 1;
+  const fainted = !!p.fainted;
+  // @pkmn/client leaves hp=0 for a brought mon never sent in (its HP isn't
+  // known until it's been on field). A genuinely 0-HP mon is fainted, so
+  // `hp===0 && !fainted` means "never on field" → untouched, full HP.
+  const hpPercent = (p.hp === 0 && !fainted) ? 100 : Math.round((p.hp / maxhp) * 1000) / 10;
   return {
     species: p.speciesForme || p.baseSpeciesForme || p.name,
-    fainted: !!p.fainted,
+    fainted,
+    hpPercent,
+    status: fainted ? null : (p.status ?? null),
   };
 }
 
@@ -449,8 +461,8 @@ function snapshotSide(
     if (pkm) {
       bench.push(snapshotBench(pkm));
     } else {
-      // Brought but not yet switched in — synthesize a placeholder.
-      bench.push({ species: prettySpeciesFromKey(sp, ots, sideIsP1), fainted: false });
+      // Brought but not yet switched in — full HP (never been on field).
+      bench.push({ species: prettySpeciesFromKey(sp, ots, sideIsP1), fainted: false, hpPercent: 100, status: null });
     }
   }
 
@@ -479,7 +491,13 @@ function prettySpeciesFromKey(spKey: string, ots: OtsContext, sideIsP1: boolean)
       if (speciesKey(s.species) === spKey) return s.species;
     }
   }
-  // Best-effort: convert "calyrex-ice" key form back; preserve as-is otherwise.
+  // No sheet (Bo1 CTS): resolve the @pkmn key → display name via the dex, so a
+  // never-sent forme restricted renders as "Zamazenta-Crowned" not the raw id
+  // "zamazentacrowned" — the latter dupes against the active display form when
+  // reconstruct_p1_team aggregates by species string. Fall back to the raw key
+  // only if the dex has no match.
+  const sp = Dex.species.get(spKey);
+  if (sp && sp.exists && sp.name) return sp.name;
   return spKey;
 }
 
@@ -718,11 +736,33 @@ export function parseLog(log: string): ParseLogResult {
         const moveName = String(parsed.args[2] ?? '');
         const fromInfo = parseFromKwarg(kwArgs.from);
         const calledVia = (fromInfo && fromInfo.type === 'move') ? fromInfo.name : null;
+        // Target(s): protocol is `|move|attacker|move|target|[spread] slots`.
+        // Single-target → args[3] is the target ident; spread → kwArgs.spread
+        // is a comma list of affected slots (already in slot form).
+        const toSlot = (s: string): string => {
+          const t = s.trim();
+          return /^p[12][a-c]$/.test(t) ? t : (extractSlot(t) || '');
+        };
+        let targetSlots: string[] = [];
+        let isSpread = false;
+        if (kwArgs.spread !== undefined) {
+          isSpread = true;
+          targetSlots = String(kwArgs.spread || '')
+            .split(',').map(toSlot).filter(Boolean);
+        } else {
+          const tgt = parsed.args[3] as string | undefined;
+          if (tgt) {
+            const s = toSlot(tgt);
+            if (s) targetSlots = [s];
+          }
+        }
         currentMove = {
           type: 'move',
           attacker_slot: attackerSlot,
           move_name: moveName,
           called_via: calledVia,
+          target_slots: targetSlots,
+          is_spread: isSpread,
           hits: [],
         };
         // Add to derived revealedMoves only if it's an own move.

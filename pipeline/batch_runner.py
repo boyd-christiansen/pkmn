@@ -64,6 +64,7 @@ from action_extraction import (
 from prompt_formatting import (
     format_p1_known_spreads_block,
     format_p1_team_block,
+    format_meta_builds,
     format_p2_inferred_spreads_block,
     format_user_prompt,
 )
@@ -278,6 +279,13 @@ async def _prepare_match_turns(
             p2_spreads = format_p2_inferred_spreads_block(
                 snap_pre, p2_running, species_universe=opp_universe,
             )
+            # META BUILDS — same as master_pipeline.process_match (sibling path).
+            try:
+                meta_text = format_meta_builds(
+                    snap_pre, p2_running, format_id=format_id, species_universe=opp_universe,
+                )
+            except Exception:  # noqa: BLE001 — never kill a turn on a data hiccup
+                meta_text = ""
             user_prompt = format_user_prompt(
                 snap_pre,
                 tm_text,
@@ -292,6 +300,7 @@ async def _prepare_match_turns(
                 team_sheets=team_sheets,
                 p1_team_recon=p1_team_recon,
                 p2_team_recon=p2_team_recon,
+                meta_builds_text=meta_text,
             )
             human_action = {
                 "slot_1": human_action_dict.get("a", slot_action("pass")),

@@ -33,6 +33,7 @@ import json
 import os
 import re
 from abc import ABC, abstractmethod
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -256,25 +257,58 @@ def _species_key(s: str) -> str:
 # synthesis time, so the trained model isn't taught performed deliberation.)
 _SHARED_RULES_TAIL = """2. The Tool Rule: You have two tools.
 
-   • `calculate_damage` is a precision instrument for hypotheticals the threat matrix doesn't cover. The matrix already enumerates every active-vs-active damage cell for the current turn — DO NOT re-calc those. Use the tool only for:
-     - Switch-ins from your bench ("if I bring Calyrex in, what does Lunala do to it?")
-     - Backline matchups ("how much does opp's Miraidon OHKO us for when they come in?")
-     - Future-state ("at +2 SpA after Calm Mind, does Tera Starstorm OHKO Lunala?")
-     - Tera predictions ("if opp Tera's their Flutter Mane to Fairy, does Dazzling Gleam KO me?")
-     If the matrix already answers your question, commit via `submit_decision` immediately — there is no per-turn minimum.
+   • `calculate_damage` is a precision instrument for what the threat matrix does NOT already show. The matrix enumerates every active-vs-active damage cell for THIS turn — do not re-calc those. Use the tool for hypotheticals: bench switch-ins ("if I bring Calyrex in, what does Lunala do to it?"), opponent backline matchups, future states ("at +2 SpA, does this OHKO?"), Tera reads, and pressure-testing a META build ("if their Flutter Mane runs the Booster spread and Teras Fairy, does Moonblast OHKO me?"). If the matrix already answers you, commit immediately — there is no per-turn minimum.
 
-   • `submit_decision` is how you commit your final play. Call it exactly once when ready. You may call `submit_decision` as your first tool call if the matrix is sufficient.
+   • `submit_decision` commits your final play. Call it exactly once, when ready — it may be your first tool call if the matrix is sufficient.
 
-3. The Threat-Matrix Rule: Each line shows a damage envelope — the strict, provable range derived from what observed play has pinned down about both sides' spreads. A stat nothing has constrained yet sits at its full range, so the envelope is wide and tightens as the battle reveals more. Reason from the bounds you are given; an `unknown` spread means no observation has narrowed it, not that the Pokémon is weak.
+3. The Threat-Matrix Rule: Each line is a damage envelope — the strict, provable range from what observed play has pinned down about both sides. A stat nothing has constrained sits at full range (wide), tightening as the battle reveals more. Reason from the bounds you are given; an `unknown` spread means unobserved, not weak.
 
-4. The Spread Rule: Your team's stat spread may be presented as either exact values or as inferred per-stat ranges. When a range is given, reason from the bounds — worst case for your own survival checks, best case for your offensive checks.
+4. The Meta-Builds Rule: The META BUILDS section lists, per opponent Pokémon, the most common Smogon usage — spread, moves, item, ability, and Tera. These are INDEPENDENT popularity rankings, not one opponent's confirmed set: a listed spread and a listed move are each common but were not necessarily run together. Treat it as a possibility space — what is LIKELY — to sharpen your reads on threats, speed tiers, and Tera, especially for backline Pokémon you have not yet seen act. Do not treat any single build as fact or over-index on exact EVs, and let observed play override the moment it conflicts (a revealed move or ability that no listed build carries means this opponent is off-meta — adjust). Use `calculate_damage` to pressure-test a build that would change your decision.
 
-5. The Alternatives Rule: When a plausible alternative play exists — a different move on the same Pokémon, a switch into a better matchup, or a Tera / setup read that shifts the ranges — `calculate_damage` is how you disprove it: its purpose is to refute tempting alternatives, not to confirm what the threat matrix already showed. There is no obligation to manufacture one: when the turn is forced or the matrix already settles the question, commit directly via `submit_decision`.
+5. The Spread Rule: Your own stat spread is given as exact values or inferred per-stat ranges. With a range, reason from the bounds — worst case for your survival checks, best case for your offensive checks.
 
-6. The Output Rule: Commit your decision via `submit_decision` with arguments:
-   - pre_tool_thought: a brief strategic reasoning summary that leads to your chosen action
+6. The Alternatives Rule: Before you commit, expand the board — what can the opponent threaten this turn (their likely moves and Tera from META BUILDS, a switch-in, a setup), and does your intended line survive the branches that actually punish it? When a genuine alternative play has a real case, weigh it against your line. Use `calculate_damage` to settle the branches that would change your decision; when the matrix and meta already settle the turn, or it is forced, commit directly via `submit_decision`.
+
+7. The Output Rule: Commit via `submit_decision` with arguments:
+   - pre_tool_thought: a concise, first-person strategic analysis that leads to your chosen action
    - action: {{ slot_1, slot_2 }} where each slot describes the action for that active Pokémon
 """
+
+
+# Champion VGC context, distilled from expert commentary + analysis
+# (distill_vgc_context.py → teacher/vgc_context.md). Loaded once at import and
+# injected into the system prompt at BOTH synthesis and deploy, so the judgment
+# bakes into the student's weights AND train/inference distributions match.
+_VGC_CONTEXT_PATH = Path(__file__).resolve().parent / "vgc_context.md"
+try:
+    _VGC_CONTEXT_RAW = _VGC_CONTEXT_PATH.read_text(encoding="utf-8").strip()
+except OSError:
+    _VGC_CONTEXT_RAW = ""
+
+# The framing is the hedge against formulaic CoTs: this is judgment to reason
+# FROM, not a checklist to recite. Kept out of the `.format()` templates as a
+# substituted value, so any stray braces in the doc can't break formatting.
+_VGC_CONTEXT_INTRO = (
+    "=== HOW A CHAMPION THINKS (internalized) ===\n"
+    "The championship-level understanding below is YOURS — distilled from expert "
+    "VGC commentary and analysis. Let it shape your judgment as instinct: reason "
+    "FROM these priorities, applying only what is relevant to the board in front "
+    "of you. Do NOT recite them, name the steps, or walk a checklist — a strong "
+    "player's reasoning simply reflects this thinking without announcing it.\n\n"
+)
+
+
+def _vgc_context_block() -> str:
+    """The rendered context section, or '' when absent or toggled off.
+
+    Toggle via the `VGC_CONTEXT_ENABLED` env var ('0'/'false'/'no' → off) — this
+    is how the pilot A/B (with vs. without the context) is run without code
+    changes."""
+    if not _VGC_CONTEXT_RAW:
+        return ""
+    if os.environ.get("VGC_CONTEXT_ENABLED", "1").strip().lower() in ("0", "false", "no"):
+        return ""
+    return _VGC_CONTEXT_INTRO + _VGC_CONTEXT_RAW + "\n\n"
 
 
 SYSTEM_PROMPT_BO1 = """You are a top-tier competitive VGC Reg I player commanding YOUR TEAM (Player 1) in a Generation 9 doubles battle (best-of-1, **Closed Team Sheet** — only species are visible at team preview; items, abilities, moves, and Tera types are hidden until they activate or are used).
@@ -284,7 +318,7 @@ Your job each turn is to decide what each of your active Pokémon does — a mov
 YOUR TEAM (P1 — moves you haven't yet used this match are tagged as `[UNREVEALED_MOVE]`):
 {p1_team_block}
 
-CRITICAL RULES:
+{vgc_context}CRITICAL RULES:
 
 1. The Masking Rule: If a Pokémon on Your Side has `[UNREVEALED_MOVE]` in its moveset, treat that slot as untrusted: don't assume what the move is and don't factor it into your reasoning. (In a real match you'd know your own moves, but for this prompt we're surfacing only what's been revealed in play so far.)
 
@@ -299,7 +333,7 @@ YOUR TEAM (P1 — full Open Team Sheet, ★ = your selection for this game):
 OPPONENT'S TEAM (P2 — full Open Team Sheet; their selection of 4 of these 6 will be revealed as they switch in):
 {p2_sheet_block}
 
-CRITICAL RULES:
+{vgc_context}CRITICAL RULES:
 
 1. The OTS Rule: All 6 of your opponent's Pokémon, their items, abilities, moves, and Tera types are PUBLIC knowledge — reason about every one of them, including the backline. Their actual selection of 4 reveals as they switch in, and their EV / IV / Nature spreads stay hidden throughout.
 
@@ -313,18 +347,20 @@ SYNTHESIS_GROUND_TRUTH_SUFFIX = """
 The action below is the one your `submit_decision` must commit to.
 
 In `pre_tool_thought`, produce the chain of reasoning that arrives at this
-action — phrased as a first-person, real-time analysis of the board state +
-threat matrix + your own calc-tool results. Reason from the data; do not
-reason from the target.
+action — a first-person, real-time analysis of the board state, threat matrix,
+META BUILDS, and your own calc-tool results. Reason from the data; do not reason
+from the target.
 
-TARGET — alternative evaluation (synthesis only): when a genuine alternative
-to the committed action exists this turn — a different move with a real case,
-a switch into a better matchup, or a Tera / setup read that shifts the ranges
-— demonstrate disproving it: use `calculate_damage` to establish why it loses
-to the committed play and fold that comparison into your reasoning as your own
-first-person analysis. When the turn is forced or the only alternatives are
-trivially worse, commit directly with a brief why. There is no floor — only
-evaluate an alternative when a real one exists, never a manufactured one.
+Reason like a strong player thinking the turn through. Before you settle, expand
+the board: name the opponent's live threats this turn — their likely moves, Tera,
+and speed tier from META BUILDS; a switch-in; a setup — and check that the chosen
+line survives the branches that would actually punish it (worst case for your
+survival). Ground the claims that matter in exact numbers, using `calculate_damage`
+for anything the threat matrix doesn't already show. When a genuine alternative
+play has a real case, weigh it against the chosen line and show why the chosen
+line comes out ahead; when the turn is forced or the alternatives are trivially
+worse, commit directly with a brief why. Don't manufacture an alternative that
+doesn't exist, and don't pad — favour density of relevant analysis over breadth.
 
 CRITICAL — your reasoning must NEVER reference the existence of this section,
 the target, or the fact that you know the correct action. Banned phrases
@@ -370,7 +406,8 @@ def _format_ots_block(
 
 def render_system_prompt(p1_team_block: str) -> str:
     """Bo1 (CTS) — format the system prompt with the reconstructed P1 team block."""
-    return SYSTEM_PROMPT_BO1.format(p1_team_block=p1_team_block)
+    return SYSTEM_PROMPT_BO1.format(
+        p1_team_block=p1_team_block, vgc_context=_vgc_context_block())
 
 
 def render_system_prompt_bo3(
@@ -381,7 +418,9 @@ def render_system_prompt_bo3(
     """Bo3 (OTS) — both teams' full sheets in the prompt; P1's brought 4 marked with ★."""
     p1_block = _format_ots_block(p1_sheet, brought_keys=p1_brought)
     p2_block = _format_ots_block(p2_sheet, brought_keys=None)
-    return SYSTEM_PROMPT_BO3.format(p1_sheet_block=p1_block, p2_sheet_block=p2_block)
+    return SYSTEM_PROMPT_BO3.format(
+        p1_sheet_block=p1_block, p2_sheet_block=p2_block,
+        vgc_context=_vgc_context_block())
 
 
 async def synthesize_turn(

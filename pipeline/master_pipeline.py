@@ -49,6 +49,7 @@ from action_extraction import (
 from prompt_formatting import (
     format_p1_known_spreads_block,
     format_p1_team_block,
+    format_meta_builds,
     format_p2_inferred_spreads_block,
     format_user_prompt,
 )
@@ -610,6 +611,16 @@ async def process_match(
             p2_spreads = format_p2_inferred_spreads_block(
                 snap_pre, p2_running, species_universe=opp_universe,
             )
+            # META BUILDS: top-2 Smogon builds per opponent mon (reuses
+            # opp_universe for the same visibility gating). Pure/sync; degrades
+            # to "" on any error — a missing data file must never kill a turn.
+            try:
+                meta_text = format_meta_builds(
+                    snap_pre, p2_running, format_id=format_id, species_universe=opp_universe,
+                )
+            except Exception as e:  # noqa: BLE001
+                meta_text = ""
+                _log_error(f"[{match_id} g{game_idx} t{turn}] format_meta_builds failed: {e}")
             user_prompt = format_user_prompt(
                 snap_pre,
                 tm_text,
@@ -624,6 +635,7 @@ async def process_match(
                 team_sheets=team_sheets,
                 p1_team_recon=p1_team_recon,
                 p2_team_recon=p2_team_recon,
+                meta_builds_text=meta_text,
             )
             human_action = {
                 "slot_1": human_action_dict.get("a", slot_action("pass")),
