@@ -41,6 +41,7 @@ import damage_inferencer
 import threat_matrix
 from action_extraction import (
     DEFAULT_MIN_GAME_TURNS,
+    action_consistent_with_knownset,
     extract_p1_actions,
     filter_fragment_games,
     flip_match_to_winner,
@@ -569,6 +570,18 @@ async def process_match(
             human_action_dict = extract_p1_actions(snap_pre, snap_post, events_stream)
             if human_action_dict is None:
                 stats["skipped_ambiguous"] += 1
+                await _safe_update_knowledge(
+                    snap_pre, snap_post, events_stream, p1_running, p2_running,
+                    session=aiohttp_session, base_url=calc_base_url,
+                    p1_universe=p1_universe_keys, p2_universe=p2_universe_keys,
+                )
+                continue
+
+            # Data-integrity: an OTS move outside the mon's knownMoves is a
+            # parser misparse (mirror-match slot misattribution). Drop the turn
+            # rather than train a label that contradicts the sheet.
+            if not action_consistent_with_knownset(snap_pre, human_action_dict):
+                stats["skipped_illegal_moveset"] += 1
                 await _safe_update_knowledge(
                     snap_pre, snap_post, events_stream, p1_running, p2_running,
                     session=aiohttp_session, base_url=calc_base_url,

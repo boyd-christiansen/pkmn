@@ -56,6 +56,7 @@ import damage_inferencer
 import threat_matrix
 from action_extraction import (
     DEFAULT_MIN_GAME_TURNS,
+    action_consistent_with_knownset,
     extract_p1_actions,
     filter_fragment_games,
     flip_match_to_winner,
@@ -147,6 +148,7 @@ async def _prepare_match_turns(
     """
     stats: dict[str, int] = {
         "skipped_ambiguous": 0,
+        "skipped_illegal_moveset": 0,
         "skipped_threat_matrix_error": 0,
         "already_done": 0,
     }
@@ -242,6 +244,17 @@ async def _prepare_match_turns(
             human_action_dict = extract_p1_actions(snap_pre, snap_post, events_stream)
             if human_action_dict is None:
                 stats["skipped_ambiguous"] += 1
+                await _safe_update_knowledge(
+                    snap_pre, snap_post, events_stream, p1_running, p2_running,
+                    session=aiohttp_session, base_url=calc_base_url,
+                    p1_universe=p1_universe_keys, p2_universe=p2_universe_keys,
+                )
+                continue
+
+            # Data-integrity: drop OTS turns whose move isn't in the mon's
+            # knownMoves (mirror-match slot misparse) — see process_match.
+            if not action_consistent_with_knownset(snap_pre, human_action_dict):
+                stats["skipped_illegal_moveset"] += 1
                 await _safe_update_knowledge(
                     snap_pre, snap_post, events_stream, p1_running, p2_running,
                     session=aiohttp_session, base_url=calc_base_url,
@@ -761,6 +774,7 @@ async def run_batch_for_matches(
     stats: dict[str, int] = {
         "matches_processed": len(matches),
         "skipped_ambiguous": 0,
+        "skipped_illegal_moveset": 0,
         "skipped_threat_matrix_error": 0,
         "already_done": 0,
         "skipped_no_games": 0,

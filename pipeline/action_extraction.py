@@ -198,6 +198,58 @@ def slot_action(
     }
 
 
+def _norm_move(m: str) -> str:
+    return "".join(c for c in (m or "").lower() if c.isalnum())
+
+
+def action_consistent_with_knownset(
+    snap_pre: dict[str, Any], action_dict: dict[str, Any] | None
+) -> bool:
+    """True unless the label contradicts a constraint the prompt renders.
+
+    The label is a real human play, so a contradiction is a parser DATA bug, not
+    an illegal play — such turns are dropped rather than trained on (the model
+    must never see "locked into X / trapped" next to a label that does Y). This
+    is the synthesis-time mirror of validate_action_legality's checks:
+      • OTS moveset membership (mirror-match slot misparse / impossible move)
+      • choice-lock      (move ≠ choiceLockedInto)
+      • Encore-lock      (move ≠ encored move)
+      • Disable          (move == disabled move)
+      • trapped + switch (a flagged-trapped mon manually switching)
+    Bo1 CTS knownMoves is None (no full set), so the moveset check is inert there.
+    """
+    if not action_dict:
+        return True
+    actives = {a.get("slot"): a for a in (snap_pre.get("p1", {}).get("active") or [])}
+    for slot, act in action_dict.items():
+        if not isinstance(act, dict):
+            continue
+        mon = actives.get(slot) or {}
+        atype = act.get("action_type")
+        if atype == "switch" and mon.get("trapped"):
+            return False
+        if atype != "move":
+            continue
+        move = act.get("move")
+        if not move:
+            continue
+        mk = _norm_move(move)
+        vols = mon.get("volatiles") or {}
+        known = mon.get("knownMoves")
+        if known is not None and mk != "struggle" and mk not in {_norm_move(k) for k in known}:
+            return False
+        lock = mon.get("choiceLockedInto")
+        if lock and mk != _norm_move(lock):
+            return False
+        enc = (vols.get("encored") or {}).get("move")
+        if enc and mk not in (_norm_move(enc), "struggle"):
+            return False
+        dis = (vols.get("disabled") or {}).get("move")
+        if dis and mk == _norm_move(dis):
+            return False
+    return True
+
+
 def extract_p1_actions(
     snap_pre: dict[str, Any],
     snap_post: dict[str, Any],

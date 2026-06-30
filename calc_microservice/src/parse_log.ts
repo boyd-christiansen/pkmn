@@ -99,14 +99,42 @@ const NON_OWN_CALLERS: ReadonlySet<string> = new Set([
   'Mirror Move', 'Assist', 'Nature Power',
 ]);
 
+// Partial-trapping moves (Wrap / Fire Spin / Bind / Infestation / etc.). When
+// one of these binds a target, @pkmn/client records the volatile under the
+// MOVE's id (e.g. volatiles['infestation']), not a generic 'partiallytrapped'
+// key — so trap detection scans p.volatiles for any of these ids. Built from
+// the dex (volatileStatus === 'partiallytrapped') so it stays correct as the
+// move pool changes; a static fallback covers a dex miss.
+const PARTIAL_TRAP_MOVE_IDS: ReadonlySet<string> = (() => {
+  const ids = new Set<string>([
+    'bind', 'clamp', 'firespin', 'infestation', 'magmastorm', 'sandtomb',
+    'snaptrap', 'thundercage', 'whirlpool', 'wrap',
+  ]);
+  try {
+    for (const m of GENS.get(9).moves as Iterable<any>) {
+      if (m?.volatileStatus === 'partiallytrapped' && m.id) ids.add(String(m.id));
+    }
+  } catch {
+    /* keep the static fallback */
+  }
+  return ids;
+})();
+
 // =============================================================================
 // Types — snapshot extensions
 // =============================================================================
 
 export interface Volatiles {
   substitute?: { hp: number };
-  encored?: boolean;
-  disabled?: boolean;
+  // Encore / Disable now carry the locked / disabled move DISPLAY NAME (e.g.
+  // "Draco Meteor"). @pkmn/client stores these volatiles bare ({id} only), so
+  // the move is recovered from the parse stream: Disable's move is the `-start`
+  // arg[3]; Encore's is the target's last-move-this-stint at the `-start`
+  // moment. If the move genuinely can't be recovered, `move` is '' (the
+  // volatile is still emitted — never dropped — so the action-mask consumer
+  // knows the mon is encored/disabled even when the move id is unknown).
+  encored?: { move: string };
+  disabled?: { move: string };
   taunt?: { turnsLeft?: number };
   healBlock?: { turnsLeft?: number };
   perishCount?: number;            // 1, 2, or 3
@@ -130,7 +158,14 @@ export interface ActivePokemonSnapshot {
   terastallizedAs: string | null;
   boosts: Record<string, number>;
   volatiles: Volatiles;              // only-when-set keys
-  choiceLockedInto: string | null;   // move id, when item is Choice Scarf/Specs/Band AND lastMove set
+  choiceLockedInto: string | null;   // move display name, when item is Choice Scarf/Specs/Band AND the mon has used a move SINCE its current switch-in (a switch-out clears the lock)
+  // Inferred in a cross-side post-pass (computed AFTER both sides' active
+  // arrays are built, since it depends on the opposing actives). True when the
+  // mon cannot switch out: partial-trap volatile (Wrap/Infestation/etc.), or an
+  // opposing Shadow Tag (non-Ghost) / Arena Trap (grounded) / Magnet Pull
+  // (Steel). Forced false by Ghost-type / Shed Shell / Run Away. Conservative:
+  // an unrevealed opposing ability (Bo1 CTS) can't assert a trap.
+  trapped: boolean;
   toxicCounter?: number;
 }
 
@@ -277,12 +312,36 @@ interface OtsContext {
   p2Brought: Set<string>;
 }
 
-function snapshotVolatiles(p: Pokemon): Volatiles {
+/** Normalize a move id → display name via the dex (e.g. "dracometeor" →
+ *  "Draco Meteor"). Falls back to the raw id when the dex has no match. */
+function moveDisplayName(moveId: string | null | undefined): string {
+  if (!moveId) return '';
+  const id = String(moveId);
+  return GENS.get(9).moves.get(id)?.name ?? id;
+}
+
+function snapshotVolatiles(
+  p: Pokemon,
+  // Last move this mon used SINCE its current switch-in (raw move name as it
+  // appears in the protocol). Encore locks the target into its last move, so
+  // this is the encored move. Keyed by p.originalIdent.
+  moveThisStint: Map<string, string>,
+  // Disabled move per mon (display name), captured from `|-start|...|Disable|<Move>`.
+  // Keyed by p.originalIdent.
+  disabledMove: Map<string, string>,
+): Volatiles {
   const v: any = p.volatiles ?? {};
   const out: Volatiles = {};
   if (v['substitute']) out.substitute = { hp: v['substitute']?.level ?? 0 };
-  if (v['encore']) out.encored = true;
-  if (v['disable']) out.disabled = true;
+  if (v['encore']) {
+    // The encored move = the mon's last move this stint. moveThisStint stores
+    // the raw protocol move name; normalize through the dex for consistency.
+    const raw = moveThisStint.get(p.originalIdent);
+    out.encored = { move: raw ? moveDisplayName(raw) : '' };
+  }
+  if (v['disable']) {
+    out.disabled = { move: disabledMove.get(p.originalIdent) ?? '' };
+  }
   if (v['taunt']) out.taunt = { turnsLeft: v['taunt']?.duration };
   if (v['healblock']) out.healBlock = { turnsLeft: v['healblock']?.duration };
   if (v['perish3']) out.perishCount = 3;
@@ -293,18 +352,32 @@ function snapshotVolatiles(p: Pokemon): Volatiles {
   return out;
 }
 
-function snapshotChoiceLock(p: Pokemon, resolvedItem: string | null): string | null {
+function snapshotChoiceLock(
+  p: Pokemon,
+  resolvedItem: string | null,
+  // Last move this mon used SINCE its current switch-in (keyed by
+  // p.originalIdent). A Choice lock only holds while the mon stays in — a
+  // switch-out clears it — so we must NOT fall back to p.lastMove, which
+  // persists across switches and produces false-positive locks for a mon that
+  // used a Choice move, switched out, and came back.
+  moveThisStint: Map<string, string>,
+  itemTouchedSinceSwitch: Set<string>,
+): string | null {
   // The item lookup must use the OTS-resolved item, not @pkmn/client's raw
   // p.item — in Bo3 OTS, p.item only populates after a `|-item|` reveal,
   // but Choice Scarf/Specs/Band are always known from the team sheet.
   if (!resolvedItem) return null;
   const item = resolvedItem.toLowerCase();
   if (!item.includes('choice')) return null;
-  if (!p.lastMove) return null;
-  const lastMoveId = String(p.lastMove);
-  // Normalize move ID → display name via the dex (e.g. "boltstrike" → "Bolt Strike").
-  const moveData = GENS.get(9).moves.get(lastMoveId);
-  return moveData?.name ?? lastMoveId;
+  // An item shuffle this stint (Trick / Switcheroo / Knock Off / etc.) makes the
+  // held-item assumption unreliable — a Choice item may have left or arrived
+  // mid-stint — so don't assert a lock. (Fixes the Tricked-Choice-Scarf false
+  // positive where a mon shows `choicescarf` yet legally plays different moves.)
+  if (itemTouchedSinceSwitch.has(p.originalIdent)) return null;
+  const stintMove = moveThisStint.get(p.originalIdent);
+  if (!stintMove) return null;
+  // Normalize move name/ID → display name via the dex (e.g. "boltstrike" → "Bolt Strike").
+  return moveDisplayName(stintMove);
 }
 
 function snapshotActive(
@@ -313,6 +386,9 @@ function snapshotActive(
   ots: OtsContext,
   sideIsP1: boolean,
   derivedMovesForSide: Map<string, Set<string>>,
+  moveThisStint: Map<string, string>,
+  disabledMove: Map<string, string>,
+  itemTouchedSinceSwitch: Set<string>,
 ): ActivePokemonSnapshot {
   const maxhp = p.maxhp || 1;
   const hpPercent = Math.round((p.hp / maxhp) * 1000) / 10;
@@ -356,8 +432,9 @@ function snapshotActive(
     isTerastallized: !!p.isTerastallized,
     terastallizedAs: p.terastallized ?? null,
     boosts: { ...p.boosts } as Record<string, number>,
-    volatiles: snapshotVolatiles(p),
-    choiceLockedInto: snapshotChoiceLock(p, item),
+    volatiles: snapshotVolatiles(p, moveThisStint, disabledMove),
+    choiceLockedInto: snapshotChoiceLock(p, item, moveThisStint, itemTouchedSinceSwitch),
+    trapped: false, // filled in by the cross-side post-pass in snapshotBattle
     ...(toxicCounter && toxicCounter > 0 ? { toxicCounter } : {}),
   };
 }
@@ -407,6 +484,9 @@ function snapshotSide(
   sideIsP1: boolean,
   onFieldSet: Set<string>,
   derivedMovesForSide: Map<string, Set<string>>,
+  moveThisStint: Map<string, string>,
+  disabledMove: Map<string, string>,
+  itemTouchedSinceSwitch: Set<string>,
   teraUsed: { species: string; teraType: string; onTurn: number } | null,
 ): SideSnapshot {
   const activeSet = new Set(side.active.filter((p): p is Pokemon => p !== null));
@@ -435,7 +515,7 @@ function snapshotSide(
 
   const active: ActivePokemonSnapshot[] = [];
   side.active.forEach((p, idx) => {
-    if (p) active.push(snapshotActive(p, idx, ots, sideIsP1, derivedMovesForSide));
+    if (p) active.push(snapshotActive(p, idx, ots, sideIsP1, derivedMovesForSide, moveThisStint, disabledMove, itemTouchedSinceSwitch));
   });
 
   // Bench: always the full brought-set (pre-scanned) minus current actives.
@@ -501,6 +581,83 @@ function prettySpeciesFromKey(spKey: string, ots: OtsContext, sideIsP1: boolean)
   return spKey;
 }
 
+// =============================================================================
+// Trapping inference (cross-side post-pass)
+// =============================================================================
+
+/** Lowercase + strip non-alphanumerics, so "Shadow Tag" / "shadowtag" / "Shadow
+ *  Tag " all compare equal. Used for ability comparisons. */
+function normName(s: string | null | undefined): string {
+  return (s ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/** Types for a snapshot's species, via the dex (covers the displayed forme,
+ *  including a Tera form's stripped base). Empty array if unknown. */
+function speciesTypes(species: string): string[] {
+  const sp = Dex.species.get(speciesKey(species));
+  return sp && sp.exists ? ((sp.types as string[] | undefined) ?? []) : [];
+}
+
+/** Is this active grounded? Grounded = NOT (Flying-type OR Levitate OR Air
+ *  Balloon OR a magnetrise volatile). Uses the OTS-resolved item/ability from
+ *  the snapshot (so Bo3 sheet items count) plus the raw Pokemon for the
+ *  magnetrise volatile. */
+function isGroundedSnapshot(snap: ActivePokemonSnapshot, p: Pokemon): boolean {
+  const types = speciesTypes(snap.species);
+  if (types.some((t) => t.toLowerCase() === 'flying')) return false;
+  if (normName(snap.ability) === 'levitate') return false;
+  if (normName(snap.item) === 'airballoon') return false;
+  if ((p.volatiles as any)?.['magnetrise']) return false;
+  return true;
+}
+
+/** Mutates each active snapshot's `trapped` flag. Cross-side: a mon is trapped
+ *  by the OPPOSING actives' trap abilities or by its own partial-trap volatile.
+ *  Ghost-type / Shed Shell / Run Away override everything to false. Opposing
+ *  abilities that are null (unrevealed, Bo1 CTS) cannot assert a trap — that's
+ *  the correct conservative behavior. */
+function applyTrapping(
+  p1Pairs: Array<{ snap: ActivePokemonSnapshot; p: Pokemon }>,
+  p2Pairs: Array<{ snap: ActivePokemonSnapshot; p: Pokemon }>,
+): void {
+  const compute = (
+    selfPairs: Array<{ snap: ActivePokemonSnapshot; p: Pokemon }>,
+    oppPairs: Array<{ snap: ActivePokemonSnapshot; p: Pokemon }>,
+  ) => {
+    for (const { snap, p } of selfPairs) {
+      const types = speciesTypes(snap.species).map((t) => t.toLowerCase());
+      const isGhost = types.includes('ghost');
+      const isSteel = types.includes('steel');
+
+      let trapped = false;
+
+      // Opposing trap abilities — the reliable signal. (The partial-trap
+      // volatile path was removed: @pkmn/client's binding volatile, e.g.
+      // 'infestation', can linger on the Pokemon object after the trap ends,
+      // which falsely trapped mons that then legally switched. The binding move
+      // is still visible in the move log + volatile rendering, so the model
+      // isn't blind to it.) A null/unrevealed ability asserts nothing.
+      for (const opp of oppPairs) {
+        const ab = normName(opp.snap.ability);
+        if (!ab) continue;
+        if (ab === 'shadowtag' && !isGhost) { trapped = true; break; }
+        if (ab === 'arenatrap' && isGroundedSnapshot(snap, p)) { trapped = true; break; }
+        if (ab === 'magnetpull' && isSteel) { trapped = true; break; }
+      }
+
+      // 3) Hard overrides → never trapped.
+      if (isGhost) trapped = false;
+      else if (normName(snap.item) === 'shedshell') trapped = false;
+      else if (normName(snap.ability) === 'runaway') trapped = false;
+
+      snap.trapped = trapped;
+    }
+  };
+
+  compute(p1Pairs, p2Pairs);
+  compute(p2Pairs, p1Pairs);
+}
+
 function snapshotBattle(
   battle: Battle,
   ots: OtsContext,
@@ -508,6 +665,9 @@ function snapshotBattle(
   onFieldP2: Set<string>,
   derivedMovesP1: Map<string, Set<string>>,
   derivedMovesP2: Map<string, Set<string>>,
+  moveThisStint: Map<string, string>,
+  disabledMove: Map<string, string>,
+  itemTouchedSinceSwitch: Set<string>,
   teraUsedP1: { species: string; teraType: string; onTurn: number } | null,
   teraUsedP2: { species: string; teraType: string; onTurn: number } | null,
 ): Omit<TurnSnapshot, 'events'> {
@@ -528,6 +688,23 @@ function snapshotBattle(
   const weatherState = (battle.field as any).weatherState as any;
   const terrainState = (battle.field as any).terrainState as any;
 
+  const p1Side = snapshotSide(battle.p1, ots, true, onFieldP1, derivedMovesP1, moveThisStint, disabledMove, itemTouchedSinceSwitch, teraUsedP1);
+  const p2Side = snapshotSide(battle.p2, ots, false, onFieldP2, derivedMovesP2, moveThisStint, disabledMove, itemTouchedSinceSwitch, teraUsedP2);
+
+  // Cross-side trapping post-pass: trapping depends on the OPPOSING actives, so
+  // it must run after both sides' active snapshots exist. snapshotSide builds
+  // `active` in the same order as the non-null entries of side.active, so we
+  // re-walk side.active to pair each snapshot with its source Pokemon.
+  const pairUp = (side: Side, snaps: ActivePokemonSnapshot[]) => {
+    const pairs: Array<{ snap: ActivePokemonSnapshot; p: Pokemon }> = [];
+    let i = 0;
+    for (const p of side.active) {
+      if (p && i < snaps.length) pairs.push({ snap: snaps[i++]!, p });
+    }
+    return pairs;
+  };
+  applyTrapping(pairUp(battle.p1, p1Side.active), pairUp(battle.p2, p2Side.active));
+
   return {
     turn: battle.turn,
     field: {
@@ -541,8 +718,8 @@ function snapshotBattle(
       ...(tw1.turnsLeft !== undefined ? { tailwindP1TurnsLeft: tw1.turnsLeft } : {}),
       ...(tw2.turnsLeft !== undefined ? { tailwindP2TurnsLeft: tw2.turnsLeft } : {}),
     },
-    p1: snapshotSide(battle.p1, ots, true, onFieldP1, derivedMovesP1, teraUsedP1),
-    p2: snapshotSide(battle.p2, ots, false, onFieldP2, derivedMovesP2, teraUsedP2),
+    p1: p1Side,
+    p2: p2Side,
   };
 }
 
@@ -634,6 +811,23 @@ export function parseLog(log: string): ParseLogResult {
     if (!s) { s = new Set<string>(); map.set(slot, s); }
     return s;
   };
+
+  // Last move each mon used SINCE its current switch-in, keyed by the mon's
+  // position-independent stable ident (p.originalIdent, e.g. "p1: Calyrex").
+  // Cleared on switch-in (fresh stint). Powers the Choice-lock fix (a lock only
+  // holds while the mon stays in) and the Encore move id (Encore locks the
+  // target into its last move).
+  const moveThisStint = new Map<string, string>();
+  // Disabled move per mon (display name), keyed by p.originalIdent. Captured
+  // from `|-start|...|Disable|<Move>` (the volatile itself carries no move).
+  // Cleared on switch-in.
+  const disabledMove = new Map<string, string>();
+  // Idents whose held item was touched by ANY item event (Trick / Switcheroo /
+  // Knock Off / consumed / Fling / steal / incinerate) since their current
+  // switch-in. While an item shuffle is in play the Choice-item assumption is
+  // unreliable, so snapshotChoiceLock suppresses the lock for these mons.
+  // Cleared on switch-in (fresh mon holds its own item).
+  const itemTouchedSinceSwitch = new Set<string>();
 
   // Tera-used per side, sticky once set for the rest of this game.
   let teraUsedP1: { species: string; teraType: string; onTurn: number } | null = null;
@@ -771,6 +965,15 @@ export function parseLog(log: string): ParseLogResult {
             getDerivedMoves(attackerSlot).add(moveName);
           }
         }
+        // Record the move-this-stint for Choice-lock + Encore. Only DIRECT
+        // moves (calledVia === null) represent the mon's own selection — a
+        // Choice item never locks you into a called move (Metronome / Sleep
+        // Talk etc.), and Encore repeats the genuinely chosen move. Key by the
+        // attacker's position-independent stable ident.
+        if (calledVia === null) {
+          const attackerPokemon = battle.getPokemon(parsed.args[1] as any);
+          if (attackerPokemon) moveThisStint.set(attackerPokemon.originalIdent, moveName);
+        }
         break;
       }
 
@@ -857,6 +1060,31 @@ export function parseLog(log: string): ParseLogResult {
         break;
       }
 
+      case '-start': {
+        // Capture the disabled move from `|-start|<ident>|Disable|<Move>`.
+        // @pkmn/client stores the disable volatile bare ({id}); the move only
+        // appears here in arg[3]. Keyed by the mon's stable ident.
+        const effect = String(parsed.args[2] ?? '');
+        if (normName(effect) === 'disable') {
+          const ident = parsed.args[1] as string;
+          const pkm = battle.getPokemon(ident as any);
+          const moveDisp = moveDisplayName(String(parsed.args[3] ?? ''));
+          if (pkm) disabledMove.set(pkm.originalIdent, moveDisp);
+        }
+        break;
+      }
+
+      case '-end': {
+        // Clear the captured disabled move when Disable wears off.
+        const effect = String(parsed.args[2] ?? '');
+        if (normName(effect) === 'disable') {
+          const ident = parsed.args[1] as string;
+          const pkm = battle.getPokemon(ident as any);
+          if (pkm) disabledMove.delete(pkm.originalIdent);
+        }
+        break;
+      }
+
       case '-terastallize': {
         const slot = extractSlot(parsed.args[1] as string);
         const side = extractSide(parsed.args[1] as string);
@@ -906,6 +1134,16 @@ export function parseLog(log: string): ParseLogResult {
           (side === 'p1' ? onFieldP1 : onFieldP2).add(speciesKey(toSpecies));
           // Reset derived moves for this slot — new mon means new revealedMoves.
           (side === 'p1' ? derivedMovesP1 : derivedMovesP2).set(slot, new Set<string>());
+          // Fresh stint for the INCOMING mon: clear its move-this-stint (so a
+          // Choice lock / Encore from a prior stint doesn't carry over) and any
+          // stale disabled move. battle.add has already applied the switch, so
+          // getPokemon(ident) resolves to the incoming mon.
+          const incoming = battle.getPokemon(ident as any);
+          if (incoming) {
+            moveThisStint.delete(incoming.originalIdent);
+            disabledMove.delete(incoming.originalIdent);
+            itemTouchedSinceSwitch.delete(incoming.originalIdent);
+          }
         }
         break;
       }
@@ -956,6 +1194,9 @@ export function parseLog(log: string): ParseLogResult {
           item,
           ...(cause ? { cause } : {}),
         });
+        // Item left this mon — Choice-item assumption is now unreliable.
+        const _ep = battle.getPokemon(parsed.args[1] as any);
+        if (_ep) itemTouchedSinceSwitch.add(_ep.originalIdent);
         break;
       }
 
@@ -964,6 +1205,15 @@ export function parseLog(log: string): ParseLogResult {
         const slot = extractSlot(parsed.args[1] as string);
         const item = String(parsed.args[2] ?? '');
         const fromInfo = parseFromKwarg(kwArgs.from);
+        // A swap-in (Trick / Switcheroo / Magician) changes the held item, so
+        // the Choice-item assumption is unreliable for this mon this stint.
+        const _isSwap = !!fromInfo && (fromInfo.type === 'move'
+          || (fromInfo.type === null && /Trick|Switcheroo|Magician/i.test(fromInfo.name))
+          || (fromInfo.type === 'ability' && /Magician/i.test(fromInfo.name)));
+        if (_isSwap) {
+          const _ip = battle.getPokemon(parsed.args[1] as any);
+          if (_ip) itemTouchedSinceSwitch.add(_ip.originalIdent);
+        }
         if (fromInfo?.type === 'move' || (fromInfo && fromInfo.type === null && /Trick|Switcheroo|Magician/i.test(fromInfo.name))) {
           emitOrQueueEvent({
             type: 'item_event',
@@ -1003,6 +1253,7 @@ export function parseLog(log: string): ParseLogResult {
               battle, ots,
               onFieldP1, onFieldP2,
               derivedMovesP1, derivedMovesP2,
+              moveThisStint, disabledMove, itemTouchedSinceSwitch,
               teraUsedP1, teraUsedP2,
             ),
             events: [],

@@ -69,9 +69,19 @@ def _check_turn(snap_pre: dict[str, Any], actions: dict[str, dict[str, Any]]) ->
 
     for letter, act in actions.items():
         mon = pre_active.get(letter)
-        if not mon or act.get("action_type") != "move":
+        if not mon:
             continue
         species = mon.get("species", "?")
+        atype = act.get("action_type")
+        vols = mon.get("volatiles") or {}
+
+        # 0. Trapping — a trapped mon cannot manually switch out. (Pivot moves
+        #    like U-turn are `move` actions, so they're correctly exempt.)
+        if atype == "switch" and mon.get("trapped"):
+            out.append(("trapped_switch", f"{species}: shown trapped but label switches out"))
+
+        if atype != "move":
+            continue
         move = act.get("move")
 
         # 1. Choice lock — a real play can only be the locked move (or a switch,
@@ -90,6 +100,16 @@ def _check_turn(snap_pre: dict[str, Any], actions: dict[str, dict[str, Any]]) ->
         if known and move and _move_key(move) != "struggle":
             if _move_key(move) not in {_move_key(k) for k in known if k}:
                 out.append(("move_not_in_knownset", f"{species}: label move {move!r} ∉ knownMoves {known}"))
+
+        # 4. Encore — a move action must be the encored move.
+        enc = (vols.get("encored") or {}).get("move")
+        if enc and move and _move_key(move) not in (_move_key(enc), "struggle"):
+            out.append(("encore_lock", f"{species}: shown Encore-locked into {enc!r}, label plays {move!r}"))
+
+        # 5. Disable — a move action must not be the disabled move.
+        dis = (vols.get("disabled") or {}).get("move")
+        if dis and move and _move_key(move) == _move_key(dis):
+            out.append(("disable_violation", f"{species}: shown Disabled {dis!r}, label plays the disabled move"))
 
     return out
 
@@ -189,14 +209,13 @@ def cli(inputs: tuple[Path, ...], min_game_turns: int, n_examples: int) -> None:
         click.echo(f"  ✗ {vtype}: {c}  ({rate*100:.4f}% of scanned turns)")
 
     click.echo(
-        "\nKNOWN GAPS (not scanned — parser carries no move name / trapped flag):\n"
-        "  • Encore-lock: cannot verify the label is the encored move.\n"
-        "  • Disable: cannot verify the label avoids the disabled move.\n"
-        "  • Trapping (Shadow Tag / Arena Trap / Magnet Pull / partial-trap):\n"
-        "    cannot verify a switch was legal — no `trapped` flag is captured.\n"
-        "  Fix = parser enhancement (encored/disabled move id + trapped flag).\n"
-        "  Until then the action MASK is implicit; these classes rely on the\n"
-        "  model reading the ledger's volatile lines rather than a hard mask."
+        "\nHARD-MASK CHECKS (now scanned — parser carries the move ids + trapped flag):\n"
+        "  • encore_lock      — a move label under Encore must be the encored move.\n"
+        "  • disable_violation — a move label must avoid the Disabled move.\n"
+        "  • trapped_switch   — a trapped mon's label must not be a manual switch\n"
+        "    (pivot moves like U-turn are `move` actions, correctly exempt).\n"
+        "  Requires re-parsed data (these fields are new). On OLD parsed_data the\n"
+        "  volatiles are bare booleans, so these checks are silently inert there."
     )
 
 

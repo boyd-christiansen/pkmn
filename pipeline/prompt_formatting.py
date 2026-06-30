@@ -744,9 +744,15 @@ def _active_state_suffix(active: dict[str, Any]) -> str:
             hp = vinfo.get("hp")
             bits.append("Substitute" + (f" ({hp} HP)" if hp is not None else ""))
         elif vname == "encored":
-            bits.append("Encore-locked (can only repeat its last move, or switch)")
+            mv = vinfo.get("move")
+            bits.append(
+                f"Encore-locked into {mv} (must repeat it, or switch)" if mv
+                else "Encore-locked (can only repeat its last move, or switch)")
         elif vname == "disabled":
-            bits.append("has a move Disabled (that move is unavailable this turn)")
+            mv = vinfo.get("move")
+            bits.append(
+                f"{mv} Disabled (that move is unavailable this turn)" if mv
+                else "has a move Disabled (that move is unavailable this turn)")
         elif vname == "taunt":
             bits.append(f"Taunt{_maybe_turns_left(vinfo.get('turnsLeft'))}")
         elif vname == "healBlock":
@@ -762,6 +768,8 @@ def _active_state_suffix(active: dict[str, Any]) -> str:
     lock = active.get("choiceLockedInto")
     if lock:
         bits.append(f"locked into {lock}")
+    if active.get("trapped"):
+        bits.append("trapped — cannot switch out")
     if not bits:
         return ""
     return "         · " + " · ".join(bits)
